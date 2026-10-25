@@ -1,0 +1,179 @@
+# DNA-DB vs MySQL vs PostgreSQL — full test & benchmark report
+
+> **Russian:** [DB_COMPARISON_RU.md](DB_COMPARISON_RU.md) · Part of the bilingual docs set: [README](../README.md) · [TEST_RESULTS](TEST_RESULTS.md) · [BENCHMARKS](BENCHMARKS.md)
+
+**Run date:** 2026-10-26 · **Raw data:** [bench_compare_results.json](bench_compare_results.json) · **Logs:** [bench_compare_run.log](bench_compare_run.log) · **Charts:** [`charts/`](charts/)
+
+---
+
+## 1. TL;DR
+
+Identical workload, identical keys, identical RNG sequence on all three systems, every system at its
+**default durability level** (no group-commit tricks, no fsync tuning). DNA-DB is **3–8× faster** on
+single-connection workloads and **1.4–1.6× faster** on the 8-thread mixed workload, with **0 data
+mismatches** on every system.
+
+| Phase | DNA-DB v3.0 | MySQL 8.4.11 | PostgreSQL 17.11 |
+|---|---:|---:|---:|
+| Load 10 000 KV rows, single connection | **1 067 ops/s** | 144 ops/s | 357 ops/s |
+| Point read ×4 000, single connection | **4 990 ops/s** | 616 ops/s | 594 ops/s |
+| Mixed 80/20, 8 threads × 500 ops | **4 473 ops/s** | 2 728 ops/s | 3 117 ops/s |
+| SQL `INSERT`, 3 000 rows | **939 ops/s** | 142 ops/s | 358 ops/s |
+| SQL `SELECT … WHERE pk`, ×1 500 | **3 604 ops/s** | 622 ops/s | 678 ops/s |
+| Verified reads returning a wrong value | **0** | 0 | 0 |
+
+![Throughput by workload phase](charts/throughput.png)
+
+---
+
+## 2. Test environment & methodology
+
+| Item | Value |
+|---|---|
+| Host | Windows 11 (10.0.26200), Python 3.12.9, single client process |
+| DNA-DB | `dna-db-core 3.0.0`, **native host binary**, `serve --sync strict` (fsync WAL per ack) |
+| MySQL | 8.4.11, official `mysql:8.4` container (Docker Desktop 29.8.1, WSL2), `innodb_flush_log_at_trx_commit=1` (default) |
+| PostgreSQL | 17.11, official `postgres:17` container, `synchronous_commit=on` (default) |
+| Client drivers | raw TCP protocol (DNA-DB), `pymysql 2.2.8`, `psycopg2 2.9.13` — all `autocommit=True` |
+| Dataset | deterministic: keys `chr1:0000000…chr1:0000999`, value = 160 bytes, `random.Random(42)` key order, identical for all systems |
+| Phases | load 10 000 → point read 4 000 → mixed 8×500 (80 % read / 20 % write) → SQL load 3 000 rows → SQL point query 1 500 |
+| Seed | `777` for the mixed phase on every system |
+
+**Fairness rules applied:** every statement is a separate durable transaction in all three systems
+(autocommit / one fsync-WAL append per ack), no batching, no caching between phases (each phase
+starts from the same data state), and correctness is *measured*, not assumed: every read checks the
+returned bytes against the expected value.
+
+**Honest caveats — read this before quoting numbers:**
+
+1. MySQL and PostgreSQL run **inside Docker (WSL2 VM)**, DNA-DB runs **natively on the host**.
+   Container networking and virtualized disk add measurable overhead to the two server databases;
+   a bare-metal Linux deployment of MySQL/PG would close part of the gap.
+2. This is a **microbenchmark of single-key operations** (KV get/put and primary-key lookups) over
+   one connection per thread. It is *not* TPC-C/TPC-H: it says nothing about complex joins,
+   analytical queries, replication or multi-node scaling — where MySQL/PG are far more capable today.
+3. Durability is on by default everywhere, so each single-row commit pays an fsync in all three
+   systems; that dominates the absolute ops/s numbers.
+
+---
+
+## 3. Results in detail
+
+### 3.1 Throughput
+
+| Phase | DNA-DB | MySQL | PostgreSQL | DNA-DB vs MySQL | DNA-DB vs PG |
+|---|---:|---:|---:|---:|---:|
+| Load (insert) | 1 067 | 144 | 357 | **7.4×** | **3.0×** |
+| Point read | 4 990 | 616 | 594 | **8.1×** | **8.4×** |
+| Mixed 80/20, 8 threads | 4 473 | 2 728 | 3 117 | **1.6×** | **1.4×** |
+| SQL INSERT | 939 | 142 | 358 | **6.6×** | **2.6×** |
+| SQL SELECT by PK | 3 604 | 622 | 678 | **5.8×** | **5.3×** |
+
+### 3.2 Latency — point read (ms, lower is better)
+
+| System | p50 | p95 | p99 |
+|---|---:|---:|---:|
+| **DNA-DB** | **0.187** | **0.254** | **0.301** |
+| MySQL | 1.554 | 2.026 | 2.588 |
+| PostgreSQL | 1.574 | 2.305 | 3.045 |
+
+![Point read latency](charts/latency_point_read.png)
+
+### 3.3 Latency — SQL `SELECT … WHERE pk` (ms)
+
+| System | p50 | p95 | p99 |
+|---|---:|---:|---:|
+| **DNA-DB** | **0.236** | **0.298** | **0.334** |
+| MySQL | 1.562 | 1.890 | 2.140 |
+| PostgreSQL | 1.436 | 1.695 | 1.899 |
+
+![SQL SELECT latency](charts/latency_sql_select.png)
+
+### 3.4 Correctness — every read was verified
+
+Each of the 4 000 KV reads and 1 500 SQL point queries compared the returned value with the value
+written earlier. **All three systems answered every request correctly** — 0 mismatches, 0 errors:
+
+![Correctness: mismatches during benchmark](charts/correctness.png)
+
+---
+
+## 4. Why the numbers look like this
+
+* **One sequential fsync vs. a full commit pipeline.** DNA-DB appends a record to a single
+  write-ahead log and fsyncs it once per acknowledged write — no page cache flushes, no buffer-pool
+  eviction, no double-write buffer. InnoDB additionally maintains the double-write buffer and
+  buffer pool; PostgreSQL writes full-page images to the WAL after the first change to a page in a
+  checkpoint window. Both extra layers are exactly what you pay for general-purpose crash safety
+  on a page-based storage model.
+* **No query parser/planner round-trip on the hot path.** Point lookups in DNA-DB go straight to an
+  in-memory index + segment seek; MySQL/PG parse, plan, optimize and then execute with locking,
+  MVCC visibility and permission checks on every statement.
+* **The 8-thread mixed phase is where the gap shrinks** (1.4–1.6× instead of 3–8×): InnoDB and
+  PostgreSQL amortize fsync across concurrent commits (group commit) and saturate their parallel
+  pipelines, while DNA-DB's per-connection acknowledgements are already serialized per fsync.
+* **Why DNA-DB wins on SQL INSERT too (939 vs 142/358 ops/s):** the SQL path writes the same
+  WAL record as a KV put; MySQL pays a row-lock + undo/redo + double-write cycle and PG pays
+  full-page WAL + hint bits per row, for a 1-row autocommit transaction.
+
+---
+
+## 5. Full DNA-DB test suite (same run, 2026-10-26)
+
+The benchmark above is only one part; the engine's own suite was re-run in full before comparing:
+
+| Suite | Result | Evidence |
+|---|---|---|
+| `cargo test --release` | **152 passed, 0 failed** (139 unit + 13 integration), 0 warnings | [cargo_test_output.txt](cargo_test_output.txt) |
+| Protocol smoke test | **15 / 15 checks passed** (incl. 1 MiB value round-trip, WAL replay after hard kill) | [smoke_test_results.json](smoke_test_results.json) |
+| `kill -9` crash durability | **3 750 acknowledged writes → 0 missing, 0 corrupt** | [KILL9_TEST_RESULT.txt](KILL9_TEST_RESULT.txt) |
+| Sector-corruption chaos test | **3 / 3 scenarios PASS, 300 000 key verifications**, incl. honest `UNREPAIRABLE` verdict on over-damage | [chaos_results.json](chaos_results.json) · [chaos_full_run.log](chaos_full_run.log) |
+| Benchmark correctness | **0 mismatches** in all three systems | this report §3.4 |
+
+Also verified by CI on Linux: [`.github/workflows/ci.yml`](../.github/workflows/ci.yml)
+(`cargo test --release` + clippy + Python compile checks).
+
+---
+
+## 6. Capability matrix (what the benchmark does *not* show)
+
+| Capability | DNA-DB v3.0 | MySQL 8.4 | PostgreSQL 17 |
+|---|---|---|---|
+| Single-key KV / PK latency | **very good** | good | good |
+| SQL subset (SELECT/JOIN/INSERT/UPDATE/DELETE/CREATE, aggregates, GROUP BY/HAVING, ORDER BY, IN, subqueries, secondary indexes) | ✅ | ✅ full SQL | ✅ full SQL |
+| Multi-statement SQL transactions (BEGIN/COMMIT) | ❌ (atomic batches via WAL / DnaQL `TX {}`) | ✅ | ✅ |
+| Full-text/analytic SQL, window functions, CTEs | ❌ | ✅ | ✅ |
+| Fuzzy search with mutations (bit-parallel Myers, `~N`) | ✅ DnaQL | ❌ (LIKE scan / UDF) | ❌ (LIKE scan / UDF) |
+| 2-bit nucleotide packing (4 bases per byte) | ✅ | ❌ | ❌ |
+| Dual-strand disk mirroring + Reed–Solomon self-repair | ✅ | ❌ (replication) | ❌ (replication) |
+| Replication / clustering / ecosystem | ❌ | ✅ | ✅ |
+| Auth over TCP + web admin panel | ✅ (HTTP panel, TCP auth) | ✅ | ✅ |
+
+**Conclusion:** on the workload measured here — durable single-key writes and primary-key reads —
+DNA-DB is substantially faster than both servers at their default durability settings, and returns
+identically correct data. For complex relational workloads, transactions across statements,
+replication or analytics, MySQL/PostgreSQL remain the right tool; DNA-DB's niche is
+genomics-shaped workloads (fuzzy sequence search, packed nucleotides, self-healing storage).
+
+---
+
+## 7. How to reproduce
+
+```bash
+# 1. the three databases (Docker) — user/password/db: bench/bench/bench, root/bench for MySQL
+docker run -d --name bench-pg  -e POSTGRES_USER=bench -e POSTGRES_PASSWORD=bench \
+           -e POSTGRES_DB=bench -p 5432:5432 postgres:17
+docker run -d --name bench-mysql -e MYSQL_ROOT_PASSWORD=bench \
+           -e MYSQL_DATABASE=bench -p 3306:3306 mysql:8.4
+
+# 2. build DNA-DB and run its own suite
+cargo build --release && cargo test --release
+python scripts/smoke_test.py && python scripts/kill9_test.py && python scripts/chaos_test.py
+
+# 3. the comparison + charts
+python scripts/bench_compare.py     # -> docs/bench_compare_results.json
+python scripts/gen_charts.py        # -> docs/charts/*.png
+```
+
+Raw machine-readable results: [bench_compare_results.json](bench_compare_results.json) ·
+raw console log: [bench_compare_run.log](bench_compare_run.log).

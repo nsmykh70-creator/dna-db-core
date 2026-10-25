@@ -1,0 +1,31 @@
+
+=== DNA-DB v3.0 ===
+  load 10000 ... 1067 ops/s, avg 0.94 ms
+  point-read 4000 ... 4990 ops/s, p50 0.19 / p95 0.25 / p99 0.30 ms, errors=0
+  mixed 8 threads x 500 ops (80/20) ... 4473 ops/s, p50 1.63 / p99 4.54 ms
+  sql load 3000 rows ... 939 ops/s, avg 1.05 ms
+  sql SELECT WHERE pk x 1500 ... 3604 ops/s, p50 0.24 / p95 0.30 / p99 0.33 ms, errors=0
+
+=== MySQL ===
+  load 10000 ... 144 ops/s, avg 6.95 ms
+  point-read 4000 ... 616 ops/s, p50 1.55 / p95 2.03 / p99 2.59 ms, errors=0
+  mixed 8 threads x 500 ops (80/20) ... 2728 ops/s, p50 2.18 / p99 3.55 ms
+  sql load 3000 rows ... 142 ops/s, avg 7.04 ms
+  sql SELECT WHERE pk x 1500 ... 622 ops/s, p50 1.56 / p95 1.89 / p99 2.14 ms, errors=0
+
+=== PostgreSQL ===
+  load 10000 ... 357 ops/s, avg 2.80 ms
+  point-read 4000 ... 594 ops/s, p50 1.57 / p95 2.31 / p99 3.04 ms, errors=0
+  mixed 8 threads x 500 ops (80/20) ... 3117 ops/s, p50 2.05 / p99 5.25 ms
+  sql load 3000 rows ... 358 ops/s, avg 2.79 ms
+  sql SELECT WHERE pk x 1500 ... 678 ops/s, p50 1.44 / p95 1.70 / p99 1.90 ms, errors=0
+
+JSON report: C:\dnadb\extracted\dna-db-core-v2.1.0\docs\bench_compare_results.json
+
+==============================================================================
+system / metric                  load/s     read/s    mixed/s  sql sel/s
+------------------------------------------------------------------------------
+DNA-DB                             1067       4990       4473       3604
+MySQL                               144        616       2728        622
+PostgreSQL                          357        594       3117        678
+==============================================================================

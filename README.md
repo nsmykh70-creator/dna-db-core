@@ -257,6 +257,9 @@ python3 scripts/chaos_test.py       # sector corruption -> doctor --fix -> 100% 
 
 Test results of the full verification run: [docs/TEST_RESULTS.md](docs/TEST_RESULTS.md).
 
+Three-way benchmark **DNA-DB vs MySQL vs PostgreSQL** (charts, methodology, raw data):
+[docs/DB_COMPARISON.md](docs/DB_COMPARISON.md).
+
 Web panel screenshots and test reports: [docs/screenshots](docs/screenshots), [docs/](docs/).
 
 ## 8. License and status

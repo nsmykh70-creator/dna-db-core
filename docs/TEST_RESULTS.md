@@ -2,6 +2,7 @@
 
 > **Русская версия:** [TEST_RESULTS_RU.md](TEST_RESULTS_RU.md)
 > This file lists the real, reproducible results of the full verification run.
+> Three-way benchmark vs MySQL/PostgreSQL: [DB_COMPARISON.md](DB_COMPARISON.md).
 
 * **Date of run:** 2026-10-25 (21:27–21:56 +03:00)
 * **Commit under test:** working tree of `main` (release profile)
