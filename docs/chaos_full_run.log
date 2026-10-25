@@ -1,16 +1,16 @@
 
 === SCENARIO 1/3: offline (restart + doctor --fix) ===
-[1.1] loaded 100000 keys in 107.6s, checkpointed, SIGKILLed
+[1.1] loaded 100000 keys in 99.7s, checkpointed, SIGKILLed
 [1.2] 3 segments on disk; planning 60 sector hits
 [1.3] damaged 60 × 4 KiB sectors (240 KiB) — bit-flips and zero-fills
-[1.4] doctor --fix completed in 1.8s: 60 blocks rewritten from parity, 3/3 segments healthy
+[1.4] doctor --fix completed in 1.5s: 60 blocks rewritten from parity, 3/3 segments healthy
 [1.5] verified 100000 keys in 23.0s: missing=0, corrupted=0
 [1.6] engine health: lesions found=0, repaired=0, unrecoverable=0
 [1.7] OFFLINE SCENARIO: PASS — 100000/100000 keys restored
 
 === SCENARIO 2/3: live (damage while serving, on-read repair) ===
 [2.1] damaged 60 × 4 KiB sectors under a live server
-[2.2] read all 100000 keys in 20.7s (on-read repair): missing=0, corrupted=0
+[2.2] read all 100000 keys in 22.9s (on-read repair): missing=0, corrupted=0
 [2.3] lesions: found=45, repaired=45, bytes_repaired=184320
 [2.4] LIVE SCENARIO: PASS
 
@@ -24,9 +24,8 @@
 ================================================================
 CHAOS SUMMARY
 ================================================================
-{"scenario": "offline", "keys": 100000, "sectors_damaged": 60, "blocks_fixed_by_doctor": 60, "missing": 0, "corrupted": 0, "verdict": "PASS", "load_secs": 107.6, "doctor_secs": 1.8, "verify_secs": 23.0}
-{"scenario": "live", "keys": 100000, "sectors_damaged": 60, "missing": 0, "corrupted": 0, "verdict": "PASS", "verify_secs": 20.7, "lesions_repaired": 45}
+{"scenario": "offline", "keys": 100000, "sectors_damaged": 60, "blocks_fixed_by_doctor": 60, "missing": 0, "corrupted": 0, "verdict": "PASS", "load_secs": 99.7, "doctor_secs": 1.5, "verify_secs": 23.0}
+{"scenario": "live", "keys": 100000, "sectors_damaged": 60, "missing": 0, "corrupted": 0, "verdict": "PASS", "verify_secs": 22.9, "lesions_repaired": 45}
 {"scenario": "overdmg", "keys": 100000, "damaged_shards_in_one_stripe": 4, "doctor_verdict": "UNREPAIRABLE", "wrong_values": 0, "unreadable_keys": 483, "verdict": "PASS"}
 ----------------------------------------------------------------
 CHAOS PASS: 3 scenario(s), 300000 key-verifications, seed=20261021
-JSON report: docs/chaos_results.json
