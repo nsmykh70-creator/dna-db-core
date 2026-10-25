@@ -9,6 +9,8 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use std::io::{BufRead, Read, Write};
 use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use dna_db_core::engine::{Engine, EngineConfig};
 use dna_db_core::dna_ql::DnaQlEngine;
