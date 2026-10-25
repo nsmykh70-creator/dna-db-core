@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 //! DnaQL (DNA Query Language) v2.1 — REAL tokenizer, parser and executor.
 //!
 //! Implemented grammar (subset of DNAQL_SPEC.md, fully functional):
@@ -999,14 +999,16 @@ impl DnaQlEngine {
         &self,
         statements: &[TxStmt],
     ) -> Result<(Vec<DnaQlRow>, String), String> {
-        // 1. Buffer mutations into a transaction session
-        let mut session = self.tx.begin(crate::tx::TxIsolationLevel::ReadCommitted);
+        // 1. Buffer mutations into a transaction session. Reads go THROUGH
+        // the session (read-your-writes: a statement sees earlier statements'
+        // buffered effects) and record Serializable validation baselines.
+        let mut session = self.tx.begin(crate::tx::TxIsolationLevel::Serializable);
 
         for stmt in statements {
             match stmt {
                 TxStmt::Mutate { table, locus, field, op, value } => {
                     let key = format!("{}:{}", table, locus);
-                    let existing = self.read_row(&key)?;
+                    let existing = session.read_row(&key)?;
                     let mut row = existing.unwrap_or_default();
                     let old = row.get(field).cloned().unwrap_or(Value::Null);
                     let new_val = apply_assign(&old, *op, value)?;
@@ -1015,7 +1017,7 @@ impl DnaQlEngine {
                 }
                 TxStmt::Append { table, locus, fields } => {
                     let key = format!("{}:{}", table, locus);
-                    let existing = self.read_row(&key)?;
+                    let existing = session.read_row(&key)?;
                     let mut row = existing.unwrap_or_default();
                     for (k, v) in fields {
                         row.insert(k.clone(), v.clone());
@@ -1029,7 +1031,8 @@ impl DnaQlEngine {
             }
         }
 
-        // 2. Atomic commit: one WAL batch frame, one fsync
+        // 2. Atomic commit: baseline validation (Serializable) + one WAL batch
+        // frame, one fsync. Conflicts surface as retryable errors here.
         let lsn = self.tx.commit(&mut session)?;
 
         // 3. Report resulting rows

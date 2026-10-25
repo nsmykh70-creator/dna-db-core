@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Relational SQL Engine — REAL tokenizer + parser + executor.
 //!
 //! Implemented subset (honest scope):
@@ -214,6 +214,7 @@ enum Stmt {
         name: String,
         table: String,
         column: String,
+        unique: bool,
         if_not_exists: bool,
     },
     DropIndex {
@@ -630,7 +631,7 @@ impl SParser {
         }
         if self.kw("UNIQUE") {
             self.expect_kw("INDEX")?;
-            return Err("SQL: UNIQUE INDEX is not supported yet (see roadmap)".into());
+            return self.parse_create_index(true);
         }
         self.expect_kw("TABLE")?;
         let if_not_exists = if self.kw("IF") {
@@ -700,7 +701,7 @@ impl SParser {
     }
 
     /// CREATE [UNIQUE handled above] INDEX [IF NOT EXISTS] name ON table (col)
-    fn parse_create_index(&mut self, _unique: bool) -> Result<Stmt, String> {
+    fn parse_create_index(&mut self, unique: bool) -> Result<Stmt, String> {
         let if_not_exists = if self.kw("IF") {
             self.expect_kw("NOT")?;
             self.expect_kw("EXISTS")?;
@@ -715,7 +716,7 @@ impl SParser {
         let column = self.ident()?;
         self.expect(STok::RParen)?;
         if matches!(self.peek(), STok::Semi) { self.next(); }
-        Ok(Stmt::CreateIndex { name, table, column, if_not_exists })
+        Ok(Stmt::CreateIndex { name, table, column, unique, if_not_exists })
     }
 
     fn parse_drop(&mut self) -> Result<Stmt, String> {
@@ -983,8 +984,8 @@ impl SqlEngine {
                 self.exec_create_table(table, if_not_exists)?
             }
             Stmt::DropTable { table, if_exists } => self.exec_drop_table(&table, if_exists)?,
-            Stmt::CreateIndex { name, table, column, if_not_exists } => {
-                self.exec_create_index(&name, &table, &column, if_not_exists)?
+            Stmt::CreateIndex { name, table, column, unique, if_not_exists } => {
+                self.exec_create_index(&name, &table, &column, unique, if_not_exists)?
             }
             Stmt::DropIndex { name, if_exists } => self.exec_drop_index(&name, if_exists)?,
         };
@@ -1147,6 +1148,7 @@ impl SqlEngine {
         name: &str,
         table: &str,
         column: &str,
+        unique: bool,
         if_not_exists: bool,
     ) -> Result<(Vec<String>, Vec<BTreeMap<String, Value>>, String, Option<String>), String> {
         let mut table_schema = self
@@ -1177,10 +1179,30 @@ impl SqlEngine {
         }
 
         // Backfill: one WAL batch of index entries over the existing rows.
+        // A UNIQUE index must verify existing data first — duplicates abort
+        // before anything is written.
         let rows = self.read_table_rows(table)?;
         let base = index_prefix(table, column);
         let mut batch = Vec::with_capacity(rows.len());
         let mut indexed = 0usize;
+        if unique {
+            let mut seen: std::collections::HashMap<Vec<u8>, Value> =
+                std::collections::HashMap::new();
+            for row in &rows {
+                let Some(v) = row.get(column) else { continue };
+                if v.is_null() {
+                    continue; // SQL: NULLs never conflict in a UNIQUE index
+                }
+                let enc = encode_ordered_value(v);
+                if seen.contains_key(&enc) {
+                    return Err(format!(
+                        "SQL: cannot create UNIQUE index '{}': duplicate value {} on column '{}.{}'",
+                        name, v, table, column
+                    ));
+                }
+                seen.insert(enc, v.clone());
+            }
+        }
         for row in &rows {
             let Some(v) = row.get(column) else { continue };
             if v.is_null() {
@@ -1207,14 +1229,19 @@ impl SqlEngine {
         table_schema.secondary_indexes.push(SecondaryIndexMeta {
             name: name.to_string(),
             column: column.to_string(),
+            unique,
         });
         self.persist_schema(&table_schema)?;
 
         Ok((
             vec!["status".into()],
             vec![mk_row(&[("status", Value::Text("CREATED".into()))])],
-            format!("CreateIndex({} ON {}.{} rows={})", name, table, column, indexed),
-            Some(format!("index '{}' created on {}.{} ({} entries)", name, table, column, indexed)),
+            format!("CreateIndex({}{} ON {}.{} rows={})", if unique { "UNIQUE " } else { "" }, name, table, column, indexed),
+            Some(format!(
+                "{}index '{}' created on {}.{} ({} entries)",
+                if unique { "UNIQUE " } else { "" },
+                name, table, column, indexed
+            )),
         ))
     }
 
@@ -1287,6 +1314,47 @@ impl SqlEngine {
             .put(format!("__schema:{}", table.name).as_bytes(), &payload)
             .map_err(|e| e.to_string())?;
         self.schemas.write().insert(table.name.clone(), table.clone());
+        Ok(())
+    }
+
+    /// Enforce every UNIQUE secondary index of `table` for the row `new`
+    /// (full row map + its row key). `old_key`, when present, is the key of
+    /// the row being replaced: its own current index entries don't count as
+    /// conflicts. A non-NULL `new` value must appear in the index at most
+    /// once besides the row itself.
+    fn check_unique_violations(
+        &self,
+        table: &str,
+        schema: &ChromosomeTable,
+        row_key: &str,
+        new: &BTreeMap<String, Value>,
+        old_key: Option<&str>,
+    ) -> Result<(), String> {
+        for idx in schema.secondary_indexes.iter().filter(|i| i.unique) {
+            let Some(v) = new.get(&idx.column) else { continue };
+            if v.is_null() {
+                continue; // SQL: multiple NULLs never conflict
+            }
+            let mut prefix = index_prefix(table, &idx.column);
+            prefix.extend_from_slice(&escape_index_part(&encode_ordered_value(v)));
+            let entries = self
+                .engine
+                .scan_prefix(&prefix)
+                .map_err(|e| e.to_string())?;
+            for (_, payload) in entries {
+                let Ok(holder) = String::from_utf8(payload) else { continue };
+                if holder == row_key {
+                    continue; // this row's own (unchanged) entry
+                }
+                if Some(holder.as_str()) == old_key {
+                    continue; // entry being replaced by this very update
+                }
+                return Err(format!(
+                    "UNIQUE constraint failed: {}.{} = {} (index '{}')",
+                    table, idx.column, v, idx.name
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -1449,6 +1517,10 @@ impl SqlEngine {
         let mut batch = Vec::new();
         let mut inserted_keys = Vec::new();
         let mut seen_keys = std::collections::HashSet::new();
+        // UNIQUE indexes: (column, encoded value) -> owning row key, so two
+        // rows of one multi-row INSERT cannot slip the same value past us.
+        let mut stmt_unique: std::collections::HashMap<(String, Vec<u8>), String> =
+            std::collections::HashMap::new();
         for row in rows {
             let map: BTreeMap<String, Value> = row.into_iter().collect();
             let pk = Self::pk_of(&schema, &map)?;
@@ -1463,6 +1535,37 @@ impl SqlEngine {
                 .is_some()
             {
                 return Err(format!("duplicate primary key in INSERT: {}", key));
+            }
+            // UNIQUE index enforcement — also covers duplicates between rows
+            // of this same statement (via stmt_unique) and against rows that
+            // already exist in the engine (via index scan).
+            for idx in schema.secondary_indexes.iter().filter(|i| i.unique) {
+                let Some(v) = map.get(&idx.column) else { continue };
+                if v.is_null() {
+                    continue;
+                }
+                let enc = encode_ordered_value(v);
+                if let Some(earlier) = stmt_unique.get(&(idx.column.clone(), enc.clone())) {
+                    if earlier != &key {
+                        return Err(format!(
+                            "UNIQUE constraint failed: {}.{} = {} (index '{}')",
+                            table, idx.column, v, idx.name
+                        ));
+                    }
+                }
+                let mut prefix = index_prefix(table, &idx.column);
+                prefix.extend_from_slice(&escape_index_part(&enc));
+                let entries = self
+                    .engine
+                    .scan_prefix(&prefix)
+                    .map_err(|e| e.to_string())?;
+                if !entries.is_empty() {
+                    return Err(format!(
+                        "UNIQUE constraint failed: {}.{} = {} (index '{}')",
+                        table, idx.column, v, idx.name
+                    ));
+                }
+                stmt_unique.insert((idx.column.clone(), enc), key.clone());
             }
             let payload = RowCodec::encode(
                 &map.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>(),
@@ -1567,7 +1670,7 @@ impl SqlEngine {
         }
 
         let mut new_keys = std::collections::HashSet::new();
-        for (_, _, new_key, new_row) in &changes {
+        for (old_key, _, new_key, new_row) in &changes {
             if !new_keys.insert(new_key.clone()) {
                 return Err(format!("UPDATE would create duplicate primary key: {}", new_key));
             }
@@ -1580,6 +1683,15 @@ impl SqlEngine {
             {
                 return Err(format!("UPDATE conflicts with existing primary key: {}", new_key));
             }
+
+            // UNIQUE secondary-index constraints (target row excluded).
+            self.check_unique_violations(
+                table,
+                &schema,
+                new_key,
+                new_row,
+                Some(old_key.as_str()),
+            )?;
 
             for fk in &schema.foreign_keys {
                 if let Some(value) = new_row.get(&fk.column) {
@@ -3007,6 +3119,94 @@ mod tests {
         let fields = RowCodec::decode(&raw).unwrap();
         assert!(fields.iter().any(|(k, v)| k == "balance" && *v == Value::Float(-25.5)));
         assert!(fields.iter().any(|(k, v)| k == "username" && *v == Value::Text("O'Brien".into())));
+    }
+
+    #[test]
+    fn unique_index_rejects_duplicate_insert() {
+        let (_e, sql) = setup();
+        sql.execute("INSERT INTO chr_users (user_id = 1, username = 'alice', balance = 10.0)").unwrap();
+        sql.execute("INSERT INTO chr_users (user_id = 2, username = 'bob', balance = 20.0)").unwrap();
+
+        sql.execute("CREATE UNIQUE INDEX uq_users_username ON chr_users (username)").unwrap();
+
+        // duplicate value rejected
+        let err = sql
+            .execute("INSERT INTO chr_users (user_id = 3, username = 'alice', balance = 30.0)")
+            .unwrap_err();
+        assert!(err.contains("UNIQUE constraint failed"), "err: {err}");
+        // nothing was written
+        let res = sql.execute("SELECT user_id FROM chr_users WHERE user_id = 3").unwrap();
+        assert!(res.rows.is_empty());
+
+        // distinct value accepted
+        sql.execute("INSERT INTO chr_users (user_id = 4, username = 'carol', balance = 40.0)").unwrap();
+
+        // multi-row INSERT with an in-statement duplicate rejected
+        let err = sql
+            .execute(
+                "INSERT INTO chr_users (user_id, username, balance) VALUES (5, 'dave', 1.0), (6, 'dave', 2.0)",
+            )
+            .unwrap_err();
+        assert!(err.contains("UNIQUE constraint failed"), "err: {err}");
+
+        // same statement with distinct values accepted atomically
+        sql.execute(
+            "INSERT INTO chr_users (user_id, username, balance) VALUES (7, 'eve', 1.0), (8, 'frank', 2.0)",
+        )
+        .unwrap();
+        let res = sql.execute("SELECT user_id FROM chr_users WHERE username = 'eve'").unwrap();
+        assert_eq!(res.rows.len(), 1);
+    }
+
+    #[test]
+    fn unique_index_rejects_duplicate_update_and_allows_nulls() {
+        let (_e, sql) = setup();
+        sql.execute("INSERT INTO chr_users (user_id = 1, username = 'alice', balance = 10.0)").unwrap();
+        sql.execute("INSERT INTO chr_users (user_id = 2, username = 'bob', balance = 20.0)").unwrap();
+        sql.execute("CREATE UNIQUE INDEX uq_users_username ON chr_users (username)").unwrap();
+
+        // updating one row onto another's unique value is rejected
+        let err = sql
+            .execute("UPDATE chr_users SET username = 'alice' WHERE user_id = 2")
+            .unwrap_err();
+        assert!(err.contains("UNIQUE constraint failed"), "err: {err}");
+
+        // moving to a free value works
+        sql.execute("UPDATE chr_users SET username = 'robert' WHERE user_id = 2").unwrap();
+
+        // NULL is not a value: multiple NULL usernames never conflict
+        sql.execute("CREATE TABLE chr_notes (id INT, owner TEXT, note TEXT, PRIMARY KEY (id))").unwrap();
+        sql.execute("INSERT INTO chr_notes (id = 1, owner = NULL, note = 'a')").unwrap();
+        sql.execute("INSERT INTO chr_notes (id = 2, owner = NULL, note = 'b')").unwrap();
+        sql.execute("CREATE UNIQUE INDEX uq_notes_owner ON chr_notes (owner)").unwrap();
+        sql.execute("INSERT INTO chr_notes (id = 3, owner = NULL, note = 'c')").unwrap();
+        // but a real duplicate still fails
+        sql.execute("INSERT INTO chr_notes (id = 4, owner = 'zed', note = 'd')").unwrap();
+        let err = sql
+            .execute("INSERT INTO chr_notes (id = 5, owner = 'zed', note = 'e')")
+            .unwrap_err();
+        assert!(err.contains("UNIQUE constraint failed"), "err: {err}");
+    }
+
+    #[test]
+    fn unique_index_creation_fails_on_existing_duplicates() {
+        let (_e, sql) = setup();
+        sql.execute("INSERT INTO chr_users (user_id = 1, username = 'dup', balance = 1.0)").unwrap();
+        sql.execute("INSERT INTO chr_users (user_id = 2, username = 'dup', balance = 2.0)").unwrap();
+
+        let err = sql
+            .execute("CREATE UNIQUE INDEX uq_users_username ON chr_users (username)")
+            .unwrap_err();
+        assert!(err.contains("cannot create UNIQUE index"), "err: {err}");
+        // index must not have been registered
+        let schema = sql.get_schema("chr_users").unwrap();
+        assert!(schema.secondary_index_on("username").is_none());
+
+        // plain CREATE INDEX on the same data still succeeds
+        sql.execute("CREATE INDEX idx_users_username ON chr_users (username)").unwrap();
+        let schema = sql.get_schema("chr_users").unwrap();
+        let idx = schema.secondary_index_on("username").unwrap();
+        assert!(!idx.unique);
     }
 
     #[test]

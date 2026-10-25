@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Relational Schema Mapping via Genomic Base-Pairing Metaphor
 //!
 //! Tables -> Chromosomes ('chr_name:locus_id' LSM namespace)
@@ -159,6 +159,10 @@ pub struct ForeignKeyConstraint {
 pub struct SecondaryIndexMeta {
     pub name: String,
     pub column: String,
+    /// Enforce SQL UNIQUE semantics on this column (CREATE UNIQUE INDEX).
+    /// Older persisted schemas decode with `unique: false`.
+    #[serde(default)]
+    pub unique: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -349,7 +353,7 @@ mod tests {
         let fields = vec![
             ("null_f".to_string(), Value::Null),
             ("int_f".to_string(), Value::Int(-42)),
-            ("float_f".to_string(), Value::Float(3.14159)),
+            ("float_f".to_string(), Value::Float(123.456)),
             ("text_f".to_string(), Value::Text("привет мир".to_string())),
             ("dna_f".to_string(), Value::Dna("ACGTACGT".to_string())),
         ];
