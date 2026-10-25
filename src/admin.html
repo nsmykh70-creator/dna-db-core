@@ -87,6 +87,23 @@
   .examples button:hover{color:var(--text);border-color:var(--accent)}
   .hidden{display:none!important}
   @media (max-width:900px){.tw{grid-template-columns:1fr}}
+  /* ---------- row editor modal ---------- */
+  table.grid tbody tr.rowedit{cursor:pointer}
+  .modal-back{position:fixed;inset:0;background:rgba(4,8,20,.66);backdrop-filter:blur(3px);display:flex;align-items:flex-start;justify-content:center;padding:56px 16px;z-index:60;overflow:auto}
+  .modal{background:var(--panel);border:1px solid var(--line);border-radius:14px;width:620px;max-width:100%;box-shadow:0 24px 80px rgba(0,0,0,.55)}
+  .modal-head{display:flex;align-items:center;gap:10px;padding:14px 18px;border-bottom:1px solid var(--line)}
+  .modal-head h3{margin:0;font-size:15px}
+  .modal-body{padding:14px 18px;display:flex;flex-direction:column;gap:8px;max-height:52vh;overflow:auto}
+  .frow{display:grid;grid-template-columns:170px 1fr 62px;gap:10px;align-items:center}
+  .frow label{color:var(--muted);font-size:12.5px;font-family:var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .frow label.pk{color:var(--warn)}
+  .frow input[type=text]{width:100%;padding:7px 9px;border-radius:8px;border:1px solid var(--line);background:#0d1426;color:var(--text);font-family:var(--mono);font-size:13px}
+  .frow input[type=text]:focus{outline:none;border-color:var(--accent)}
+  .frow input[type=text]:disabled{opacity:.45}
+  .frow .nulltog{display:flex;align-items:center;gap:4px;color:var(--muted);font-size:11px;cursor:pointer;user-select:none}
+  .modal-foot{display:flex;gap:10px;padding:13px 18px;border-top:1px solid var(--line);align-items:center}
+  .modal .plan{margin:0 18px 12px}
+  .modal .errbox{margin:0 18px 12px}
   /* helix spinner */
   @keyframes spin{to{transform:rotate(360deg)}}
   .spin{display:inline-block;animation:spin 1.6s linear infinite}
@@ -204,12 +221,33 @@
   </main>
 </div>
 
+<!-- ================= ROW EDITOR MODAL ================= -->
+<div id="row-modal" class="modal-back hidden">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="rm-title">
+    <div class="modal-head">
+      <h3 id="rm-title">✏️ Редактирование строки</h3>
+      <span style="flex:1"></span>
+      <button class="act ghost" id="rm-close" title="Закрыть (Esc)">✕</button>
+    </div>
+    <div class="modal-body" id="rm-fields"></div>
+    <div class="plan" id="rm-sql"></div>
+    <div id="rm-err" class="errbox hidden"></div>
+    <div class="modal-foot">
+      <button class="act" id="rm-save">💾 Сохранить (UPDATE)</button>
+      <button class="act danger" id="rm-del">Удалить строку</button>
+      <span style="flex:1"></span>
+      <button class="act ghost" id="rm-cancel">Отмена</button>
+    </div>
+  </div>
+</div>
+
 <script>
 "use strict";
 const $ = s => document.querySelector(s);
 let TOKEN = sessionStorage.getItem("dnadb_token") || "";
 let TABLES = [];
 let CURRENT = null, OFFSET = 0, LIMIT = 50;
+let BROWSE_ROWS = [], RM_ROW = null, RM_COLS = null, RM_PK = null;
 
 /* ---------------- api helper ---------------- */
 async function api(path, opts = {}) {
@@ -371,6 +409,9 @@ async function browse() {
   if (!r.ok) { $("#tbl-grid").innerHTML = "<tbody><tr><td class='errbox'>" + esc((r.body && r.body.error) || "error") + "</td></tr></tbody>"; return; }
   const b = r.body;
   renderGrid($("#tbl-grid"), b.columns, b.rows);
+  BROWSE_ROWS = b.rows || [];
+  const tb = $("#tbl-grid").querySelector("tbody");
+  if (tb) tb.querySelectorAll("tr").forEach((tr, i) => { if (BROWSE_ROWS[i]) tr.dataset.idx = i; tr.classList.add("rowedit"); });
   const cnt = document.getElementById("rowcnt"); if (cnt) cnt.textContent = fmtNum(b.total);
   const from = b.total ? OFFSET + 1 : 0, to = Math.min(OFFSET + LIMIT, b.total);
   $("#pg-info").textContent = "строки " + from + "–" + to + " из " + fmtNum(b.total) + " · " + (b.time_us / 1000).toFixed(2) + " мс · " + esc(b.plan || "");
@@ -380,6 +421,98 @@ async function browse() {
 $("#pg-prev").addEventListener("click", () => { OFFSET = Math.max(0, OFFSET - LIMIT); browse(); });
 $("#pg-next").addEventListener("click", () => { OFFSET += LIMIT; browse(); });
 $("#pg-size").addEventListener("change", e => { LIMIT = +e.target.value; OFFSET = 0; browse(); });
+
+/* ---------------- row editor modal ---------------- */
+function sqlLiteral(col, raw, isNull) {
+  if (isNull) return "NULL";
+  const ty = String((RM_COLS && RM_COLS[col]) || "");
+  if (ty.includes("Int")) {
+    const n = Number(raw);
+    if (!Number.isFinite(n) || !Number.isInteger(n)) throw new Error("колонка " + col + ": ожидается целое число");
+    return String(n);
+  }
+  if (ty.includes("Float")) {
+    const n = Number(raw);
+    if (!Number.isFinite(n)) throw new Error("колонка " + col + ": ожидается число");
+    return String(n);
+  }
+  return "'" + String(raw).replace(/'/g, "''") + "'";
+}
+function openRowEditor(row, cols) {
+  const s = schemaOf(CURRENT); if (!s) return;
+  RM_ROW = Object.assign({}, row); RM_COLS = cols || s.columns; RM_PK = s.pk;
+  $("#rm-title").textContent = "✏️ " + CURRENT + " · " + s.pk + " = " + (row[s.pk] === null || row[s.pk] === undefined ? "NULL" : row[s.pk]);
+  $("#rm-err").classList.add("hidden");
+  const fields = Object.keys(RM_COLS).map(c => {
+    const v = row[c];
+    const isNull = v === null || v === undefined;
+    return '<div class="frow">' +
+      '<label class="' + (c === s.pk ? "pk" : "") + '" title="' + esc(c) + (c === s.pk ? " (PRIMARY KEY)" : "") + '">' + esc(c) + '</label>' +
+      '<input type="text" data-col="' + esc(c) + '" value="' + esc(isNull ? "" : v) + '"' + (isNull ? " disabled" : "") + '>' +
+      '<label class="nulltog"><input type="checkbox" data-null="' + esc(c) + '"' + (isNull ? " checked" : "") + '> NULL</label>' +
+    '</div>';
+  }).join("");
+  $("#rm-fields").innerHTML = fields;
+  $("#rm-fields").querySelectorAll("input[data-null]").forEach(cb => cb.addEventListener("change", () => {
+    const inp = $('#rm-fields input[data-col="' + cb.dataset.null + '"]');
+    inp.disabled = cb.checked;
+  }));
+  updateSqlPreview();
+  $("#row-modal").classList.remove("hidden");
+  const first = $("#rm-fields input[type=text]:not([disabled])"); if (first) first.focus();
+}
+function collectRow() {
+  const out = {};
+  $("#rm-fields").querySelectorAll("input[data-col]").forEach(inp => {
+    const cb = $('#rm-fields input[data-null="' + inp.dataset.col + '"]');
+    out[inp.dataset.col] = (cb && cb.checked) ? null : inp.value;
+  });
+  return out;
+}
+function updateSqlPreview() {
+  try {
+    const vals = collectRow();
+    const sets = Object.keys(vals).map(c => c + " = " + sqlLiteral(c, vals[c], vals[c] === null));
+    const pkv = sqlLiteral(RM_PK, RM_ROW[RM_PK], RM_ROW[RM_PK] === null || RM_ROW[RM_PK] === undefined);
+    $("#rm-sql").textContent = "UPDATE " + CURRENT + " SET " + sets.join(", ") + " WHERE " + RM_PK + " = " + pkv;
+    $("#rm-sql").classList.remove("hidden");
+  } catch (e) { /* keep last preview while typing partial numbers */ }
+}
+$("#rm-fields").addEventListener("input", updateSqlPreview);
+function closeRowEditor() { $("#row-modal").classList.add("hidden"); RM_ROW = null; }
+$("#rm-close").addEventListener("click", closeRowEditor);
+$("#rm-cancel").addEventListener("click", closeRowEditor);
+$("#row-modal").addEventListener("click", e => { if (e.target.id === "row-modal") closeRowEditor(); });
+document.addEventListener("keydown", e => { if (e.key === "Escape" && !$("#row-modal").classList.contains("hidden")) closeRowEditor(); });
+$("#tbl-grid").addEventListener("click", e => {
+  const tr = e.target.closest("tr[data-idx]"); if (!tr) return;
+  const row = BROWSE_ROWS[+tr.dataset.idx]; if (!row) return;
+  openRowEditor(row, (schemaOf(CURRENT) || {}).columns);
+});
+$("#rm-save").addEventListener("click", async () => {
+  let sql;
+  try {
+    const vals = collectRow();
+    const sets = Object.keys(vals).map(c => c + " = " + sqlLiteral(c, vals[c], vals[c] === null));
+    const pkv = sqlLiteral(RM_PK, RM_ROW[RM_PK], RM_ROW[RM_PK] === null || RM_ROW[RM_PK] === undefined);
+    sql = "UPDATE " + CURRENT + " SET " + sets.join(", ") + " WHERE " + RM_PK + " = " + pkv;
+  } catch (err) { const b = $("#rm-err"); b.textContent = err.message; b.classList.remove("hidden"); return; }
+  const r = await api("/api/query", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ kind: "sql", query: sql }) });
+  if (!r.ok) { const b = $("#rm-err"); b.textContent = (r.body && r.body.error) || ("HTTP " + r.status); b.classList.remove("hidden"); return; }
+  closeRowEditor(); browse(); loadTables();
+});
+$("#rm-del").addEventListener("click", async () => {
+  const pkv0 = RM_ROW[RM_PK];
+  if (pkv0 === null || pkv0 === undefined) { const b = $("#rm-err"); b.textContent = "строка без PK — удаление недоступно"; b.classList.remove("hidden"); return; }
+  if (!confirm("Удалить строку " + CURRENT + " WHERE " + RM_PK + " = " + pkv0 + " ?")) return;
+  let pkv;
+  try { pkv = sqlLiteral(RM_PK, pkv0, false); } catch (err) { return; }
+  const r = await api("/api/query", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ kind: "sql", query: "DELETE FROM " + CURRENT + " WHERE " + RM_PK + " = " + pkv }) });
+  if (!r.ok) { const b = $("#rm-err"); b.textContent = (r.body && r.body.error) || ("HTTP " + r.status); b.classList.remove("hidden"); return; }
+  closeRowEditor(); browse(); loadTables();
+});
 $("#idx-create").addEventListener("click", async () => {
   const col = $("#idx-col").value; if (!col) return;
   const name = $("#idx-name").value.trim() || ("idx_" + CURRENT + "_" + col);

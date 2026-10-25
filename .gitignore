@@ -8,6 +8,7 @@
 /panel_demo_data
 /shell_test_data
 /run-*
+*.log
 
 # python
 __pycache__/

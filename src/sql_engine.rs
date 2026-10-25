@@ -98,6 +98,12 @@ fn stokenize(input: &str) -> Result<Vec<STok>, String> {
                 let mut closed = false;
                 while i < b.len() {
                     if b[i] == quote {
+                        // standard SQL escape: doubled quote inside a string is a literal quote
+                        if i + 1 < b.len() && b[i + 1] == quote {
+                            s.push(quote);
+                            i += 2;
+                            continue;
+                        }
                         closed = true;
                         i += 1;
                         break;
@@ -109,6 +115,27 @@ fn stokenize(input: &str) -> Result<Vec<STok>, String> {
                     return Err("SQL: unterminated string".into());
                 }
                 toks.push(STok::Str(s));
+            }
+            '-' if i + 1 < b.len() && b[i + 1].is_ascii_digit() => {
+                let mut num = String::new();
+                let mut is_float = false;
+                num.push('-');
+                i += 1;
+                while i < b.len()
+                    && (b[i].is_ascii_digit()
+                        || (b[i] == '.' && i + 1 < b.len() && b[i + 1].is_ascii_digit()))
+                {
+                    if b[i] == '.' {
+                        is_float = true;
+                    }
+                    num.push(b[i]);
+                    i += 1;
+                }
+                if is_float {
+                    toks.push(STok::Float(num.parse().map_err(|_| "SQL: bad float")?));
+                } else {
+                    toks.push(STok::Int(num.parse().map_err(|_| "SQL: bad int")?));
+                }
             }
             '0'..='9' => {
                 let mut num = String::new();
@@ -2950,6 +2977,35 @@ mod tests {
             .unwrap();
         assert_eq!(res.rows[0].get("deleted"), Some(&Value::Int(1)));
         assert!(res.execution_plan.contains("SeqScan"));
+    }
+
+    #[test]
+    fn tokenizer_negative_numbers_and_escaped_quotes() {
+        // negative int / float literals
+        let toks = stokenize("UPDATE t SET a = -1, b = -2.5").unwrap();
+        assert!(toks.iter().any(|t| matches!(t, STok::Int(i) if *i == -1)));
+        assert!(toks.iter().any(|t| matches!(t, STok::Float(f) if (*f - -2.5).abs() < f64::EPSILON)));
+
+        // doubled single quote inside a string is a literal quote
+        let toks = stokenize("UPDATE t SET name = 'O''Brien'").unwrap();
+        assert!(toks.iter().any(|t| matches!(t, STok::Str(s) if s == "O'Brien")));
+    }
+
+    #[test]
+    fn update_with_negative_and_quoted_values() {
+        let (e, sql) = setup();
+        sql.execute("INSERT INTO chr_users (user_id = 7, username = 'plain', balance = 100.0)")
+            .unwrap();
+
+        let res = sql
+            .execute("UPDATE chr_users SET balance = -25.5, username = 'O''Brien' WHERE user_id = 7")
+            .unwrap();
+        assert_eq!(res.rows[0].get("affected_rows"), Some(&Value::Int(1)));
+
+        let raw = e.get(b"chr_users:7").unwrap().unwrap();
+        let fields = RowCodec::decode(&raw).unwrap();
+        assert!(fields.iter().any(|(k, v)| k == "balance" && *v == Value::Float(-25.5)));
+        assert!(fields.iter().any(|(k, v)| k == "username" && *v == Value::Text("O'Brien".into())));
     }
 
     #[test]
