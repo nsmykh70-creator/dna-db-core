@@ -446,7 +446,7 @@ class DnaDbAdapter:
 
 class MySqlAdapter:
     name = "MySQL"
-    version = "MySQL 8.4.11 (InnoDB, flush_log_at_trx_commit=1)"
+    version = "MySQL (InnoDB)"
 
     def __init__(self):
         import pymysql
@@ -454,6 +454,20 @@ class MySqlAdapter:
         self.conn = pymysql.connect(host="127.0.0.1", port=3306, user="root",
                                     password="bench", database="bench",
                                     autocommit=True)
+        # report the REAL server version and durability setting of this host
+        try:
+            cur = self.conn.cursor()
+            cur.execute("SELECT VERSION()")
+            ver = str(cur.fetchone()[0])
+            cur.execute("SHOW VARIABLES LIKE "
+                        "'innodb_flush_log_at_trx_commit'")
+            row = cur.fetchone()
+            flush = row[1] if row else "?"
+            cur.close()
+            self.version = ("MySQL %s (innodb_flush_log_at_trx_commit=%s)"
+                            % (ver, flush))
+        except Exception:
+            pass
 
     def _cursor(self):
         return self.conn.cursor()
@@ -636,7 +650,7 @@ class MySqlAdapter:
 
 class PgAdapter:
     name = "PostgreSQL"
-    version = "PostgreSQL 17.11 (synchronous_commit=on)"
+    version = "PostgreSQL (synchronous_commit=on)"
 
     def __init__(self):
         import psycopg2
@@ -644,6 +658,18 @@ class PgAdapter:
         self.conn = psycopg2.connect(host="127.0.0.1", port=5432, user="bench",
                                      password="bench", dbname="bench")
         self.conn.autocommit = True
+        # report the REAL server version and durability setting of this host
+        try:
+            cur = self.conn.cursor()
+            cur.execute("SHOW server_version")
+            ver = str(cur.fetchone()[0])
+            cur.execute("SHOW synchronous_commit")
+            sync = str(cur.fetchone()[0])
+            cur.close()
+            self.version = ("PostgreSQL %s (synchronous_commit=%s)"
+                            % (ver, sync))
+        except Exception:
+            pass
 
     def load(self, keys, value, rng):
         lat = []

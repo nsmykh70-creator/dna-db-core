@@ -1,0 +1,117 @@
+name: Bench (Linux, native DBs)
+
+# Runs the same comparison as scripts/bench_compare.py locally, but on a Linux
+# runner with MySQL and PostgreSQL installed natively (apt + systemd), i.e.
+# WITHOUT the Docker/WSL2 container overhead of the Windows dev machine.
+# Trigger: manually, or whenever the benchmark script itself changes.
+# Results (JSON, run log, PNG charts) are committed back to the repository.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'scripts/bench_compare.py'
+      - 'scripts/gen_charts.py'
+      - '.github/workflows/bench-linux.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bench-linux
+  cancel-in-progress: true
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        run: |
+          if ! command -v cargo >/dev/null 2>&1; then
+            curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          else
+            rustup default stable || true
+          fi
+
+      - name: Install and start MySQL + PostgreSQL (native, no containers)
+        run: |
+          set -eo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            mysql-server postgresql
+          sudo systemctl start mysql
+          sudo systemctl start postgresql
+
+          # MySQL: root over TCP with password 'bench' (the benchmark's login)
+          sudo mysql -e "
+            CREATE USER IF NOT EXISTS 'root'@'127.0.0.1'
+              IDENTIFIED WITH mysql_native_password BY 'bench';
+            GRANT ALL ON *.* TO 'root'@'127.0.0.1' WITH GRANT OPTION;
+            ALTER USER 'root'@'localhost'
+              IDENTIFIED WITH mysql_native_password BY 'bench';
+            CREATE DATABASE IF NOT EXISTS bench;
+            FLUSH PRIVILEGES;"
+
+          # PostgreSQL: user/database 'bench'
+          sudo -u postgres psql -c \
+            "CREATE USER bench WITH PASSWORD 'bench';" || true
+          sudo -u postgres psql -c \
+            "CREATE DATABASE bench OWNER bench;" || true
+
+          # readiness
+          for i in $(seq 1 60); do
+            mysqladmin ping -h127.0.0.1 -uroot -pbench --silent && \
+            pg_isready -h 127.0.0.1 -U bench && break
+            sleep 2
+          done
+          mysqladmin ping -h127.0.0.1 -uroot -pbench
+          pg_isready -h 127.0.0.1 -U bench
+
+      - name: Install Python dependencies
+        run: pip3 install --quiet pymysql psycopg2-binary matplotlib
+
+      - name: Build DNA-DB (release, Linux)
+        run: cargo build --release
+
+      - name: Run the comparison benchmark
+        run: |
+          set -o pipefail
+          PYTHONUTF8=1 python3 scripts/bench_compare.py \
+            --json-out docs/bench_compare_results_linux.json \
+            2>&1 | tee docs/bench_linux_run.log
+
+      - name: Generate charts
+        run: |
+          PYTHONUTF8=1 python3 scripts/gen_charts.py \
+            --json docs/bench_compare_results_linux.json \
+            --out docs/charts/linux \
+            --sql-json ""
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "### Native Linux benchmark (apt MySQL/PostgreSQL, no Docker)"
+            echo '```'
+            tail -n 14 docs/bench_linux_run.log 2>/dev/null || echo "no log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit results
+        run: |
+          set -eo pipefail
+          git config user.name "dna-db-ci"
+          git config user.email "actions@users.noreply.github.com"
+          git add docs/bench_compare_results_linux.json docs/charts/linux
+          git add -f docs/bench_linux_run.log
+          if git diff --cached --quiet; then
+            echo "results unchanged, nothing to commit"
+            exit 0
+          fi
+          git commit -m "bench: native Linux results (ubuntu runner, no containers)"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
