@@ -1,0 +1,20 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# runtime data (WAL, segments, repair journal)
+/dna_data
+/bench_tmp
+/panel_demo_data
+/shell_test_data
+/run-*
+
+# python
+__pycache__/
+*.pyc
+
+# editors / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

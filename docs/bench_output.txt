@@ -1,0 +1,8 @@
+=== DNA-DB Core Benchmarks (real measurements) ===
+data_dir: ./bench_tmp\run-2112-1792765006506617900, ops: 50000
+[PUT strict-fsync]  50000 ops in 40.148s = 1245 ops/s, avg 802.97 us/op
+[GET random]        25000 ops in 0.049s = 514920 ops/s, avg 1.94 us/op
+[SCAN prefix]       50000 rows in 0.059s = 59176 us total
+[BATCH x10 atomic]  5000 batches (50000 rows) in 4.193s = 1193 batches/s
+[BITAP Levenshtein] 100k bp, k<=1: 296 matches in 3.658 ms = 27.3 Mbp/s
+[BITAP Hamming]     100k bp, k<=1: 127 matches in 2.656 ms = 37.6 Mbp/s

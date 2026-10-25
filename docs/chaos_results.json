@@ -1,0 +1,37 @@
+{
+  "results": [
+    {
+      "scenario": "offline",
+      "keys": 100000,
+      "sectors_damaged": 60,
+      "blocks_fixed_by_doctor": 60,
+      "missing": 0,
+      "corrupted": 0,
+      "verdict": "PASS",
+      "load_secs": 107.6,
+      "doctor_secs": 1.8,
+      "verify_secs": 23.0
+    },
+    {
+      "scenario": "live",
+      "keys": 100000,
+      "sectors_damaged": 60,
+      "missing": 0,
+      "corrupted": 0,
+      "verdict": "PASS",
+      "verify_secs": 20.7,
+      "lesions_repaired": 45
+    },
+    {
+      "scenario": "overdmg",
+      "keys": 100000,
+      "damaged_shards_in_one_stripe": 4,
+      "doctor_verdict": "UNREPAIRABLE",
+      "wrong_values": 0,
+      "unreadable_keys": 483,
+      "verdict": "PASS"
+    }
+  ],
+  "chaos": "PASS",
+  "seed": 20261021
+}

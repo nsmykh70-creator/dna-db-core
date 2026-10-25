@@ -1,0 +1,80 @@
+{
+  "results": [
+    {
+      "check": "auth_ok",
+      "status": "PASS",
+      "detail": ""
+    },
+    {
+      "check": "auth_bad",
+      "status": "PASS",
+      "detail": "wrong password -> b'NO'"
+    },
+    {
+      "check": "preauth_guard",
+      "status": "PASS",
+      "detail": "b'ERR: not authenticated'"
+    },
+    {
+      "check": "ping",
+      "status": "PASS",
+      "detail": "status=ok"
+    },
+    {
+      "check": "put_get",
+      "status": "PASS",
+      "detail": "ack=b'OK' len=140"
+    },
+    {
+      "check": "get_miss",
+      "status": "PASS",
+      "detail": "empty frame on miss"
+    },
+    {
+      "check": "delete",
+      "status": "PASS",
+      "detail": ""
+    },
+    {
+      "check": "big_value",
+      "status": "PASS",
+      "detail": "1 MiB roundtrip, 1048576 bytes"
+    },
+    {
+      "check": "sql_create",
+      "status": "PASS",
+      "detail": "b'{\"columns\":[\"status\"],\"plan\":\"CreateTable(smoke_t) cols=3 fks=0\",\"rows\":[{\"statu'"
+    },
+    {
+      "check": "sql_insert",
+      "status": "PASS",
+      "detail": "b'{\"columns\":[\"inserted_key\",\"pk\"],\"plan\":\"BatchInsert(smoke_t) rows=1 via single '"
+    },
+    {
+      "check": "sql_select",
+      "status": "PASS",
+      "detail": "1 row(s)"
+    },
+    {
+      "check": "dnaql_analyze",
+      "status": "PASS",
+      "detail": "b'{\"ast\":\"\\\\\"BioAnalysis { functions: [\\\\\\\\\\\\\"GC_CONTENT\\\\\\\\\\\\\"] }\\\\\"\",\"note\":\"real bio-analysis of 10 bp\",\"ro'"
+    },
+    {
+      "check": "checkpoint",
+      "status": "PASS",
+      "detail": ""
+    },
+    {
+      "check": "bad_opcode",
+      "status": "PASS",
+      "detail": "b'ERR: unknown opcode 0x7F'"
+    },
+    {
+      "check": "restart_recovery",
+      "status": "PASS",
+      "detail": "after hard kill + WAL replay: b'DO-NOT-LOSE'"
+    }
+  ],
+  "summary": "PASS"
+}

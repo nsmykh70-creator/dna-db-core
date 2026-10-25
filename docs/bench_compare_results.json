@@ -1,0 +1,177 @@
+{
+  "meta": {
+    "date": "2026-10-23 20:50:45",
+    "machine": "nt | Windows-11-10.0.26200-SP0",
+    "params": {
+      "load": 10000,
+      "reads": 4000,
+      "threads": 8,
+      "mixed_ops": 500,
+      "sql_rows": 3000,
+      "sql_queries": 1500
+    },
+    "durability": {
+      "dnadb": "--sync strict (fsync WAL per ack)",
+      "mysql": "innodb_flush_log_at_trx_commit=1 (default)",
+      "postgres": "synchronous_commit=on (default)"
+    }
+  },
+  "systems": {
+    "dnadb": {
+      "name": "DNA-DB v3.0",
+      "version": "dna-db-core 3.0.0 (strict fsync)",
+      "load": {
+        "ops": 10000,
+        "secs": 9.787,
+        "ops_s": 1022,
+        "avg_ms": 0.978,
+        "p50_ms": 0.955,
+        "p95_ms": 1.174,
+        "p99_ms": 1.527
+      },
+      "point_read": {
+        "ops": 4000,
+        "secs": 0.698,
+        "ops_s": 5733,
+        "errors": 0,
+        "avg_ms": 0.169,
+        "p50_ms": 0.164,
+        "p95_ms": 0.244,
+        "p99_ms": 0.283
+      },
+      "mixed": {
+        "ops": 4000,
+        "secs": 0.883,
+        "ops_s": 4528,
+        "threads": 8,
+        "avg_ms": 1.712,
+        "p50_ms": 1.599,
+        "p95_ms": 3.337,
+        "p99_ms": 4.208
+      },
+      "sql_load": {
+        "ops": 3000,
+        "secs": 3.346,
+        "ops_s": 897,
+        "avg_ms": 1.105,
+        "p50_ms": 1.077,
+        "p95_ms": 1.307,
+        "p99_ms": 1.602
+      },
+      "sql_point_query": {
+        "ops": 1500,
+        "secs": 0.401,
+        "ops_s": 3744,
+        "errors": 0,
+        "avg_ms": 0.23,
+        "p50_ms": 0.224,
+        "p95_ms": 0.302,
+        "p99_ms": 0.353
+      }
+    },
+    "mysql": {
+      "name": "MySQL",
+      "version": "MySQL 8.4.11 (InnoDB, flush_log_at_trx_commit=1)",
+      "load": {
+        "ops": 10000,
+        "secs": 65.896,
+        "ops_s": 152,
+        "avg_ms": 6.588,
+        "p50_ms": 6.712,
+        "p95_ms": 9.239,
+        "p99_ms": 12.184
+      },
+      "point_read": {
+        "ops": 4000,
+        "secs": 6.659,
+        "ops_s": 601,
+        "errors": 0,
+        "avg_ms": 1.658,
+        "p50_ms": 1.551,
+        "p95_ms": 2.146,
+        "p99_ms": 3.179
+      },
+      "mixed": {
+        "ops": 4000,
+        "secs": 1.522,
+        "ops_s": 2628,
+        "threads": 8,
+        "avg_ms": 2.312,
+        "p50_ms": 2.185,
+        "p95_ms": 3.306,
+        "p99_ms": 4.426
+      },
+      "sql_load": {
+        "ops": 3000,
+        "secs": 21.098,
+        "ops_s": 142,
+        "avg_ms": 7.032,
+        "p50_ms": 6.792,
+        "p95_ms": 9.172,
+        "p99_ms": 11.584
+      },
+      "sql_point_query": {
+        "ops": 1500,
+        "secs": 2.581,
+        "ops_s": 581,
+        "errors": 0,
+        "avg_ms": 1.71,
+        "p50_ms": 1.585,
+        "p95_ms": 2.32,
+        "p99_ms": 3.118
+      }
+    },
+    "postgres": {
+      "name": "PostgreSQL",
+      "version": "PostgreSQL 17.11 (synchronous_commit=on)",
+      "load": {
+        "ops": 10000,
+        "secs": 28.879,
+        "ops_s": 346,
+        "avg_ms": 2.886,
+        "p50_ms": 2.776,
+        "p95_ms": 3.631,
+        "p99_ms": 4.877
+      },
+      "point_read": {
+        "ops": 4000,
+        "secs": 6.098,
+        "ops_s": 656,
+        "errors": 0,
+        "avg_ms": 1.513,
+        "p50_ms": 1.429,
+        "p95_ms": 1.908,
+        "p99_ms": 3.092
+      },
+      "mixed": {
+        "ops": 4000,
+        "secs": 1.391,
+        "ops_s": 2875,
+        "threads": 8,
+        "avg_ms": 2.627,
+        "p50_ms": 2.139,
+        "p95_ms": 4.933,
+        "p99_ms": 7.676
+      },
+      "sql_load": {
+        "ops": 3000,
+        "secs": 8.766,
+        "ops_s": 342,
+        "avg_ms": 2.92,
+        "p50_ms": 2.802,
+        "p95_ms": 3.663,
+        "p99_ms": 5.006
+      },
+      "sql_point_query": {
+        "ops": 1500,
+        "secs": 2.168,
+        "ops_s": 692,
+        "errors": 0,
+        "avg_ms": 1.434,
+        "p50_ms": 1.406,
+        "p95_ms": 1.671,
+        "p99_ms": 1.857
+      }
+    }
+  }
+}

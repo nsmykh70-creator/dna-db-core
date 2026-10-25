@@ -1,0 +1,11 @@
+[TEST] Starting DNA-DB kill -9 crash durability test...
+[SERVER] DNA-DB listening on 0.0.0.0:9999 (data dir: "./target/dna_test_data")
+[TEST] Sending SIGKILL (kill -9) to PID 16798...
+[TEST] Total acknowledged writes before crash: 118479
+[TEST] Restarting DNA-DB server to trigger WAL replay and torn-write auto-recovery...
+[SERVER] DNA-DB listening on 0.0.0.0:9999 (data dir: "./target/dna_test_data")
+[RESULT] Verification complete:
+  - Total checked: 118480
+  - Missing: 0
+  - Corrupt: 0
+>>> SUCCESS: 100% DURABILITY VERIFIED UNDER SIGKILL (kill -9) <<<

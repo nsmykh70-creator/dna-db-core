@@ -1,0 +1,486 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DNA-DB — панель управления</title>
+<style>
+  :root{
+    --bg:#0b1020; --panel:#121a30; --panel2:#16203c; --line:#24304f;
+    --text:#dbe4ff; --muted:#8b97b8; --accent:#22d3ee; --accent2:#38bdf8;
+    --ok:#34d399; --warn:#fbbf24; --err:#f87171; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:linear-gradient(160deg,#0b1020 0%,#0d1428 60%,#0a0f1e 100%);color:var(--text);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;min-height:100vh}
+  a{color:var(--accent2)}
+  h1,h2,h3{margin:.2em 0 .5em}
+  code,kbd,.mono{font-family:var(--mono)}
+  /* ---------- login ---------- */
+  #login{display:flex;align-items:center;justify-content:center;min-height:100vh}
+  .login-card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:34px 38px;width:360px;box-shadow:0 18px 60px rgba(0,0,0,.45)}
+  .login-card h1{font-size:22px;letter-spacing:.5px}
+  .login-card .helix{font-size:34px;line-height:1}
+  .login-card p{color:var(--muted);font-size:12.5px;margin-top:2px}
+  .login-card label{display:block;margin:14px 0 4px;color:var(--muted);font-size:12px}
+  .login-card input{width:100%;padding:9px 11px;border-radius:8px;border:1px solid var(--line);background:#0d1426;color:var(--text);font-size:14px}
+  .login-card input:focus{outline:none;border-color:var(--accent)}
+  /* ---------- shell ---------- */
+  header.top{display:flex;align-items:center;gap:14px;padding:12px 20px;border-bottom:1px solid var(--line);background:rgba(13,19,38,.85);backdrop-filter:blur(6px);position:sticky;top:0;z-index:5}
+  header.top .brand{font-weight:700;font-size:16px;letter-spacing:.4px}
+  header.top .brand .helix{color:var(--accent);margin-right:6px}
+  header.top nav{display:flex;gap:4px;margin-left:18px;flex-wrap:wrap}
+  header.top nav button{background:none;border:1px solid transparent;color:var(--muted);padding:7px 14px;border-radius:8px;cursor:pointer;font-size:13.5px}
+  header.top nav button.active{background:var(--panel2);border-color:var(--line);color:var(--text)}
+  header.top .who{margin-left:auto;color:var(--muted);font-size:12.5px;display:flex;align-items:center;gap:10px}
+  main{padding:22px;max-width:1280px;margin:0 auto}
+  section.view{display:none}
+  section.view.active{display:block}
+  /* ---------- widgets ---------- */
+  .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px;margin-bottom:18px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+  .card .k{color:var(--muted);font-size:11.5px;text-transform:uppercase;letter-spacing:.8px}
+  .card .v{font-size:20px;font-weight:600;margin-top:4px}
+  .card .v small{font-size:12px;color:var(--muted);font-weight:400}
+  .badge{display:inline-block;padding:2px 8px;border-radius:20px;font-size:11px;border:1px solid var(--line);color:var(--muted)}
+  .badge.ok{color:var(--ok);border-color:rgba(52,211,153,.4)}
+  .badge.err{color:var(--err);border-color:rgba(248,113,113,.4)}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px;margin-bottom:16px}
+  .panel h2{font-size:15px;display:flex;align-items:center;gap:10px}
+  button.act{background:var(--accent);color:#04222b;border:none;padding:8px 14px;border-radius:8px;font-weight:600;cursor:pointer;font-size:13px}
+  button.act:hover{filter:brightness(1.1)}
+  button.act.ghost{background:var(--panel2);color:var(--text);border:1px solid var(--line);font-weight:500}
+  button.act.danger{background:rgba(248,113,113,.15);color:var(--err);border:1px solid rgba(248,113,113,.35)}
+  select,input.txt,textarea{background:#0d1426;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:13.5px}
+  textarea{font-family:var(--mono);width:100%;min-height:130px;resize:vertical;line-height:1.5}
+  textarea:focus,input.txt:focus,select:focus{outline:none;border-color:var(--accent)}
+  /* ---------- tables view ---------- */
+  .tw{display:grid;grid-template-columns:270px 1fr;gap:16px;align-items:start}
+  .tbl-list{background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+  .tbl-list .item{padding:11px 14px;border-bottom:1px solid var(--line);cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:8px}
+  .tbl-list .item:hover{background:var(--panel2)}
+  .tbl-list .item.sel{background:var(--panel2);border-left:3px solid var(--accent)}
+  .tbl-list .item .cnt{color:var(--muted);font-size:11.5px}
+  .tbl-list .empty{padding:14px;color:var(--muted);font-size:13px}
+  .schema-row{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0 4px}
+  .chip{border:1px solid var(--line);border-radius:20px;padding:3px 10px;font-size:11.5px;font-family:var(--mono);background:#0d1426}
+  .chip.pk{border-color:rgba(251,191,36,.5);color:var(--warn)}
+  .chip.idx{border-color:rgba(34,211,238,.5);color:var(--accent)}
+  .chip.fk{border-color:rgba(139,92,246,.55);color:#c4b5fd}
+  .chip button{background:none;border:none;color:var(--err);cursor:pointer;margin-left:6px;font-size:11px}
+  .tbl-meta{color:var(--muted);font-size:12px;display:flex;gap:14px;flex-wrap:wrap;align-items:center}
+  .grid-wrap{overflow:auto;border:1px solid var(--line);border-radius:10px;margin-top:12px;max-height:560px}
+  table.grid{border-collapse:collapse;width:100%;font-size:13px}
+  table.grid th,table.grid td{padding:7px 11px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap;max-width:420px;overflow:hidden;text-overflow:ellipsis}
+  table.grid th{position:sticky;top:0;background:#101833;color:var(--accent2);font-size:12px;letter-spacing:.3px;z-index:1}
+  table.grid tr:nth-child(even) td{background:rgba(255,255,255,.015)}
+  table.grid tr:hover td{background:rgba(34,211,238,.06)}
+  td .null{color:var(--muted);font-style:italic}
+  td .dna{color:var(--ok);font-family:var(--mono)}
+  .pager{display:flex;gap:10px;align-items:center;margin-top:10px;color:var(--muted);font-size:12.5px}
+  /* ---------- console ---------- */
+  .console-bar{display:flex;gap:10px;align-items:center;margin-top:10px;flex-wrap:wrap}
+  .result-meta{color:var(--muted);font-size:12.5px;margin:10px 0 4px;display:flex;gap:14px;flex-wrap:wrap}
+  .plan{font-family:var(--mono);font-size:12px;color:var(--accent2);background:#0d1426;border:1px dashed var(--line);border-radius:8px;padding:8px 10px;margin:8px 0;white-space:pre-wrap}
+  .errbox{background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.4);color:#fecaca;border-radius:8px;padding:10px 12px;font-family:var(--mono);font-size:12.5px;white-space:pre-wrap;margin:8px 0}
+  .examples{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+  .examples button{background:var(--panel2);border:1px solid var(--line);color:var(--muted);border-radius:20px;padding:4px 12px;font-size:11.5px;cursor:pointer;font-family:var(--mono)}
+  .examples button:hover{color:var(--text);border-color:var(--accent)}
+  .hidden{display:none!important}
+  @media (max-width:900px){.tw{grid-template-columns:1fr}}
+  /* helix spinner */
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .spin{display:inline-block;animation:spin 1.6s linear infinite}
+</style>
+</head>
+<body>
+
+<!-- ================= LOGIN ================= -->
+<div id="login">
+  <div class="login-card">
+    <div class="helix">🧬</div>
+    <h1>DNA-DB <span style="color:var(--accent)">Admin</span></h1>
+    <p>Веб-панель управления хранилищем DNA-DB. Те же учётные данные, что и для TCP-протокола.</p>
+    <form id="login-form">
+      <label>Пользователь</label>
+      <input id="login-user" autocomplete="username" value="" placeholder="admin" required>
+      <label>Пароль</label>
+      <input id="login-pass" type="password" autocomplete="current-password" required>
+      <div id="login-err" class="errbox hidden" style="margin-top:14px"></div>
+      <button class="act" style="width:100%;margin-top:18px;padding:10px" type="submit">Войти</button>
+    </form>
+  </div>
+</div>
+
+<!-- ================= APP ================= -->
+<div id="app" class="hidden">
+  <header class="top">
+    <div class="brand"><span class="helix">🧬</span>DNA-DB <span style="color:var(--muted);font-weight:400">Admin</span></div>
+    <nav id="nav">
+      <button data-view="dashboard" class="active">Обзор</button>
+      <button data-view="tables">Таблицы</button>
+      <button data-view="sql">SQL-консоль</button>
+      <button data-view="dnaql">DnaQL-консоль</button>
+    </nav>
+    <div class="who">
+      <span id="who-user"></span>
+      <button class="act ghost" id="logout">Выйти</button>
+    </div>
+  </header>
+
+  <main>
+    <!-- ---------- dashboard ---------- -->
+    <section class="view active" id="view-dashboard">
+      <div class="cards" id="health-cards"></div>
+      <div class="panel">
+        <h2>Показатели движка <span class="badge" id="health-badge">…</span></h2>
+        <div class="grid-wrap" style="max-height:340px"><table class="grid" id="stats-table"><tbody></tbody></table></div>
+      </div>
+      <div class="panel">
+        <h2>Диагностика <span class="badge" id="diag-badge">…</span></h2>
+        <div class="grid-wrap" style="max-height:340px"><table class="grid" id="health-table"><tbody></tbody></table></div>
+      </div>
+    </section>
+
+    <!-- ---------- tables ---------- -->
+    <section class="view" id="view-tables">
+      <div class="tw">
+        <div>
+          <div class="tbl-list" id="tbl-list"><div class="empty">Загрузка…</div></div>
+        </div>
+        <div>
+          <div class="panel" id="tbl-detail">
+            <h2 id="tbl-title">Таблица не выбрана</h2>
+            <div id="tbl-body" class="hidden">
+              <div class="tbl-meta" id="tbl-meta"></div>
+              <div class="schema-row" id="tbl-schema"></div>
+              <div class="console-bar">
+                <input class="txt" id="idx-name" placeholder="имя индекса" style="width:170px" title="Имя индекса">
+                <select id="idx-col"></select>
+                <button class="act" id="idx-create">CREATE INDEX</button>
+                <span style="flex:1"></span>
+                <button class="act ghost" id="tbl-sql">Открыть в SQL-консоли</button>
+              </div>
+              <div class="grid-wrap"><table class="grid" id="tbl-grid"></table></div>
+              <div class="pager">
+                <button class="act ghost" id="pg-prev">← Назад</button>
+                <span id="pg-info">—</span>
+                <button class="act ghost" id="pg-next">Вперёд →</button>
+                <span style="flex:1"></span>
+                <select id="pg-size" class="txt"><option>25</option><option selected>50</option><option>100</option><option>250</option></select>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------- SQL console ---------- -->
+    <section class="view" id="view-sql">
+      <div class="panel">
+        <h2>SQL-консоль <span class="badge">SELECT / INSERT / UPDATE / DELETE / CREATE TABLE / CREATE INDEX</span></h2>
+        <textarea id="sql-input" spellcheck="false" placeholder="SELECT u.name, COUNT(*) AS orders FROM chr_users u WHERE u.id > 0 GROUP BY u.name HAVING COUNT(*) > 0 ORDER BY u.name LIMIT 20"></textarea>
+        <div class="console-bar">
+          <button class="act" id="sql-run">Выполнить <kbd style="opacity:.6">Ctrl+Enter</kbd></button>
+          <button class="act ghost" id="sql-clear">Очистить</button>
+        </div>
+        <div class="examples" id="sql-examples"></div>
+        <div id="sql-out"></div>
+      </div>
+    </section>
+
+    <!-- ---------- DnaQL console ---------- -->
+    <section class="view" id="view-dnaql">
+      <div class="panel">
+        <h2>DnaQL-консоль <span class="badge">ANALYZE SEQUENCE / LOCUS · COMPARE · SEARCH · FILTER · PIPELINES</span></h2>
+        <textarea id="ql-input" spellcheck="false" placeholder="ANALYZE SEQUENCE 'ATGGCCTAA' |> GC_CONTENT() |> MELTING_TEMP()"></textarea>
+        <div class="console-bar">
+          <button class="act" id="ql-run">Выполнить <kbd style="opacity:.6">Ctrl+Enter</kbd></button>
+          <button class="act ghost" id="ql-clear">Очистить</button>
+        </div>
+        <div class="examples" id="ql-examples"></div>
+        <div id="ql-out"></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script>
+"use strict";
+const $ = s => document.querySelector(s);
+let TOKEN = sessionStorage.getItem("dnadb_token") || "";
+let TABLES = [];
+let CURRENT = null, OFFSET = 0, LIMIT = 50;
+
+/* ---------------- api helper ---------------- */
+async function api(path, opts = {}) {
+  opts.headers = Object.assign({ "Authorization": "Bearer " + TOKEN }, opts.headers || {});
+  const res = await fetch(path, opts);
+  if (res.status === 401 && !path.endsWith("/api/login")) { showLogin(); throw new Error("unauthorized"); }
+  let body = null;
+  try { body = await res.json(); } catch (_) {}
+  return { ok: res.ok, status: res.status, body };
+}
+
+/* ---------------- auth ---------------- */
+function showLogin() {
+  TOKEN = ""; sessionStorage.removeItem("dnadb_token");
+  $("#app").classList.add("hidden"); $("#login").classList.remove("hidden");
+}
+function showApp(user) {
+  $("#login").classList.add("hidden"); $("#app").classList.remove("hidden");
+  $("#who-user").textContent = "👤 " + (user || "admin");
+}
+$("#login-form").addEventListener("submit", async e => {
+  e.preventDefault();
+  const errBox = $("#login-err"); errBox.classList.add("hidden");
+  const r = await api("/api/login", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ user: $("#login-user").value.trim(), pass: $("#login-pass").value })
+  }).catch(() => null);
+  if (r && r.ok && r.body && r.body.token) {
+    TOKEN = r.body.token; sessionStorage.setItem("dnadb_token", TOKEN);
+    showApp(r.body.user); boot();
+  } else {
+    errBox.textContent = (r && r.body && r.body.error) || "Ошибка входа";
+    errBox.classList.remove("hidden");
+  }
+});
+$("#logout").addEventListener("click", showLogin);
+
+/* ---------------- navigation ---------------- */
+$("#nav").addEventListener("click", e => {
+  const b = e.target.closest("button"); if (!b) return;
+  document.querySelectorAll("#nav button").forEach(x => x.classList.toggle("active", x === b));
+  document.querySelectorAll("section.view").forEach(x => x.classList.remove("active"));
+  $("#view-" + b.dataset.view).classList.add("active");
+  if (b.dataset.view === "dashboard") loadHealth();
+  if (b.dataset.view === "tables") loadTables();
+});
+
+/* ---------------- render helpers ---------------- */
+function esc(s) { return String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c])); }
+function cellHtml(v) {
+  if (v === null || v === undefined) return '<span class="null">NULL</span>';
+  if (typeof v === "string" && /^[ACGTacgt]+$/.test(v) && v.length >= 8)
+    return '<span class="dna" title="2-bit DNA payload">' + esc(v) + "</span>";
+  return esc(v);
+}
+function renderGrid(tableEl, columns, rows) {
+  if (!columns || !columns.length) { tableEl.innerHTML = ""; return; }
+  let h = "<thead><tr>" + columns.map(c => "<th>" + esc(c) + "</th>").join("") + "</tr></thead><tbody>";
+  for (const row of rows) {
+    h += "<tr>" + columns.map(c => "<td>" + cellHtml(row[c]) + "</td>").join("") + "</tr>";
+  }
+  if (!rows.length) h += '<tr><td colspan="' + columns.length + '" style="color:var(--muted)">пусто (0 строк)</td></tr>';
+  tableEl.innerHTML = h + "</tbody>";
+}
+function kvTable(el, obj) {
+  const tb = el.querySelector("tbody");
+  tb.innerHTML = Object.entries(obj).map(([k, v]) =>
+    "<tr><td style='color:var(--muted)'>" + esc(k) + "</td><td class='mono'>" + esc(
+      typeof v === "object" ? JSON.stringify(v) : v) + "</td></tr>").join("");
+}
+
+/* ---------------- dashboard ---------------- */
+async function loadHealth() {
+  const r = await api("/api/health"); if (!r.ok) return;
+  const h = r.body, hj = h.health || {}, st = h.stats || {};
+  const healthy = String(hj.status || hj.state || "").toLowerCase();
+  const okish = !healthy || healthy.includes("ok") || healthy.includes("healthy");
+  $("#health-badge").className = "badge " + (okish ? "ok" : "err");
+  $("#health-badge").textContent = okish ? "HEALTHY" : (hj.status || "CHECK");
+  $("#diag-badge").className = "badge ok"; $("#diag-badge").textContent = "HEALTH API";
+
+  const cards = [
+    ["Сегменты", h.segments],
+    ["Memtable", fmtBytes(h.memtable_bytes)],
+    ["WAL", fmtBytes(h.wal_bytes)],
+    ["Операций (puts)", fmtNum(st.puts)],
+    ["Лезий найдено", fmtNum(st.lesions_found)],
+    ["Лезий исправлено", fmtNum(st.lesions_repaired)],
+    ["Rescue-ов зеркала", fmtNum(st.mirror_rescues)],
+    ["Аптайм", fmtNum(st.uptime_secs) + " с"],
+  ];
+  $("#health-cards").innerHTML = cards.map(([k, v]) =>
+    '<div class="card"><div class="k">' + k + '</div><div class="v">' + v + "</div></div>").join("");
+  kvTable($("#stats-table"), st);
+  const flat = {};
+  for (const [k, v] of Object.entries(hj)) flat[k] = v;
+  kvTable($("#health-table"), flat);
+}
+function fmtBytes(n) {
+  n = Number(n || 0);
+  if (n < 1024) return n + " B";
+  if (n < 1048576) return (n / 1024).toFixed(1) + " KiB";
+  return (n / 1048576).toFixed(1) + " MiB";
+}
+function fmtNum(n) { return Number(n || 0).toLocaleString("ru-RU"); }
+
+/* ---------------- tables ---------------- */
+async function loadTables() {
+  const r = await api("/api/tables"); if (!r.ok) return;
+  TABLES = r.body.tables || [];
+  const list = $("#tbl-list");
+  if (!TABLES.length) { list.innerHTML = '<div class="empty">Нет таблиц. Создайте через SQL-консоль:<br><code>CREATE TABLE …</code></div>'; return; }
+  list.innerHTML = TABLES.map(t =>
+    '<div class="item" data-t="' + esc(t.name) + '"><span>▦ ' + esc(t.name) + '</span><span class="cnt">' + Object.keys(t.columns).length + " cols</span></div>").join("");
+  list.querySelectorAll(".item").forEach(it => it.addEventListener("click", () => selectTable(it.dataset.t)));
+  if (CURRENT && TABLES.some(t => t.name === CURRENT)) selectTable(CURRENT); else if (TABLES[0]) selectTable(TABLES[0].name);
+}
+function schemaOf(name) { return TABLES.find(t => t.name === name); }
+function selectTable(name) {
+  CURRENT = name; OFFSET = 0;
+  document.querySelectorAll("#tbl-list .item").forEach(i => i.classList.toggle("sel", i.dataset.t === name));
+  $("#tbl-title").textContent = "▦ " + name;
+  $("#tbl-body").classList.remove("hidden");
+  renderSchema(); browse();
+}
+function renderSchema() {
+  const s = schemaOf(CURRENT); if (!s) return;
+  $("#tbl-meta").innerHTML =
+    '<span>PK: <b class="mono">' + esc(s.pk) + "</b></span>" +
+    "<span>Строк: <b id='rowcnt'>…</b></span>" +
+    "<span>Колонок: " + Object.keys(s.columns).length + "</span>";
+  const chips = Object.entries(s.columns).map(([c, ty]) => {
+    const isPk = c === s.pk;
+    const idx = (s.indexes || []).find(i => i.column === c);
+    let cls = "chip" + (isPk ? " pk" : "") + (idx ? " idx" : "");
+    let drop = idx ? '<button data-idx="' + esc(idx.name) + '" title="DROP INDEX ' + esc(idx.name) + '">✕</button>' : "";
+    return '<span class="' + cls + '" title="' + esc(ty) + (idx ? " · index: " + esc(idx.name) : "") + '">' + esc(c) + " : " + esc(shortType(ty)) + drop + "</span>";
+  }).join("");
+  const fks = (s.fks || []).map(f =>
+    '<span class="chip fk" title="ON DELETE ' + (f.on_delete_cascade ? "CASCADE" : "RESTRICT") + '">⇢ ' + esc(f.column) + " → " + esc(f.target_chromosome) + "." + esc(f.target_locus_column) + "</span>").join("");
+  $("#tbl-schema").innerHTML = chips + fks;
+  $("#tbl-schema").querySelectorAll("button[data-idx]").forEach(b =>
+    b.addEventListener("click", async () => {
+      if (!confirm("DROP INDEX " + b.dataset.idx + "?")) return;
+      await runAdminSql("DROP INDEX " + b.dataset.idx + " ON " + CURRENT);
+      loadTables();
+    }));
+  const cols = Object.keys(s.columns).filter(c => c !== s.pk);
+  $("#idx-col").innerHTML = cols.map(c => "<option>" + esc(c) + "</option>").join("");
+  $("#idx-name").placeholder = "idx_" + CURRENT + "_" + (cols[0] || "col");
+}
+function shortType(t) {
+  if (typeof t !== "string") return t && t.ForeignLink ? "FK" : String(t);
+  const m = { Int64:"INT", Float64:"FLOAT", Text:"TEXT", Dna2Bit:"DNA", Timestamp:"TS" };
+  return m[t] || t;
+}
+async function browse() {
+  const r = await api("/api/browse?table=" + encodeURIComponent(CURRENT) + "&limit=" + LIMIT + "&offset=" + OFFSET);
+  if (!r.ok) { $("#tbl-grid").innerHTML = "<tbody><tr><td class='errbox'>" + esc((r.body && r.body.error) || "error") + "</td></tr></tbody>"; return; }
+  const b = r.body;
+  renderGrid($("#tbl-grid"), b.columns, b.rows);
+  const cnt = document.getElementById("rowcnt"); if (cnt) cnt.textContent = fmtNum(b.total);
+  const from = b.total ? OFFSET + 1 : 0, to = Math.min(OFFSET + LIMIT, b.total);
+  $("#pg-info").textContent = "строки " + from + "–" + to + " из " + fmtNum(b.total) + " · " + (b.time_us / 1000).toFixed(2) + " мс · " + esc(b.plan || "");
+  $("#pg-prev").disabled = OFFSET === 0;
+  $("#pg-next").disabled = OFFSET + LIMIT >= b.total;
+}
+$("#pg-prev").addEventListener("click", () => { OFFSET = Math.max(0, OFFSET - LIMIT); browse(); });
+$("#pg-next").addEventListener("click", () => { OFFSET += LIMIT; browse(); });
+$("#pg-size").addEventListener("change", e => { LIMIT = +e.target.value; OFFSET = 0; browse(); });
+$("#idx-create").addEventListener("click", async () => {
+  const col = $("#idx-col").value; if (!col) return;
+  const name = $("#idx-name").value.trim() || ("idx_" + CURRENT + "_" + col);
+  await runAdminSql("CREATE INDEX " + name + " ON " + CURRENT + " (" + col + ")");
+  loadTables();
+});
+async function runAdminSql(sql) {
+  const r = await api("/api/query", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ kind: "sql", query: sql }) });
+  if (!r.ok) alert((r.body && r.body.error) || "SQL error");
+  return r;
+}
+$("#tbl-sql").addEventListener("click", () => {
+  $("#sql-input").value = "SELECT * FROM " + CURRENT + " LIMIT 50";
+  document.querySelector('#nav button[data-view="sql"]').click();
+});
+
+/* ---------------- consoles ---------------- */
+function renderResult(outEl, r) {
+  if (!r.ok) {
+    outEl.innerHTML = '<div class="errbox">' + esc((r.body && r.body.error) || ("HTTP " + r.status)) + "</div>";
+    return;
+  }
+  const b = r.body;
+  let h = "";
+  if (b.plan) h += '<div class="plan">plan: ' + esc(b.plan) + "</div>";
+  const meta = ["⏱ " + (b.time_us / 1000).toFixed(2) + " мс"];
+  if (b.message) meta.push(esc(b.message));
+  if (b.note) meta.push(esc(b.note));
+  if (b.columns) meta.push(b.rows.length + " строк · " + b.columns.length + " колонок");
+  h += '<div class="result-meta">' + meta.join(" · ") + "</div>";
+  h += '<div class="grid-wrap"><table class="grid" id="out-grid"></table></div>';
+  outEl.innerHTML = h;
+  renderGrid(outEl.querySelector("#out-grid"), b.columns || [], b.rows || []);
+}
+async function runSql() {
+  const q = $("#sql-input").value.trim(); if (!q) return;
+  $("#sql-out").innerHTML = '<div class="result-meta">выполняется…</div>';
+  const r = await api("/api/query", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ kind: "sql", query: q }) });
+  renderResult($("#sql-out"), r);
+  saveRecent("dnadb_sql_recent", q);
+}
+async function runQl() {
+  const q = $("#ql-input").value.trim(); if (!q) return;
+  $("#ql-out").innerHTML = '<div class="result-meta">выполняется…</div>';
+  const r = await api("/api/query", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ kind: "dnaql", query: q }) });
+  renderResult($("#ql-out"), r);
+  saveRecent("dnadb_ql_recent", q);
+}
+$("#sql-run").addEventListener("click", runSql);
+$("#ql-run").addEventListener("click", runQl);
+$("#sql-clear").addEventListener("click", () => { $("#sql-input").value = ""; $("#sql-out").innerHTML = ""; });
+$("#ql-clear").addEventListener("click", () => { $("#ql-input").value = ""; $("#ql-out").innerHTML = ""; });
+$("#sql-input").addEventListener("keydown", e => { if (e.ctrlKey && e.key === "Enter") runSql(); });
+$("#ql-input").addEventListener("keydown", e => { if (e.ctrlKey && e.key === "Enter") runQl(); });
+
+function saveRecent(key, q) {
+  try {
+    let arr = JSON.parse(localStorage.getItem(key) || "[]");
+    arr = [q].concat(arr.filter(x => x !== q)).slice(0, 8);
+    localStorage.setItem(key, JSON.stringify(arr));
+  } catch (_) {}
+}
+
+/* example queries */
+const SQL_EXAMPLES = [
+  ["COUNT + GROUP BY", "SELECT status, COUNT(*) AS n, SUM(total_usd) AS revenue FROM chr_orders GROUP BY status"],
+  ["JOIN + ORDER BY", "SELECT u.user_id, u.username, o.total_usd FROM chr_users u INNER JOIN chr_orders o ON u.user_id = o.user_id ORDER BY o.total_usd DESC LIMIT 10"],
+  ["INDEX Range + IN", "SELECT * FROM chr_orders WHERE status IN ('paid','shipped') AND total_usd > 50 ORDER BY total_usd"],
+  ["CREATE INDEX", "CREATE INDEX idx_orders_status ON chr_orders (status)"],
+  ["INSERT", "INSERT INTO chr_users (user_id = 1001, username = 'panel_user', balance = 12.5)"],
+];
+const QL_EXAMPLES = [
+  ["GC + температура плавления", "ANALYZE SEQUENCE 'ATGGCCTAA' |> GC_CONTENT() |> MELTING_TEMP()"],
+  ["Реверс-комплемент + транскрипция + перевод", "ANALYZE SEQUENCE 'ATGGCCTAA' |> REV_COMP() |> TRANSCRIBE() |> TRANSLATE()"],
+  ["Быстрый нечёткий поиск (Levenshtein ≤1)", "chr_variants ? 'GATCGATC' ~1"],
+  ["Стандартный поиск + LINK по FK", "FIND PATTERN 'GATCGATC' IN chr_variants WHERE LEVENSHTEIN_DISTANCE <= 1 LINK chr_patients VIA COMPLEMENT(patient_id) EMIT locus, mismatches, variant_name, name"],
+  ["Пайплайн FROM |> WHERE |> EMIT", "FROM chr_variants |> WHERE variant_id >= 2 |> EMIT variant_id, variant_name, sequence"],
+  ["Проверка целостности хромосомы", "VERIFY CHROMOSOME chr_variants"],
+];
+function mountExamples(sel, items, target) {
+  $(sel).innerHTML = items.map(([, q], i) => "<button data-i='" + i + "'>" + esc(items[i][0]) + "</button>").join("");
+  $(sel).querySelectorAll("button").forEach(b =>
+    b.addEventListener("click", () => { $(target).value = items[+b.dataset.i][1]; }));
+}
+mountExamples("#sql-examples", SQL_EXAMPLES, "#sql-input");
+mountExamples("#ql-examples", QL_EXAMPLES, "#ql-input");
+
+/* ---------------- boot ---------------- */
+async function boot() {
+  loadHealth();
+  const recent = JSON.parse(localStorage.getItem("dnadb_sql_recent") || "[]");
+  if (recent[0] && !$("#sql-input").value) $("#sql-input").value = recent[0];
+}
+if (TOKEN) {
+  api("/api/health").then(r => { if (r.ok) { showApp(sessionStorage.getItem("dnadb_user") || "admin"); boot(); } })
+    .catch(() => {});
+}
+$("#login-user").addEventListener("change", () => {});
+</script>
+</body>
+</html>
