@@ -10,9 +10,14 @@
 
 Фазы (одинаковые ключи/значения/последовательность RNG для всех систем):
   1. load       — N одиночных вставок (KV, autocommit/ack на каждую)
-  2. point-read — R случайных чтений по ключу (p50/p95/p99, ops/s)
-  3. mixed      — T потоков, 80% чтения / 20% записи, агрегированная ops/s
-  4. sql        — реляционная мини-нагрузка: INSERT + SELECT WHERE pk
+  2. load-mt    — те же одиночные INSERT'ы, но в T потоков (пики параллельной записи)
+  3. load-batch — многострочные INSERT'ы пачками по B строк (пик пакетной записи)
+  4. point-read — R случайных чтений по ключу (p50/p95/p99, ops/s)
+  5. mixed      — T потоков, 80% чтения / 20% записи, агрегированная ops/s
+  6. sql        — реляционная мини-нагрузка: INSERT + SELECT WHERE pk
+
+Фазы 2-3 вставляют одинаковый SQL-текст во все три системы и проверяют
+итоговое число строк (verify_ok): это честное сравнение ПИКОВОЙ записи.
 
 Результаты: docs/bench_compare_results.json + таблица в stdout.
 """
@@ -173,6 +178,93 @@ def make_dataset(n):
 
 
 # ---------------------------------------------------------------------------
+# Batch / multi-threaded load helpers (shared by all three adapters)
+# ---------------------------------------------------------------------------
+
+def split_ranges(n, parts):
+    """Split `n` rows into `parts` contiguous (base, count) chunks."""
+    base, out = 0, []
+    for p in range(parts):
+        count = n // parts + (1 if p < n % parts else 0)
+        if count:
+            out.append((base, count))
+        base += count
+    return out
+
+
+def load_row_sql(table, i):
+    """One deterministic single-row INSERT, identical text everywhere."""
+    return ("INSERT INTO %s (user_id, uname, balance) VALUES (%d, 'u%d', %.2f)"
+            % (table, i, i, (i * 3.7) % 10000 / 100))
+
+
+def load_batch_sql(table, start, count):
+    """Multi-row VALUES batch — the same text on DNA-DB, MySQL and PG."""
+    rows = ",".join("(%d, 'u%d', %.2f)" % (i, i, (i * 3.7) % 10000 / 100)
+                    for i in range(start, start + count))
+    return "INSERT INTO %s (user_id, uname, balance) VALUES %s" % (table, rows)
+
+
+def run_mt(n_rows, threads, work):
+    """Parallel single-row load: work(base, count, lat, errors) per worker.
+
+    Returns (stats, errors): ops/s over ALL inserted rows and the latency of
+    every individual INSERT from every thread.
+    """
+    lat, errors = [], []
+    lock = threading.Lock()
+
+    def wrapper(base, count):
+        loc, err = [], []
+        work(base, count, loc, err)
+        with lock:
+            lat.extend(loc)
+            errors.extend(err)
+
+    t0 = time.perf_counter()
+    ts = [threading.Thread(target=wrapper, args=r)
+          for r in split_ranges(n_rows, threads)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    total = time.perf_counter() - t0
+    st = latency_stats(lat)
+    st.pop("ops", None)
+    stats = {"ops": n_rows, "secs": round(total, 3),
+             "ops_s": round(n_rows / total), "threads": threads,
+             "errors": len(errors), **st}
+    return stats, errors
+
+
+def run_batch(n_rows, batch_size, put_batch):
+    """Sequential batched load: put_batch(start, count) -> error or None.
+
+    Latency is measured per *statement* (one multi-row INSERT per batch).
+    """
+    lat, errors = [], []
+    t0 = time.perf_counter()
+    i, batches = 0, 0
+    while i < n_rows:
+        count = min(batch_size, n_rows - i)
+        t = time.perf_counter()
+        err = put_batch(i, count)
+        lat.append(time.perf_counter() - t)
+        if err:
+            errors.append(err)
+        batches += 1
+        i += count
+    total = time.perf_counter() - t0
+    st = latency_stats(lat)
+    st.pop("ops", None)
+    stats = {"ops": n_rows, "secs": round(total, 3),
+             "ops_s": round(n_rows / total), "batches": batches,
+             "batch_size": batch_size, "per_op": "batch",
+             "errors": len(errors), **st}
+    return stats, errors
+
+
+# ---------------------------------------------------------------------------
 # Adapters: общий интерфейс — setup, load, point_read, mixed, sql
 # ---------------------------------------------------------------------------
 
@@ -187,13 +279,59 @@ class DnaDbAdapter:
         return DnaDbClient("127.0.0.1", self.port, "admin", "bench-pass")
 
     def setup(self):
-        # fresh server, fresh storage — only the SQL demo table needs creating
+        # fresh server, fresh storage — only the SQL demo tables need creating
         c = self.connect()
-        resp = c.sql("CREATE TABLE bench_users (user_id INT, uname TEXT, "
-                     "balance FLOAT, PRIMARY KEY (user_id))")
-        if resp.startswith(b"ERR"):
-            raise RuntimeError("dnadb CREATE TABLE failed: %r" % resp[:200])
+        for ddl in (
+            "CREATE TABLE bench_users (user_id INT, uname TEXT, "
+            "balance FLOAT, PRIMARY KEY (user_id))",
+            "CREATE TABLE load_mt (user_id INT, uname TEXT, "
+            "balance FLOAT, PRIMARY KEY (user_id))",
+            "CREATE TABLE load_batch (user_id INT, uname TEXT, "
+            "balance FLOAT, PRIMARY KEY (user_id))",
+        ):
+            resp = c.sql(ddl)
+            if resp.startswith(b"ERR"):
+                raise RuntimeError("dnadb CREATE TABLE failed: %r" % resp[:200])
         c.close()
+
+    def _count(self, table):
+        c = self.connect()
+        try:
+            data = json.loads(c.sql("SELECT COUNT(*) AS n FROM %s" % table))
+        finally:
+            c.close()
+        return int(data["rows"][0]["n"])
+
+    def load_mt(self, n_rows, threads, table):
+        def work(base, count, lat, errors):
+            c = self.connect()
+            for i in range(base, base + count):
+                t = time.perf_counter()
+                resp = c.sql(load_row_sql(table, i))
+                lat.append(time.perf_counter() - t)
+                if resp.startswith(b"ERR"):
+                    errors.append(resp[:120].decode("utf-8", "replace"))
+            c.close()
+        stats, errors = run_mt(n_rows, threads, work)
+        stats["verify_ok"] = self._count(table) == n_rows
+        if errors:
+            print("\n    [load_mt error] %s" % errors[0])
+        return stats
+
+    def load_batch(self, n_rows, batch_size, table):
+        c = self.connect()
+        try:
+            def put(start, count):
+                resp = c.sql(load_batch_sql(table, start, count))
+                return (resp[:120].decode("utf-8", "replace")
+                        if resp.startswith(b"ERR") else None)
+            stats, errors = run_batch(n_rows, batch_size, put)
+        finally:
+            c.close()
+        stats["verify_ok"] = self._count(table) == n_rows
+        if errors:
+            print("\n    [load_batch error] %s" % errors[0])
+        return stats
 
     def load(self, keys, value, rng):
         c = self.connect()
@@ -426,13 +564,71 @@ class MySqlAdapter:
 
     def setup(self):
         cur = self._cursor()
-        cur.execute("DROP TABLE IF EXISTS kvbench")
-        cur.execute("DROP TABLE IF EXISTS bench_users")
-        cur.execute("CREATE TABLE kvbench (k VARCHAR(64) CHARACTER SET ascii "
-                    "PRIMARY KEY, v VARBINARY(512)) ENGINE=InnoDB")
-        cur.execute("CREATE TABLE bench_users (user_id INT PRIMARY KEY, "
-                    "uname VARCHAR(64), balance DOUBLE) ENGINE=InnoDB")
+        for ddl in ("DROP TABLE IF EXISTS kvbench",
+                    "DROP TABLE IF EXISTS bench_users",
+                    "DROP TABLE IF EXISTS load_mt",
+                    "DROP TABLE IF EXISTS load_batch",
+                    "CREATE TABLE kvbench (k VARCHAR(64) CHARACTER SET ascii "
+                    "PRIMARY KEY, v VARBINARY(512)) ENGINE=InnoDB",
+                    "CREATE TABLE bench_users (user_id INT PRIMARY KEY, "
+                    "uname VARCHAR(64), balance DOUBLE) ENGINE=InnoDB",
+                    "CREATE TABLE load_mt (user_id INT PRIMARY KEY, "
+                    "uname VARCHAR(64), balance DOUBLE) ENGINE=InnoDB",
+                    "CREATE TABLE load_batch (user_id INT PRIMARY KEY, "
+                    "uname VARCHAR(64), balance DOUBLE) ENGINE=InnoDB"):
+            cur.execute(ddl)
         cur.close()
+
+    def _connect(self):
+        return self.pymysql.connect(host="127.0.0.1", port=3306, user="root",
+                                    password="bench", database="bench",
+                                    autocommit=True)
+
+    def _count(self, table):
+        cur = self._cursor()
+        cur.execute("SELECT COUNT(*) FROM %s" % table)
+        n = int(cur.fetchone()[0])
+        cur.close()
+        return n
+
+    def load_mt(self, n_rows, threads, table):
+        def work(base, count, lat, errors):
+            conn = self._connect()
+            cur = conn.cursor()
+            for i in range(base, base + count):
+                t = time.perf_counter()
+                try:
+                    cur.execute(load_row_sql(table, i))
+                except Exception as e:
+                    errors.append(str(e)[:120])
+                lat.append(time.perf_counter() - t)
+            cur.close()
+            conn.close()
+        stats, errors = run_mt(n_rows, threads, work)
+        stats["verify_ok"] = self._count(table) == n_rows
+        if errors:
+            print("\n    [load_mt error] %s" % errors[0])
+        return stats
+
+    def load_batch(self, n_rows, batch_size, table):
+        conn = self._connect()
+        cur = conn.cursor()
+
+        def put(start, count):
+            try:
+                cur.execute(load_batch_sql(table, start, count))
+                return None
+            except Exception as e:
+                conn.rollback()
+                return str(e)[:120]
+
+        stats, errors = run_batch(n_rows, batch_size, put)
+        cur.close()
+        conn.close()
+        stats["verify_ok"] = self._count(table) == n_rows
+        if errors:
+            print("\n    [load_batch error] %s" % errors[0])
+        return stats
 
     def close(self):
         self.conn.close()
@@ -557,12 +753,72 @@ class PgAdapter:
 
     def setup(self):
         cur = self.conn.cursor()
-        cur.execute("DROP TABLE IF EXISTS kvbench")
-        cur.execute("DROP TABLE IF EXISTS bench_users")
-        cur.execute("CREATE TABLE kvbench (k TEXT PRIMARY KEY, v BYTEA)")
-        cur.execute("CREATE TABLE bench_users (user_id INT PRIMARY KEY, "
-                    "uname TEXT, balance DOUBLE PRECISION)")
+        for ddl in ("DROP TABLE IF EXISTS kvbench",
+                    "DROP TABLE IF EXISTS bench_users",
+                    "DROP TABLE IF EXISTS load_mt",
+                    "DROP TABLE IF EXISTS load_batch",
+                    "CREATE TABLE kvbench (k TEXT PRIMARY KEY, v BYTEA)",
+                    "CREATE TABLE bench_users (user_id INT PRIMARY KEY, "
+                    "uname TEXT, balance DOUBLE PRECISION)",
+                    "CREATE TABLE load_mt (user_id INT PRIMARY KEY, "
+                    "uname TEXT, balance DOUBLE PRECISION)",
+                    "CREATE TABLE load_batch (user_id INT PRIMARY KEY, "
+                    "uname TEXT, balance DOUBLE PRECISION)"):
+            cur.execute(ddl)
         cur.close()
+
+    def _connect(self):
+        conn = self.psycopg2.connect(host="127.0.0.1", port=5432, user="bench",
+                                     password="bench", dbname="bench")
+        conn.autocommit = True
+        return conn
+
+    def _count(self, table):
+        cur = self.conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM %s" % table)
+        n = int(cur.fetchone()[0])
+        cur.close()
+        return n
+
+    def load_mt(self, n_rows, threads, table):
+        def work(base, count, lat, errors):
+            conn = self._connect()
+            cur = conn.cursor()
+            for i in range(base, base + count):
+                t = time.perf_counter()
+                try:
+                    cur.execute(load_row_sql(table, i))
+                except Exception as e:
+                    conn.rollback()
+                    errors.append(str(e)[:120])
+                lat.append(time.perf_counter() - t)
+            cur.close()
+            conn.close()
+        stats, errors = run_mt(n_rows, threads, work)
+        stats["verify_ok"] = self._count(table) == n_rows
+        if errors:
+            print("\n    [load_mt error] %s" % errors[0])
+        return stats
+
+    def load_batch(self, n_rows, batch_size, table):
+        conn = self._connect()
+        cur = conn.cursor()
+
+        def put(start, count):
+            try:
+                cur.execute(load_batch_sql(table, start, count))
+                return None
+            except Exception as e:
+                conn.rollback()
+                return str(e)[:120]
+
+        stats, errors = run_batch(n_rows, batch_size, put)
+        cur.close()
+        conn.close()
+        stats["verify_ok"] = self._count(table) == n_rows
+        if errors:
+            print("\n    [load_batch error] %s" % errors[0])
+        return stats
 
     def close(self):
         self.conn.close()
@@ -581,6 +837,24 @@ def run_adapter(adapter, args, out):
     r = adapter.load(keys, value, rng)
     out["load"] = r
     print("%d ops/s, avg %.2f ms" % (r["ops_s"], r["avg_ms"]))
+
+    if args.mt_rows:
+        print("  load-mt %d rows x %d threads ... "
+              % (args.mt_rows, args.mt_threads), end="", flush=True)
+        r = adapter.load_mt(args.mt_rows, args.mt_threads, "load_mt")
+        out["load_mt"] = r
+        print("%d rows/s, p50 %.2f ms, errors=%d, verified=%s"
+              % (r["ops_s"], r["p50_ms"], r["errors"], r["verify_ok"]))
+
+    if args.batch_rows:
+        print("  load-batch %d rows, batch=%d ... "
+              % (args.batch_rows, args.batch_size), end="", flush=True)
+        r = adapter.load_batch(args.batch_rows, args.batch_size, "load_batch")
+        out["load_batch"] = r
+        print("%d rows/s (%d batches), p50 %.2f ms/batch, errors=%d, "
+              "verified=%s"
+              % (r["ops_s"], r["batches"], r["p50_ms"], r["errors"],
+                 r["verify_ok"]))
 
     print("  point-read %d ... " % args.reads, end="", flush=True)
     rng2, _, _ = make_dataset(args.load)  # same key order, fresh RNG
@@ -613,6 +887,13 @@ def main():
     global seed_base
     ap = argparse.ArgumentParser(description="DNA-DB vs MySQL vs PostgreSQL")
     ap.add_argument("--load", type=int, default=10000)
+    ap.add_argument("--mt-rows", type=int, default=8000,
+                    help="rows for the multi-threaded load phase (0 = skip)")
+    ap.add_argument("--mt-threads", type=int, default=8)
+    ap.add_argument("--batch-rows", type=int, default=8000,
+                    help="rows for the batched INSERT phase (0 = skip)")
+    ap.add_argument("--batch-size", type=int, default=200,
+                    help="rows per multi-row INSERT statement")
     ap.add_argument("--reads", type=int, default=4000)
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--mixed-ops", type=int, default=500)
@@ -631,7 +912,10 @@ def main():
             "machine": "%s | %s" % (os.name, platform_string()),
             "params": {"load": args.load, "reads": args.reads,
                        "threads": args.threads, "mixed_ops": args.mixed_ops,
-                       "sql_rows": args.sql_rows, "sql_queries": args.sql_queries},
+                       "sql_rows": args.sql_rows, "sql_queries": args.sql_queries,
+                       "mt_rows": args.mt_rows, "mt_threads": args.mt_threads,
+                       "batch_rows": args.batch_rows,
+                       "batch_size": args.batch_size},
             "durability": {
                 "dnadb": "--sync strict (fsync WAL per ack)",
                 "mysql": "innodb_flush_log_at_trx_commit=1 (default)",
@@ -674,22 +958,25 @@ def main():
     print("\nJSON report: %s" % args.json_out)
 
     # Сводная таблица
-    print("\n" + "=" * 78)
-    print("%-28s %10s %10s %10s %10s" %
-          ("system / metric", "load/s", "read/s", "mixed/s", "sql sel/s"))
-    print("-" * 78)
+    print("\n" + "=" * 96)
+    print("%-18s %9s %10s %9s %9s %9s %9s" %
+          ("system / metric", "load1/s", "loadMT/s", "batch/s",
+           "read/s", "mixed/s", "sqlsel/s"))
+    print("-" * 96)
     for key, label in (("dnadb", "DNA-DB"), ("mysql", "MySQL"),
                        ("postgres", "PostgreSQL")):
         s = results["systems"].get(key)
         if not s:
             continue
-        print("%-28s %10d %10d %10d %10d" % (
+        print("%-18s %9d %10d %9d %9d %9d %9d" % (
             label,
             s.get("load", {}).get("ops_s", 0),
+            s.get("load_mt", {}).get("ops_s", 0),
+            s.get("load_batch", {}).get("ops_s", 0),
             s.get("point_read", {}).get("ops_s", 0),
             s.get("mixed", {}).get("ops_s", 0),
             s.get("sql_point_query", {}).get("ops_s", 0)))
-    print("=" * 78)
+    print("=" * 96)
 
 
 def dump_json(path, results):

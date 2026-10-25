@@ -71,6 +71,37 @@ def chart_throughput(systems, out_dir):
     save(fig, out_dir, "throughput.png")
 
 
+def chart_peak_write(systems, out_dir):
+    """Grouped (log-scale) bars: single-thread vs MT vs batch INSERT."""
+    phases = [("load", "Single-thread\nINSERT"),
+              ("load_mt", "MT INSERT\n(8 threads)"),
+              ("load_batch", "Batch INSERT\n(200 rows/stmt)")]
+    present = [k for k, _ in phases
+               if any(k in systems[s] and systems[s][k].get("ops_s")
+                      for s in ORDER)]
+    if not present:
+        return
+    width = 0.8 / len(ORDER)
+
+    fig, ax = plt.subplots(figsize=(9.5, 4.8))
+    for i, key in enumerate(ORDER):
+        vals = [systems[key].get(p, {}).get("ops_s", 0) for p in present]
+        xs = [j + i * width for j in range(len(present))]
+        ax.bar(xs, vals, width * 0.94, label=NAMES[key], color=COLORS[key])
+        for x, v in zip(xs, vals):
+            if v:
+                ax.text(x, v, f"{v:,.0f}", ha="center", va="bottom", fontsize=8)
+
+    ax.set_yscale("log")
+    ax.set_xticks([j + width for j in range(len(present))])
+    ax.set_xticklabels([dict(phases)[p] for p in present], fontsize=8.5)
+    ax.set_ylabel("rows/s, log scale (higher is better)")
+    ax.set_title("Peak write throughput: single-thread vs multithreaded vs batch")
+    ax.grid(axis="y", alpha=0.3, which="both")
+    ax.legend(ncols=len(ORDER))
+    save(fig, out_dir, "peak_write.png")
+
+
 def chart_latency(systems, out_dir, phase, title, fname):
     """Grouped bars: p50/p95/p99 latency in ms for one phase."""
     percentiles = [("p50_ms", "p50"), ("p95_ms", "p95"), ("p99_ms", "p99")]
@@ -180,6 +211,7 @@ def main():
     data = load(args.json)
     systems = data["systems"]
     chart_throughput(systems, args.out)
+    chart_peak_write(systems, args.out)
     chart_latency(systems, args.out, "point_read",
                   "Point read (KV)", "latency_point_read.png")
     chart_latency(systems, args.out, "sql_point_query",
