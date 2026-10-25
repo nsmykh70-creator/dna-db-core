@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Safe Binary Wire Protocol for DNA-DB
 //!
 //! Frame: [length u32 LE][payload], length <= MAX_FRAME_SIZE (16 MB).

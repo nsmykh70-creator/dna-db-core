@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Генерирует итоговый HTML-отчёт DNA-DB из результатов тестов/бенчмарков.
 
 Читает:

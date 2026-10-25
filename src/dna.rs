@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! DNA Sequence Module with 2-bit compression (A=00, C=01, G=10, T=11)
 //!
 //! v2.1.0 production:

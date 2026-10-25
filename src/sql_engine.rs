@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Relational SQL Engine — REAL tokenizer + parser + executor.
 //!
 //! Implemented subset (honest scope):

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Dual-Strand Disk Mirroring (RAID-1-like failover)
 //!
 //! Strand A (primary dir) + Strand B (secondary dir). Every WAL frame and

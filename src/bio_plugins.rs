@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Bio-Plugin Registry — in-database bioinformatics functions.
 //!
 //! v2.1.0: replaced the fake WASM runtime (which only printed "0 memory

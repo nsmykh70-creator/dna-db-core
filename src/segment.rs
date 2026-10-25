@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! SSTable Disk Segment Reader and Writer
 //!
 //! File layout (little-endian):

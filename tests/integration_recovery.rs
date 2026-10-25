@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Integration tests: full lifecycle — write, crash (drop), recovery, flush,
 //! checkpoint, torn WAL, compaction, prefix scans across layers.
 

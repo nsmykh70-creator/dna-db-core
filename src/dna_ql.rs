@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! DnaQL (DNA Query Language) v2.1 — REAL tokenizer, parser and executor.
 //!
 //! Implemented grammar (subset of DNAQL_SPEC.md, fully functional):

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Bit-Parallel Genomic Alignment Engine (Myers / Wu-Manber Bitap)
 //!
 //! v2.1.0: correct bit-parallel approximate matching with the standard

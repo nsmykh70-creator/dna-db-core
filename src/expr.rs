@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Shared expression AST + evaluator for WHERE/FILTER clauses.
 //! Used by both DnaQL pipelines and the SQL engine.
 //! Grammar: or_expr -> and_expr (OR and_expr)*

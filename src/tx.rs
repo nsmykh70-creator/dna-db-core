@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Transaction Coordinator — atomic multi-table writes
 //!
 //! v2.1.0 reality check (documented honestly):

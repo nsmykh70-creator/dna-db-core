@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Живой smoke-тест продакшен-бинарника DNA-DB.
 
 Поднимает реальный сервер (release-сборка, strict fsync), прогоняет все

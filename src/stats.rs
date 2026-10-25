@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Engine Statistics — real atomic counters (no fabrication).
 //!
 //! Counters are monotonically increasing since engine open. Latency is

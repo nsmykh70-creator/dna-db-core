@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Tiered Hybrid Storage — REAL file-based tier management.
 //!
 //! Tier layout on disk:

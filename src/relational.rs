@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Relational Schema Mapping via Genomic Base-Pairing Metaphor
 //!
 //! Tables -> Chromosomes ('chr_name:locus_id' LSM namespace)

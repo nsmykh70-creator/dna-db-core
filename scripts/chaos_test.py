@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """
 DNA-DB v3.0 «Repairosome» — chaos test (the readiness criterion).
 

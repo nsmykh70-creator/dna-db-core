@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Crash-Resilient Write-Ahead Log (WAL)
 //!
 //! Durability contract (documented & tested):

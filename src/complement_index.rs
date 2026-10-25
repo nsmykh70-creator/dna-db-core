@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Complement Index — O(1) foreign-key navigation ("Base-Pairing Complementarity")
 //!
 //! A real secondary hash index: maps (chromosome, column, encoded value) ->
