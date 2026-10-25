@@ -1,0 +1,838 @@
+{
+  "meta": {
+    "date": "2026-10-26 01:41:15",
+    "machine": "Windows-11-10.0.26200-SP0",
+    "systems": {
+      "dnadb": "dna-db-core 3.0.0 (native, --sync strict)",
+      "mysql": "MySQL 8.4.11 (docker mysql:8.4)",
+      "postgres": "PostgreSQL 17.11 (docker postgres:17)"
+    },
+    "big_rows": 1000,
+    "setup_errors": {}
+  },
+  "checks": [
+    {
+      "id": "create_tables",
+      "group": "DDL",
+      "title": "CREATE TABLE + PK + FK",
+      "systems": {
+        "dnadb": {
+          "status": "ok",
+          "detail": "CreateTable(ddl_probe) cols=2 fks=0; BatchInsert(ddl_probe) rows=1 via single WAL frame; SeqScan(ddl_probe) -> Sort(id ASC) -> Project([\"id\", \"label\"]); DropTable(ddl_probe)",
+          "note": "",
+          "expect": "ok"
+        },
+        "mysql": {
+          "status": "ok",
+          "detail": "CREATE/INSERT/SELECT/DROP",
+          "note": "",
+          "expect": "ok"
+        },
+        "postgres": {
+          "status": "ok",
+          "detail": "CREATE/INSERT/SELECT/DROP",
+          "note": "",
+          "expect": "ok"
+        }
+      }
+    },
+    {
+      "id": "pk_unique",
+      "group": "DDL",
+      "title": "Duplicate primary key is rejected",
+      "systems": {
+        "dnadb": {
+          "status": "ok",
+          "detail": "rejected: ERR: duplicate primary key in INSERT: users:1",
+          "note": "",
+          "expect": "rows"
+        },
+        "mysql": {
+          "status": "ok",
+          "detail": "rejected: (1062, \"Duplicate entry '1' for key 'users.PRIMARY'\")",
+          "note": "",
+          "expect": "rows"
+        },
+        "postgres": {
+          "status": "ok",
+          "detail": "rejected: duplicate key value violates unique constraint \"users_pkey\"",
+          "note": "",
+          "expect": "rows"
+        }
+      }
+    },
+    {
+      "id": "fk_violation",
+      "group": "DDL",
+      "title": "Foreign key violation is rejected",
+      "systems": {
+        "dnadb": {
+          "status": "ok",
+          "detail": "rejected: ERR: FK violation: user_id=99 not found in 'users'",
+          "note": "",
+          "expect": "rows"
+        },
+        "mysql": {
+          "status": "ok",
+          "detail": "rejected: (1452, 'Cannot add or update a child row: a foreign key constraint fails (`bench`.`orders`, CONSTRAINT `orders_ibfk_1` FOREIGN KEY (`user_id`) REFERENCES `users` (`user_id`))')",
+          "note": "",
+          "expect": "rows"
+        },
+        "postgres": {
+          "status": "ok",
+          "detail": "rejected: insert or update on table \"orders\" violates foreign key constraint \"orders_user_id_fkey\"",
+          "note": "",
+          "expect": "rows"
+        }
+      }
+    },
+    {
+      "id": "select_order_by",
+      "group": "SELECT / WHERE",
+      "title": "SELECT with ORDER BY",
+      "systems": {
+        "dnadb": {
+          "status": "ok",
+          "detail": "7 row(s) match",
+          "note": "plan: SeqScan(users) -> Sort(user_id ASC) -> Project([\"user_id\", \"username\", \"balance\"])",
+          "expect": "rows"
+        },
+        "mysql": {
+          "status": "ok",
+          "detail": "7 row(s) match",
+          "note": "",
+          "expect": "rows"
+        },
+        "postgres": {
+          "status": "ok",
+          "detail": "7 row(s) match",
+          "note": "",
+          "expect": "rows"
+        }
+      }
+    },
+    {
+      "id": "projection_alias",
+      "group": "SELECT / WHERE",
+      "title": "Projection aliases (AS)",
+      "systems": {
+        "dnadb": {
+          "status": "ok",
+          "detail": "7 row(s) match",
+          "note": "plan: SeqScan(users) -> Sort(user_id ASC) -> Project([\"user_id\", \"username AS name\"])",
+          "expect": "rows"
+        },
+        "mysql": {
+          "status": "ok",
+          "detail": "7 row(s) match",
+          "note": "",
+          "expect": "rows"
+        },
+        "postgres": {
+          "status": "ok",
+          "detail": "7 row(s) match",
+          "note": "",
+          "expect": "rows"
+        }
+      }
+    },
+    {
+      "id": "where_in_list",
+      "group": "SELECT / WHERE",
+      "title": "WHERE ... IN (list)",
+      "systems": {
+        "dnadb": {
+          "status": "ok",
+          "detail": "6 row(s) match",
+          "note": "plan: SeqScan(orders) -> Filter(status IN (paid, shipped)) -> Sort(order_id ASC) -> Project([\"order_id\"])",
+          "expect": "rows"
+        },
+        "mysql": {
+          "status": "ok",
+          "detail": "6 row(s) match",
+          "note": "",
+          "expect": "rows"
+        },
+        "postgres": {
+          "status": "ok",
+          "detail": "6 row(s) match",
+          "note": "",
+          "expect": "rows"
+        }
+      }
+    },
+    {
+      "id": "where_and_or",
+      "group": "SELECT / WHERE",
+      "title": "WHERE with AND / != / comparison",
+      "systems": {
+        "dnadb": {
+          "status": "ok",
+          "detail": "3 row(s) match",
+          "note": "plan: SeqScan(orders) -> Filter((status != paid AND total_usd < 300)) -> Sort(order_id ASC) -> Project([\"order_id\"])",
+          "expect": "rows"
+        },
+        "mysql": {
+          "status": "ok",
+          "detail": "3 row(s) match",
+          "note": "",
+          "expect": "rows"
+        },
+        "postgres": {
+          "status": "ok",
+          "detail": "3 row(s) match",
+          "note": "",
+          "expect": "rows"
+        }
+      }
+    },
+    {
+      "id": "order_limit_offset",
+      "group": "SELECT / WHERE",
+      "title": "ORDER BY DESC + LIMIT/OFFSET",
+      "systems": {
+        "dnadb": {
+          "status": "ok",
+          "detail": "3 row(s) match",
+          "note": "plan: SeqScan(orders) -> Sort(total_usd DESC) -> Project([\"order_id\", \"total_usd\"]) -> Offset(1) -> Limit(3)",
+          "expect": "rows"
+        },
+        "mysql": {
+          "status": "ok",
+          "detail": "3 row(s) match",
+          "note": "",
+          "expect": "rows"
+        },
+        "postgres": {
+          "status": "ok",
+          "detail": "3 row(s) match",
+          "note": "",
+          "expect": "rows"
+        }
+      }
+    },
+    {
+      "id": "is_null",
+      "group": "SELECT / WHERE",
+      "title": "IS NULL",
+      "systems": {
+        "dnadb": {
+          "status": "ok",
+          "detail": "1 row(s) match",
+          "note": "plan: SeqScan(users) -> Filter(balance IS NULL) -> Sort(user_id ASC) -> Project([\"user_id\"])",
+          "expect": "rows"
+        },
+        "mysql": {
+          "status": "ok",
+          "detail": "1 row(s) match",
+          "note": "",
+          "expect": "rows"
+        },
+        "postgres": {
+          "status": "ok",
+          "detail": "1 row(s) match",
+          "note": "",
+          "expect": "rows"
+        }
+      }
+    },
+    {
+      "id": "is_not_null",
+      "group": "SELECT / WHERE",
+      "title": "IS NOT NULL",
+      "systems": {
+        "dnadb": {
+          "status": "unsupported",
+          "detail": "ERR: SQL: expected NULL",
+          "note": "",
+          "expect": "unsupported"
+        },
+        "mysql": {
+          "status": "ok",
+          "detail": "6 row(s) match",
+          "note": "",
+          "expect": "rows"
+        },
+        "postgres": {
+          "status": "ok",
+          "detail": "6 row(s) match",
+          "note": "",
+          "expect": "rows"
+        }
+      }
+    },
+    {
+      "id": "computed_projection",
+      "group": "SELECT / WHERE",
+      "title": "Computed expression in SELECT (col * 2)",
+      "systems": {
+        "dnadb": {
+          "status": "unsupported",
+          "detail": "ERR: SQL: expected FROM",
+          "note": "",
+          "expect": "unsupported"
+        },
+        "mysql": {
+          "status": "ok",
+          "detail": "3 row(s) match",
+          "note": "",
+          "expect": "rows"
+        },
+        "postgres": {
+          "status": "ok",
+          "detail": "3 row(s) match",
+          "note": "",
+          "expect": "rows"
+        }
+      }
+    },
+    {
+      "id": "qualified_order_by",
+      "group": "SELECT / WHERE",
+      "title": "ORDER BY with qualified column (t.col)",
+      "systems": {
+        "dnadb": {
+          "status": "unsupported",
+          "detail": "ERR: SQL: unexpected trailing tokens starting at Dot (unsupported syntax?)",
+          "note": "",
+          "expect": "unsupported"
+        },
+        "mysql": {
+          "status": "ok",
+          "detail": "8 row(s) match",
+          "note": "",
+          "expect": "rows"
+        },
+        "postgres": {
+          "status": "ok",
+          "detail": "8 row(s) match",
+          "note": "",
+          "expect": "rows"
+        }
+      }
+    },
+    {
+      "id": "join_inner",
+      "group": "JOIN",
+      "title": "INNER JOIN",
+      "systems": {
+        "dnadb": {
+          "status": "ok",
+          "detail": "8 row(s) match",
+          "note": "plan: SeqScan(users) -> InnerHashJoin(users.user_id, orders.user_id) -> Sort(order_id ASC) -> Project([\"username\", \"order_id\"])",
+          "expect": "rows"
+        },
+        "mysql": {
+          "status": "ok",
+          "detail": "8 row(s) match",
+          "note": "",
+          "expect": "rows"
+        },
+        "postgres": {
+          "status": "ok",
+          "detail": "8 row(s) match",
+          "note": "",
+          "expect": "rows"
+        }
+      }
+    },
+    {
+      "id": "join_left",
+      "group": "JOIN",
+      "title": "LEFT JOIN with NULL extension",
+      "systems": {
+        "dnadb": {
+          "status": "ok",
+          "detail": "10 row(s) match",
+          "note": "plan: SeqScan(users) -> LeftHashJoin(users.user_id, orders.user_id) -> Sort(username ASC, order_id ASC) -> Project([\"username\", \"order_id\"])",
+          "expect": "rows"
+        },
+        "mysql": {
+          "status": "ok",
+          "detail": "10 row(s) match",
+          "note": "",
+          "expect": "rows"
+        },
+        "postgres": {
+          "status": "ok",
+          "detail": "10 row(s) match",
+          "note": "",
+          "expect": "rows"
+        }
+      }
+    },
+    {
+      "id": "join_right",
+      "group": "JOIN",
+      "title": "RIGHT JOIN",
+      "systems": {
+        "dnadb": {
+          "status": "unsupported",
+          "detail": "ERR: SQL: unexpected trailing tokens starting at Ident(\"RIGHT\") (unsupported syntax?)",
+          "note": "",
+          "expect": "unsupported"
+        },
+        "mysql": {
+          "status": "ok",
+          "detail": "8 row(s) match",
+          "note": "",
+          "expect": "rows"
+        },
+        "postgres": {
+          "status": "ok",
+          "detail": "8 row(s) match",
+          "note": "",
+          "expect": "rows"
+        }
+      }
+    },
+    {
+      "id": "join_full",
+      "group": "JOIN",
+      "title": "FULL OUTER JOIN",
+      "systems": {
+        "dnadb": {
+          "status": "unsupported",
+          "detail": "ERR: SQL: unexpected trailing tokens starting at Ident(\"OUTER\") (unsupported syntax?)",
+          "note": "",
+          "expect": "unsupported"
+        },
+        "mysql": {
+          "status": "unsupported",
+          "detail": "(1064, \"You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'OUTER JOIN orders ON users.user_id = orders.user_id ORDER BY users.user_id, orde' at line 1\")",
+          "note": "",
+          "expect": "unsupported"
+        },
+        "postgres": {
+          "status": "ok",
+          "detail": "10 row(s) match",
+          "note": "",
+          "expect": "rows"
+        }
+      }
+    },
+    {
+      "id": "agg_functions",
+      "group": "Aggregates",
+      "title": "COUNT / SUM / AVG / MIN / MAX",
+      "systems": {
+        "dnadb": {
+          "status": "ok",
+          "detail": "1 row(s) match",
+          "note": "plan: SeqScan(orders) -> Aggregate(group_by=[], aggs=[\"COUNT(*)\", \"SUM(total_usd)\", \"AVG(total_usd)\", \"MIN(total_usd)\", \"MAX(total_usd)\"])",
+          "expect": "rows"
+        },
+        "mysql": {
+          "status": "ok",
+          "detail": "1 row(s) match",
+          "note": "",
+          "expect": "rows"
+        },
+        "postgres": {
+          "status": "ok",
+          "detail": "1 row(s) match",
+          "note": "",
+          "expect": "rows"
+        }
+      }
+    },
+    {
+      "id": "group_by",
+      "group": "Aggregates",
+      "title": "GROUP BY",
+      "systems": {
+        "dnadb": {
+          "status": "ok",
+          "detail": "3 row(s) match",
+          "note": "plan: SeqScan(orders) -> Aggregate(group_by=[\"status\"], aggs=[\"COUNT(*)\"]) -> Sort(status ASC)",
+          "expect": "rows"
+        },
+        "mysql": {
+          "status": "ok",
+          "detail": "3 row(s) match",
+          "note": "",
+          "expect": "rows"
+        },
+        "postgres": {
+          "status": "ok",
+          "detail": "3 row(s) match",
+          "note": "",
+          "expect": "rows"
+        }
+      }
+    },
+    {
+      "id": "having",
+      "group": "Aggregates",
+      "title": "HAVING on aggregate",
+      "systems": {
+        "dnadb": {
+          "status": "ok",
+          "detail": "1 row(s) match",
+          "note": "plan: SeqScan(orders) -> Aggregate(group_by=[\"status\"], aggs=[\"COUNT(*)\"]) -> Having -> Sort(status ASC)",
+          "expect": "rows"
+        },
+        "mysql": {
+          "status": "ok",
+          "detail": "1 row(s) match",
+          "note": "",
+          "expect": "rows"
+        },
+        "postgres": {
+          "status": "ok",
+          "detail": "1 row(s) match",
+          "note": "",
+          "expect": "rows"
+        }
+      }
+    },
+    {
+      "id": "order_by_aggregate",
+      "group": "Aggregates",
+      "title": "ORDER BY aggregate alias",
+      "systems": {
+        "dnadb": {
+          "status": "ok",
+          "detail": "3 row(s) match",
+          "note": "plan: SeqScan(orders) -> Aggregate(group_by=[\"status\"], aggs=[\"COUNT(*)\", \"SUM(total_usd)\"]) -> Sort(revenue DESC)",
+          "expect": "rows"
+        },
+        "mysql": {
+          "status": "ok",
+          "detail": "3 row(s) match",
+          "note": "",
+          "expect": "rows"
+        },
+        "postgres": {
+          "status": "ok",
+          "detail": "3 row(s) match",
+          "note": "",
+          "expect": "rows"
+        }
+      }
+    },
+    {
+      "id": "agg_null_skip",
+      "group": "Aggregates",
+      "title": "Aggregates ignore NULL values",
+      "systems": {
+        "dnadb": {
+          "status": "ok",
+          "detail": "1 row(s) match",
+          "note": "AVG must ignore the NULL row | plan: SeqScan(users) -> Aggregate(group_by=[], aggs=[\"AVG(balance)\"])",
+          "expect": "rows"
+        },
+        "mysql": {
+          "status": "ok",
+          "detail": "1 row(s) match",
+          "note": "AVG must ignore the NULL row",
+          "expect": "rows"
+        },
+        "postgres": {
+          "status": "ok",
+          "detail": "1 row(s) match",
+          "note": "AVG must ignore the NULL row",
+          "expect": "rows"
+        }
+      }
+    },
+    {
+      "id": "in_subquery",
+      "group": "Subqueries",
+      "title": "WHERE x IN (SELECT ...)",
+      "systems": {
+        "dnadb": {
+          "status": "ok",
+          "detail": "5 row(s) match",
+          "note": "plan: SeqScan(users) -> Filter(user_id IN (1, 1, 2, 3, 3, 4, 5, 5)) -> Sort(user_id ASC) -> Project([\"user_id\", \"username\"])",
+          "expect": "rows"
+        },
+        "mysql": {
+          "status": "ok",
+          "detail": "5 row(s) match",
+          "note": "",
+          "expect": "rows"
+        },
+        "postgres": {
+          "status": "ok",
+          "detail": "5 row(s) match",
+          "note": "",
+          "expect": "rows"
+        }
+      }
+    },
+    {
+      "id": "scalar_subquery",
+      "group": "Subqueries",
+      "title": "Scalar subquery in SELECT",
+      "systems": {
+        "dnadb": {
+          "status": "unsupported",
+          "detail": "ERR: SQL: expected identifier, got LParen",
+          "note": "",
+          "expect": "unsupported"
+        },
+        "mysql": {
+          "status": "ok",
+          "detail": "1 row(s) match",
+          "note": "",
+          "expect": "rows"
+        },
+        "postgres": {
+          "status": "ok",
+          "detail": "1 row(s) match",
+          "note": "",
+          "expect": "rows"
+        }
+      }
+    },
+    {
+      "id": "index_create",
+      "group": "Indexes",
+      "title": "CREATE INDEX on existing table",
+      "systems": {
+        "dnadb": {
+          "status": "ok",
+          "detail": "CreateIndex(idx_big_user ON big_orders.user_id rows=1000); CreateIndex(idx_big_total ON big_orders.total_usd rows=1000); analyze skipped: ERR: SQL: unsupported statement starting at Ident(\"ANALYZE\")",
+          "note": "",
+          "expect": "ok"
+        },
+        "mysql": {
+          "status": "ok",
+          "detail": "analyze skipped: (1064, \"You have an error in your SQL syntax; check the manual that corresponds ",
+          "note": "",
+          "expect": "ok"
+        },
+        "postgres": {
+          "status": "ok",
+          "detail": "indexes created",
+          "note": "",
+          "expect": "ok"
+        }
+      }
+    },
+    {
+      "id": "index_plan_equality",
+      "group": "Indexes",
+      "title": "Planner uses index for equality",
+      "systems": {
+        "dnadb": {
+          "status": "ok",
+          "detail": "index used: IndexScan(big_orders.user_id IN (123)) -> Filter(user_id = 123) -> Project([\"order_id\"]) | rows match: 2",
+          "note": "",
+          "expect": "ok"
+        },
+        "mysql": {
+          "status": "ok",
+          "detail": "index used: key=idx_big_user type=ref | rows match: 2",
+          "note": "",
+          "expect": "ok"
+        },
+        "postgres": {
+          "status": "ok",
+          "detail": "index used: Bitmap Heap Scan on big_orders  (cost=4.29..8.85 rows=2 width=4)   Recheck Cond: (user_id = 123)   ->  Bitmap Index Scan on idx_big_user  (cost=0.00..4.29 rows=2 width=0)         Index Cond: (user_id = 123) | rows match: 2",
+          "note": "",
+          "expect": "ok"
+        }
+      }
+    },
+    {
+      "id": "index_plan_range",
+      "group": "Indexes",
+      "title": "Planner uses index for range (>=)",
+      "systems": {
+        "dnadb": {
+          "status": "ok",
+          "detail": "index used: IndexScan(big_orders.total_usd >=1490) -> Filter(total_usd >= 1490) -> Project([\"order_id\"]) | rows match: 7",
+          "note": "",
+          "expect": "ok"
+        },
+        "mysql": {
+          "status": "ok",
+          "detail": "index used: key=idx_big_total type=range | rows match: 7",
+          "note": "",
+          "expect": "ok"
+        },
+        "postgres": {
+          "status": "ok",
+          "detail": "index used: Index Scan using idx_big_total on big_orders  (cost=0.28..8.41 rows=8 width=4)   Index Cond: (total_usd >= '1490'::double precision) | rows match: 7",
+          "note": "",
+          "expect": "ok"
+        }
+      }
+    },
+    {
+      "id": "index_dml",
+      "group": "Indexes",
+      "title": "Index kept correct by UPDATE / DELETE",
+      "systems": {
+        "dnadb": {
+          "status": "ok",
+          "detail": "index entries updated by UPDATE and DELETE",
+          "note": "",
+          "expect": "ok"
+        },
+        "mysql": {
+          "status": "ok",
+          "detail": "index entries updated by UPDATE and DELETE",
+          "note": "",
+          "expect": "ok"
+        },
+        "postgres": {
+          "status": "ok",
+          "detail": "index entries updated by UPDATE and DELETE",
+          "note": "",
+          "expect": "ok"
+        }
+      }
+    },
+    {
+      "id": "index_drop",
+      "group": "Indexes",
+      "title": "DROP INDEX",
+      "systems": {
+        "dnadb": {
+          "status": "ok",
+          "detail": "DROP INDEX idx_big_user -> 2 row(s) still correct",
+          "note": "",
+          "expect": "ok"
+        },
+        "mysql": {
+          "status": "ok",
+          "detail": "DROP INDEX idx_big_user ON big_orders -> 2 row(s) still correct",
+          "note": "",
+          "expect": "ok"
+        },
+        "postgres": {
+          "status": "ok",
+          "detail": "DROP INDEX idx_big_user -> 2 row(s) still correct",
+          "note": "",
+          "expect": "ok"
+        }
+      }
+    },
+    {
+      "id": "transaction_rollback",
+      "group": "Advanced / limits",
+      "title": "BEGIN / INSERT / ROLLBACK",
+      "systems": {
+        "dnadb": {
+          "status": "unsupported",
+          "detail": "ERR: SQL: unsupported statement starting at Ident(\"BEGIN\") | stmt: BEGIN",
+          "note": "",
+          "expect": "unsupported"
+        },
+        "mysql": {
+          "status": "ok",
+          "detail": "0 row(s) match",
+          "note": "rolled-back row must not exist",
+          "expect": "rows"
+        },
+        "postgres": {
+          "status": "ok",
+          "detail": "0 row(s) match",
+          "note": "rolled-back row must not exist",
+          "expect": "rows"
+        }
+      }
+    },
+    {
+      "id": "union",
+      "group": "Advanced / limits",
+      "title": "UNION",
+      "systems": {
+        "dnadb": {
+          "status": "unsupported",
+          "detail": "ERR: SQL: unexpected trailing tokens starting at Ident(\"UNION\") (unsupported syntax?)",
+          "note": "",
+          "expect": "unsupported"
+        },
+        "mysql": {
+          "status": "ok",
+          "detail": "10 row(s) match",
+          "note": "",
+          "expect": "rows"
+        },
+        "postgres": {
+          "status": "ok",
+          "detail": "10 row(s) match",
+          "note": "",
+          "expect": "rows"
+        }
+      }
+    },
+    {
+      "id": "show_tables",
+      "group": "Advanced / limits",
+      "title": "Table introspection (dialect-specific)",
+      "systems": {
+        "dnadb": {
+          "status": "unsupported",
+          "detail": "ERR: SQL: unsupported statement starting at Ident(\"SHOW\")",
+          "note": "",
+          "expect": "unsupported"
+        },
+        "mysql": {
+          "status": "ok",
+          "detail": "SHOW TABLES -> ['bench_users', 'big_orders', 'kvbench', 'orders', 'users']",
+          "note": "",
+          "expect": "ok"
+        },
+        "postgres": {
+          "status": "ok",
+          "detail": "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' -> ['bench_users', 'big_orders', 'kvbench', 'orders', 'users']",
+          "note": "",
+          "expect": "ok"
+        }
+      }
+    },
+    {
+      "id": "explain_statement",
+      "group": "Advanced / limits",
+      "title": "EXPLAIN <query>",
+      "systems": {
+        "dnadb": {
+          "status": "unsupported",
+          "detail": "ERR: SQL: unsupported statement starting at Ident(\"EXPLAIN\")",
+          "note": "",
+          "expect": "unsupported"
+        },
+        "mysql": {
+          "status": "ok",
+          "detail": "EXPLAIN returns 1 row(s)",
+          "note": "",
+          "expect": "ok"
+        },
+        "postgres": {
+          "status": "ok",
+          "detail": "EXPLAIN returns 2 row(s)",
+          "note": "",
+          "expect": "ok"
+        }
+      }
+    }
+  ],
+  "summary": {
+    "dnadb": {
+      "ok": 22,
+      "unsupported": 10,
+      "mismatch": 0,
+      "error": 0,
+      "n/a": 0
+    },
+    "mysql": {
+      "ok": 31,
+      "unsupported": 1,
+      "mismatch": 0,
+      "error": 0,
+      "n/a": 0
+    },
+    "postgres": {
+      "ok": 32,
+      "unsupported": 0,
+      "mismatch": 0,
+      "error": 0,
+      "n/a": 0
+    }
+  }
+}

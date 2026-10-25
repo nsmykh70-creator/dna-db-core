@@ -155,6 +155,9 @@ identically correct data. For complex relational workloads, transactions across 
 replication or analytics, MySQL/PostgreSQL remain the right tool; DNA-DB's niche is
 genomics-shaped workloads (fuzzy sequence search, packed nucleotides, self-healing storage).
 
+Feature-by-feature (not performance) comparison of the same three systems — 32 SQL checks with
+charts and real error texts: [SQL_FEATURES.md](SQL_FEATURES.md).
+
 ---
 
 ## 7. How to reproduce

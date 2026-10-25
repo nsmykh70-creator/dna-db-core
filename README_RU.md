@@ -260,6 +260,9 @@ python3 scripts/chaos_test.py       # порча секторов -> doctor --fi
 Сравнительный бенчмарк **DNA-DB vs MySQL vs PostgreSQL** (графики, методика, сырые данные):
 [docs/DB_COMPARISON_RU.md](docs/DB_COMPARISON_RU.md).
 
+Таблица соответствия SQL-фич (JOIN / агрегаты / индексы, 32 проверки на всех трёх системах):
+[docs/SQL_FEATURES_RU.md](docs/SQL_FEATURES_RU.md).
+
 Скриншоты веб-панели и отчёты о тестах: [docs/screenshots](docs/screenshots), [docs/](docs/).
 
 ## 8. Лицензия и статус

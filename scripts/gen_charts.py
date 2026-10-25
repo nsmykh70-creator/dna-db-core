@@ -123,10 +123,58 @@ def chart_errors(systems, out_dir):
     save(fig, out_dir, "correctness.png")
 
 
+def chart_sql_features(out_dir, path):
+    """Stacked bars: supported / documented gap / wrong result per system."""
+    data = load(path)
+    names = {"dnadb": "DNA-DB", "mysql": "MySQL", "postgres": "PostgreSQL"}
+    colors = {"ok": "#22c55e", "unsupported": "#94a3b8", "bad": "#ef4444"}
+    labels = {"ok": "supported & correct",
+              "unsupported": "not supported (documented gap)",
+              "bad": "wrong result / unexpected error"}
+    keys = [k for k in ("dnadb", "mysql", "postgres")
+            if k in data["summary"]]
+
+    fig, ax = plt.subplots(figsize=(9.0, 3.6))
+    ys = range(len(keys))
+    left = [0] * len(keys)
+    for bucket in ("ok", "unsupported", "bad"):
+        vals = []
+        for k in keys:
+            s = data["summary"][k]
+            if bucket == "ok":
+                v = s.get("ok", 0)
+            elif bucket == "unsupported":
+                v = s.get("unsupported", 0)
+            else:
+                v = s.get("mismatch", 0) + s.get("error", 0)
+            vals.append(v)
+        ax.barh(list(ys), vals, left=left, color=colors[bucket],
+                label=labels[bucket])
+        for y, v, l in zip(ys, vals, left):
+            if v:
+                ax.text(l + v / 2, y, str(v), ha="center", va="center",
+                        color="white" if bucket != "ok" else "#052e16",
+                        fontsize=9, fontweight="bold")
+        left = [l + v for l, v in zip(left, vals)]
+
+    ax.set_yticks(list(ys))
+    ax.set_yticklabels([names[k] for k in keys])
+    ax.invert_yaxis()
+    ax.set_xlabel("feature checks passed")
+    ax.set_title("SQL feature conformance (%d checks per system)"
+                 % len(data["checks"]))
+    ax.grid(axis="x", alpha=0.3)
+    ax.legend(loc="lower right", fontsize=8, ncols=1)
+    ax.set_xlim(0, max(left) * 1.08)
+    save(fig, out_dir, "sql_features.png")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--json", default=os.path.join(DOCS, "bench_compare_results.json"))
     ap.add_argument("--out", default=os.path.join(DOCS, "charts"))
+    ap.add_argument("--sql-json", default=os.path.join(
+        DOCS, "sql_feature_results.json"))
     args = ap.parse_args()
 
     data = load(args.json)
@@ -137,6 +185,8 @@ def main():
     chart_latency(systems, args.out, "sql_point_query",
                   "SQL SELECT WHERE pk", "latency_sql_select.png")
     chart_errors(systems, args.out)
+    if args.sql_json and os.path.exists(args.sql_json):
+        chart_sql_features(args.out, args.sql_json)
 
 
 if __name__ == "__main__":
