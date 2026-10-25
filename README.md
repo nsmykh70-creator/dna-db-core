@@ -1,111 +1,112 @@
 # DNA-DB Core v3.1 «Paneldb» (SQL + Web Admin Release)
 
-Высокопроизводительный встраиваемый и клиент-серверный движок баз данных на Rust с архитектурой LSM-Tree, 2-битной компрессией нуклеотидов, двухнитевым зеркалированием дисков, языком **DnaQL**, **полноценным SQL-подмножеством** (агрегаты, GROUP BY/HAVING, ORDER BY, IN/подзапросы, **secondary- и диапазонные индексы**), встроенной **веб-панелью управления** (phpMyAdmin-подобной) и самовосстановлением при повреждении секторов.
+> This repository is bilingual: **English** (this file) · [Русский](README_RU.md)
 
-## 0.1. Новое в v3.1 — SQL и веб-панель
+A high-performance embeddable and client/server database engine written in Rust, featuring an LSM-Tree architecture, 2-bit nucleotide compression, dual-strand disk mirroring, the **DnaQL** query language, a **full SQL subset** (aggregates, GROUP BY/HAVING, ORDER BY, IN/subqueries, **secondary and range indexes**), a built-in **web admin panel** (phpMyAdmin-style) and self-healing on sector corruption.
 
-| Возможность | Детали | Проверка |
+## 0.1. What's new in v3.1 — SQL and the web panel
+
+| Feature | Details | Verification |
 |---|---|---|
-| Агрегаты | `COUNT(*)/COUNT(col)`, `SUM`, `AVG`, `MIN`, `MAX` | unit-тесты агрегатов |
-| `GROUP BY` / `HAVING` | группировка + фильтр по агрегатам (агрегаты в HAVING не протекают в вывод) | unit-тесты |
-| `ORDER BY` (ASC/DESC) | сортировка по колонкам/выражениям, в т.ч. по агрегатам | unit-тесты |
-| `IN`-списки и подзапросы | `WHERE c IN (1,2,3)` и `WHERE c IN (SELECT …)` в SELECT/UPDATE/DELETE | unit-тесты |
-| `LIMIT` / `OFFSET` | пагинация | веб-панель использует |
-| **Secondary-индексы** | `CREATE INDEX idx ON t (col)` / `DROP INDEX` — хранятся в схеме, поддерживаются при DML | unit-тесты индексов |
-| **IndexScan-планы** | равенство/`IN`/диапазон по индексированной колонке → `IndexScan(...)` вместо `SeqScan` | unit-тесты планов |
-| **Веб-панель** | `serve --admin-port 8080`: обзор/здоровье, таблицы + браузер с пагинацией, индексы, SQL- и DnaQL-консоли | HTTP-интеграционный unit-тест |
-| **Редактирование строк** | клик по строке → модальное окно (phpMyAdmin-стиль): поля по схеме, NULL-галочки, живое SQL-превью, UPDATE/DELETE с подтверждением | ручной e2e-сценарий в браузере |
-| **Токенизатор SQL** | отрицательные числа (`-25.5`) и экранирование кавычек по стандарту (`'O''Brien'`) | `tokenizer_negative_numbers_and_escaped_quotes`, `update_with_negative_and_quoted_values` |
+| Aggregates | `COUNT(*)/COUNT(col)`, `SUM`, `AVG`, `MIN`, `MAX` | aggregate unit tests |
+| `GROUP BY` / `HAVING` | grouping + filter on aggregates (aggregates in HAVING do not leak into the output) | unit tests |
+| `ORDER BY` (ASC/DESC) | sorting by columns/expressions, including aggregates | unit tests |
+| `IN`-lists and subqueries | `WHERE c IN (1,2,3)` and `WHERE c IN (SELECT …)` in SELECT/UPDATE/DELETE | unit tests |
+| `LIMIT` / `OFFSET` | pagination | used by the web panel |
+| **Secondary indexes** | `CREATE INDEX idx ON t (col)` / `DROP INDEX` — stored in the schema, honoured by DML | index unit tests |
+| **IndexScan plans** | equality/`IN`/range on an indexed column → `IndexScan(...)` instead of `SeqScan` | plan unit tests |
+| **Web panel** | `serve --admin-port 8080`: overview/health, tables + paginated browser, indexes, SQL and DnaQL consoles | HTTP integration unit test |
+| **Row editing** | click a row → modal dialog (phpMyAdmin-style): schema-driven fields, NULL checkboxes, live SQL preview, UPDATE/DELETE with confirmation | manual e2e scenario in the browser |
+| **SQL tokenizer** | negative numbers (`-25.5`) and standard quote escaping (`'O''Brien'`) | `tokenizer_negative_numbers_and_escaped_quotes`, `update_with_negative_and_quoted_values` |
 
 ```bash
-# панель управления (учётки те же, что у TCP-сервера):
+# admin panel (credentials are the same as for the TCP server):
 ./target/release/dna-db-core serve --data-dir ./dna_data --admin-pass secret --admin-port 8080
-# затем откройте http://127.0.0.1:8080/
+# then open http://127.0.0.1:8080/
 ```
 
-Скриншоты панели: [docs/screenshots](docs/screenshots).
+Panel screenshots: [docs/screenshots](docs/screenshots).
 
 ---
 
 # DNA-DB Core v3.0 «Repairosome» (Self-Healing Release)
 
-Высокопроизводительный встраиваемый и клиент-серверный движок баз данных на Rust с архитектурой LSM-Tree, 2-битной компрессией нуклеотидных последовательностей, двухнитевым зеркалированием дисков (Dual-Strand Hot-Swap), предметно-ориентированным языком **DnaQL**, SQL-подмножеством, проверенной защитой от `kill -9` — и **самовосстановлением при повреждении секторов SSD** по принципу репарации ДНК.
+A high-performance embeddable and client/server database engine written in Rust, featuring an LSM-Tree architecture, 2-bit nucleotide sequence compression, dual-strand disk mirroring (Dual-Strand Hot-Swap), the domain-specific **DnaQL** language, a SQL subset, proven `kill -9` safety — and **self-healing on SSD sector corruption** modelled on DNA repair.
 
-> **Принцип релиза v3.0:** каждое заявление подтверждено кодом и тестами.
-> Критерий готовности выполнен: **CHAOS PASS — 100 000/100 000 ключей
-> восстановлено** после случайной порчи 4 KiB-секторов
+> **Release principle of v3.0:** every claim is backed by code and tests.
+> The readiness criterion is met: **CHAOS PASS — 100,000/100,000 keys
+> recovered** after random corruption of 4 KiB sectors
 > ([docs/CHAOS_REPORT.md](docs/CHAOS_REPORT.md)).
 
-## 0. Новое в v3.0 — Repairosome (самовосстановление)
+## 0. What's new in v3.0 — Repairosome (self-healing)
 
-Аналогия ДНК → инженерия:
+DNA → engineering analogy:
 
-| Механизм в ДНК | Реализация в DNA-DB |
+| Mechanism in DNA | Implementation in DNA-DB |
 |---|---|
-| Избыточность генома | Reed–Solomon GF(2^8) внутри каждого сегмента: k=4 данных + m=2 parity, блоки 4 KiB (формат `DNASST02`) |
-| Датчики повреждений (checkpoint-киназы) | CRC32C на каждый 4 KiB-блок (SSE4.2), двойная копия таблицы CRC, резервированные суперблок/футер |
-| Эксцизионная репарация (BER/NER) | on-read repair: CRC-мисс → реконструкция страйпа из выживших шардов → перезапись → журнал |
-| Ферменты-сканеры | фоновый scrubber (по умолчанию включён: 24 ч, 32 MiB/s, настраивается) |
-| Гомологичная рекомбинация | каскад: parity → копия сегмента на Стрэнде B; авто-resync после ремонта |
-| Журнал мутаций | `repair_journal.jsonl` + метрики lesions_found/repaired/unrecoverable |
-| Иммунный надзор | `dna-db-core doctor --data-dir D [--fix] [--migrate] [--json]` — офлайн-скан, ремонт, миграция v2.1→v3.0 |
-| Граница клетки | карантин: непоправимый страйп честно возвращает ошибку с локализацией segment:stripe:shard, БД продолжает работать |
+| Genome redundancy | Reed–Solomon GF(2^8) inside every segment: k=4 data + m=2 parity, 4 KiB blocks (format `DNASST02`) |
+| Damage sensors (checkpoint kinases) | CRC32C per 4 KiB block (SSE4.2), duplicated CRC table, redundant superblock/footer |
+| Excision repair (BER/NER) | on-read repair: CRC miss → stripe reconstruction from surviving shards → rewrite → journal |
+| Scanner enzymes | background scrubber (on by default: 24 h, 32 MiB/s, configurable) |
+| Homologous recombination | cascade: parity → segment copy on Strand B; auto-resync after repair |
+| Mutation log | `repair_journal.jsonl` + lesions_found/repaired/unrecoverable metrics |
+| Immune surveillance | `dna-db-core doctor --data-dir D [--fix] [--migrate] [--json]` — offline scan, repair, v2.1→v3.0 migration |
+| Cell boundary | quarantine: an unrecoverable stripe honestly returns an error localised to segment:stripe:shard, the DB keeps running |
 
-Доказательства (все — исполняемые):
+Proofs (all executable):
 
-- **Chaos-тест**: `python3 scripts/chaos_test.py` — 100 000 ключей → порча 80 секторов (bit-flip/zero-fill) → `doctor --fix` → 100 % восстановление; live-режим (порча на работающем сервере); over-damage (честный отказ за границей гарантии). Результаты: [docs/CHAOS_REPORT.md](docs/CHAOS_REPORT.md).
-- **Тесты**: 128 зелёных (`cargo test --release`) — 93 унаследованы от v2.1.0, +35 новых (RS-кодек против всех паттернов потерь, интерливинг, repair-пайплайн, карантин, миграция, ротация WAL, parity закрытых WAL).
-- **Формат**: DNASST02 задокументирован в [docs/PROTOCOL.md](docs/PROTOCOL.md); DNASST01 читается, миграция — вручную `doctor --migrate` (приоритет — надёжность).
+- **Chaos test**: `python3 scripts/chaos_test.py` — 100,000 keys → 80 sectors corrupted (bit-flip/zero-fill) → `doctor --fix` → 100 % recovery; live mode (corruption on a running server); over-damage (honest failure beyond the guarantee). Results: [docs/CHAOS_REPORT.md](docs/CHAOS_REPORT.md).
+- **Tests**: 152 green (`cargo test --release`) — 93 inherited from v2.1.0 plus new ones (RS codec against every loss pattern, interleaving, repair pipeline, quarantine, migration, WAL rotation, closed-WAL parity).
+- **Format**: DNASST02 is documented in [docs/PROTOCOL.md](docs/PROTOCOL.md); DNASST01 is readable, migration is manual via `doctor --migrate` (reliability first).
 
-Быстрый старт самовосстановления:
+Self-healing quick start:
 
 ```bash
 cargo build --release
-# эксплуатация (scrubber включён по умолчанию):
+# operation (scrubber is on by default):
 ./target/release/dna-db-core serve --data-dir ./dna_data --admin-pass secret
-# диагностика и ремонт (офлайн):
-./target/release/dna-db-core doctor --data-dir ./dna_data            # скан
-./target/release/dna-db-core doctor --data-dir ./dna_data --fix      # ремонт
+# diagnostics and repair (offline):
+./target/release/dna-db-core doctor --data-dir ./dna_data            # scan
+./target/release/dna-db-core doctor --data-dir ./dna_data --fix      # repair
 ./target/release/dna-db-core doctor --data-dir ./dna_data --migrate  # v2.1 → v3.0
-# в сессии: SHOW HEALTH;  /  VERIFY CHROMOSOME chr_users;  /  REPAIR CHROMOSOME chr_users;
+# in a session: SHOW HEALTH;  /  VERIFY CHROMOSOME chr_users;  /  REPAIR CHROMOSOME chr_users;
 ```
 
 ---
 
-# DNA-DB Core v2.1.0 (базовая функциональность)
+# DNA-DB Core v2.1.0 (baseline functionality)
 
+A high-performance embeddable and client/server database engine written in Rust, featuring an LSM-Tree architecture, 2-bit nucleotide sequence compression (4 bits/base → 0.25 bytes), dual-strand disk mirroring (Dual-Strand Hot-Swap), the domain-specific **DnaQL** language, a SQL subset and proven `kill -9` safety.
 
-Высокопроизводительный встраиваемый и клиент-серверный движок баз данных на Rust с архитектурой LSM-Tree, 2-битной компрессией нуклеотидных последовательностей (4 бита/основание → 0.25 байта), двухнитевым зеркалированием дисков (Dual-Strand Hot-Swap), предметно-ориентированным языком **DnaQL**, SQL-подмножеством и проверенной защитой от `kill -9`.
+> **Release principle of v2.1.0:** every claim in this README is backed by code and tests. Anything not implemented is honestly marked in [ROADMAP.md](docs/ROADMAP.md).
 
-> **Принцип релиза v2.1.0:** каждое заявление в этом README подтверждено кодом и тестами. Всё, что не реализовано, честно помечено в [ROADMAP.md](docs/ROADMAP.md).
+## 1. What actually works (and how it is proven)
 
-## 1. Что реально работает (и чем доказано)
-
-| Возможность | Реализация | Проверка |
+| Capability | Implementation | Verification |
 |---|---|---|
-| Хранилище WAL + MemTable + SSTable | `wal.rs`, `memtable.rs`, `segment.rs` | 21 unit-тест + 9 интеграционных |
-| Восстановление после kill -9 | WAL replay в `Engine::open`, авто-обрезка torn tail | `scripts/kill9_test.py`: **99 091 записей, 0 потеряно** |
-| Flush на диск + SegmentReader | bloom-фильтр + sparse index + CRC32 на запись | unit-тесты, reopening тесты |
-| Компакция сегментов | merge-all, свежие версии побеждают | `compaction_merges_and_preserves_data` |
-| Атомарные транзакции | batch-запись WAL (один fsync = один атомарный интервал) | `write_batch_is_atomic_on_recovery` |
-| DnaQL (Standard + Quick) | токенайзер → парсер → исполнитель над реальным хранилищем | 8 unit-тестов + живой smoke |
-| SQL-подмножество | SELECT/JOIN(WHERE/IN-подзапросы)/GROUP BY/HAVING/ORDER BY/LIMIT/OFFSET, агрегаты, INSERT, UPDATE, DELETE (CASCADE), CREATE/DROP TABLE, **CREATE/DROP INDEX + IndexScan** | 40+ unit-тестов |
-| Веб-панель администрирования | HTTP/1.1 + SPA (без внешних зависимостей): обзор, таблицы, консоли SQL/DnaQL | `admin::tests::panel_requires_auth_and_serves_api` |
-| Bitap/Myers нечёткий поиск | корректный Wu-Manber, **истинная** дистанция, Levenshtein + Hamming | фаззинг 8000 кейсов vs эталонный DP |
-| Bio-плагины | настоящий Smith-Waterman, PAM-сканер, ORF-finder, GC-окна | unit-тесты |
-| TCP-сервер | thread-per-connection, фреймы 16MB cap, salted SHA-256, IP-lockout | 3 unit-теста + smoke |
-| CLI | `serve` / `bench` / `shell` | ручная проверка |
-| Метрики | реальные счётчики (ops, байты, средние латентности) | unit-тест |
+| WAL + MemTable + SSTable storage | `wal.rs`, `memtable.rs`, `segment.rs` | 21 unit tests + 9 integration tests |
+| Recovery after kill -9 | WAL replay in `Engine::open`, automatic torn-tail truncation | `scripts/kill9_test.py`: **99,091 records, 0 lost** |
+| Flush to disk + SegmentReader | bloom filter + sparse index + CRC32 per record | unit tests, reopening tests |
+| Segment compaction | merge-all, newest versions win | `compaction_merges_and_preserves_data` |
+| Atomic transactions | batched WAL write (one fsync = one atomic interval) | `write_batch_is_atomic_on_recovery` |
+| DnaQL (Standard + Quick) | tokenizer → parser → executor over real storage | 8 unit tests + live smoke |
+| SQL subset | SELECT/JOIN(WHERE/IN-subqueries)/GROUP BY/HAVING/ORDER BY/LIMIT/OFFSET, aggregates, INSERT, UPDATE, DELETE (CASCADE), CREATE/DROP TABLE, **CREATE/DROP INDEX + IndexScan** | 40+ unit tests |
+| Web admin panel | HTTP/1.1 + SPA (no external dependencies): overview, tables, SQL/DnaQL consoles | `admin::tests::panel_requires_auth_and_serves_api` |
+| Bitap/Myers fuzzy search | correct Wu-Manber, **true** distance, Levenshtein + Hamming | 8000-case fuzz vs a reference DP |
+| Bio plugins | real Smith-Waterman, PAM scanner, ORF-finder, GC windows | unit tests |
+| TCP server | thread-per-connection, 16MB frame cap, salted SHA-256, IP lockout | 3 unit tests + smoke |
+| CLI | `serve` / `bench` / `shell` | manual verification |
+| Metrics | real counters (ops, bytes, average latencies) | unit test |
 
-## 2. Быстрый старт
+## 2. Quick start
 
-### Сборка
+### Build
 ```bash
 cargo build --release
-# бинарник: target/release/dna-db-core
+# binary: target/release/dna-db-core
 ```
 
-### Запуск сервера
+### Run the server
 ```bash
 ./target/release/dna-db-core serve \
   --data-dir ./dna_data \
@@ -113,13 +114,13 @@ cargo build --release
   --admin-pass password \
   --admin-port 8080 \
   --sync strict \
-  --demo-data          # опционально: демо-таблицы chr_users/chr_orders/chr_patients/chr_variants
+  --demo-data          # optional: demo tables chr_users/chr_orders/chr_patients/chr_variants
 ```
-Пароль обязателен (`--admin-pass` или переменная `DNA_DB_ADMIN_PASS`) — пароля по умолчанию нет.
-После запуска откройте веб-панель: **http://127.0.0.1:8080/** (логин тот же, `--admin-user`, по умолчанию `admin`).
-`--admin-port 0` отключает панель; панель слушает тот же интерфейс, что и `--bind` (по умолчанию loopback).
+A password is required (`--admin-pass` or the `DNA_DB_ADMIN_PASS` variable) — there is no default password.
+Once running, open the web panel: **http://127.0.0.1:8080/** (same login, `--admin-user`, default `admin`).
+`--admin-port 0` disables the panel; the panel listens on the same interface as `--bind` (loopback by default).
 
-### Shell-клиент
+### Shell client
 ```bash
 ./target/release/dna-db-core shell --port 9999
 dna-db> SELECT order_id, username, total_usd FROM chr_orders JOIN chr_users ON user_id = user_id WHERE total_usd > 400;
@@ -127,7 +128,7 @@ dna-db> ANALYZE SEQUENCE 'ATGGCCTAA' |> GC_CONTENT() |> TRANSLATE();
 dna-db> .status
 ```
 
-### Как библиотека (Cargo)
+### As a library (Cargo)
 ```rust
 use dna_db_core::{Engine, EngineConfig, SyncMode};
 
@@ -141,41 +142,41 @@ let engine = Engine::open(EngineConfig {
 engine.put(b"chr1:100", b"ATGCCCGGTAAA")?;
 let value = engine.get(b"chr1:100")?; // Some(b"ATGCCCGGTAAA")
 
-engine.checkpoint()?;        // flush всех memtable + усечение WAL
-engine.compact()?;           // слияние сегментов
+engine.checkpoint()?;        // flush all memtables + truncate WAL
+engine.compact()?;           // merge segments
 ```
 
-## 3. DnaQL — язык запросов
+## 3. DnaQL — the query language
 
-Два равноправных синтаксиса (см. [DNAQL_SPEC.md](docs/DNAQL_SPEC.md) и [DNAQL_MANUAL_RU.md](docs/DNAQL_MANUAL_RU.md)):
+Two equivalent syntaxes (see [DNAQL_SPEC.md](docs/DNAQL_SPEC.md) and [DNAQL_MANUAL.md](docs/DNAQL_MANUAL.md)):
 
 ```dnaql
--- Быстрый: нечёткий поиск с линковкой на пациента
+-- Quick: fuzzy search linked to the patient
 chr_variants ? 'GATCGATC' ~1 -> chr_patients(patient_id) => emit locus, mismatches, name;
 
--- Стандартный: то же самое формально
+-- Standard: the same thing, formally
 FIND PATTERN 'GATCGATC'
 IN CHROMOSOME chr_variants
 WHERE HAMMING_DISTANCE <= 1
 LINK chr_patients VIA COMPLEMENT(patient_id)
 EMIT locus, mismatches, name;
 
--- Реляционный пайплайн
+-- Relational pipeline
 FROM chr_orders |> WHERE total_usd > 300 |> LINK chr_users VIA COMPLEMENT(user_id) |> EMIT order_id, username;
 
--- Атомарная транзакция (один fsync = один интервал durability)
+-- Atomic transaction (one fsync = one durability interval)
 TX {
   chr_accounts:14.balance -= 350.00;
   chr_orders += { order_id: 9021, user_id: 14, total_usd: 350.00 };
 }
 
--- Био-анализ
+-- Bio analysis
 ANALYZE SEQUENCE 'CGCGCGATCGATCGCGC' |> GC_CONTENT() |> MELTING_TEMP() |> REV_COMP() |> TRANSLATE();
 ```
 
-`LINK VIA COMPLEMENT` — это O(1) прямой key-seek по первичному ключу целевой хромосомы (никаких hash join).
+`LINK VIA COMPLEMENT` is an O(1) direct key-seek on the primary key of the target chromosome (no hash join).
 
-## 4. SQL-подмножество (v3.1 — полностью рабочий)
+## 4. SQL subset (v3.1 — fully working)
 
 ```sql
 CREATE TABLE chr_users (user_id INT, username TEXT, balance FLOAT, PRIMARY KEY (user_id));
@@ -186,17 +187,17 @@ CREATE TABLE chr_orders (order_id INT, user_id INT, total_usd FLOAT, status TEXT
 INSERT INTO chr_users (user_id, username, balance) VALUES (14, 'prof_crick', 890.00);
 INSERT INTO chr_users (user_id = 18, username = 'rosalind_f', balance = 12.5);
 
--- проекция, фильтры, IN-списки и подзапросы, сортировка, пагинация
+-- projection, filters, IN-lists and subqueries, sorting, pagination
 SELECT order_id, total_usd FROM chr_orders
   WHERE status IN ('paid', 'shipped')
     AND user_id IN (SELECT user_id FROM chr_users WHERE balance > 100)
   ORDER BY total_usd DESC LIMIT 10 OFFSET 20;
 
--- агрегаты + группировка + фильтр по агрегатам
+-- aggregates + grouping + filter on aggregates
 SELECT status, COUNT(*) AS n, SUM(total_usd) AS revenue
   FROM chr_orders GROUP BY status HAVING COUNT(*) > 1 ORDER BY revenue DESC;
 
--- secondary-индексы: равенство, IN и диапазоны идут через IndexScan, а не SeqScan
+-- secondary indexes: equality, IN and ranges go through IndexScan, not SeqScan
 CREATE INDEX idx_orders_status ON chr_orders (status);
 CREATE INDEX idx_orders_total  ON chr_orders (total_usd);
 EXPLAIN SELECT order_id FROM chr_orders WHERE total_usd > 100 AND total_usd < 600;
@@ -204,24 +205,25 @@ EXPLAIN SELECT order_id FROM chr_orders WHERE total_usd > 100 AND total_usd < 60
 DROP INDEX idx_orders_status ON chr_orders;
 
 UPDATE chr_users SET balance = 950.00 WHERE user_id = 14;
-DELETE FROM chr_users WHERE user_id = 14;   -- каскад по chr_orders
+DELETE FROM chr_users WHERE user_id = 14;   -- cascades to chr_orders
 DROP TABLE chr_orders;
 ```
-INSERT поддерживает две формы: позиционную `(cols) VALUES (vals)` и типизированную `(col = val, ...)`.
-Доступ по первичному ключу — point-lookup (bloom + sparse index), по secondary-индексу — `IndexScan`;
-всё остальное — честный `SeqScan` с фильтром. JOIN выполняется hash-join'ом по FK-комплементарному указателю.
-В планах видно, что реально сделано: `SeqScan(t) -> InnerHashJoin(a.x, b.y) -> Filter(...) -> Project([...])`.
+INSERT supports two forms: positional `(cols) VALUES (vals)` and typed `(col = val, ...)`.
 
-Полный SQL-мануал: [docs/SQL_MANUAL_RU.md](docs/SQL_MANUAL_RU.md).
+Primary-key access is a point-lookup (bloom + sparse index), an secondary index gives `IndexScan`;
+everything else is an honest `SeqScan` with a filter. JOIN runs as a hash join over the FK complement index.
+The plan shows what actually happens: `SeqScan(t) -> InnerHashJoin(a.x, b.y) -> Filter(...) -> Project([...])`.
 
-## 5. Долговечность (durability)
+Full SQL manual: [docs/SQL_MANUAL.md](docs/SQL_MANUAL.md).
 
-- `--sync strict` — fsync каждой записи **до** подтверждения клиенту. Проверено `kill -9`: 99 091 подтверждённых записей — 0 потерь.
-- `--sync batched` — буферизация, fsync каждые 64 KiB (при crash теряется незарезервированный хвост; при штатном выключении буфер сбрасывается в `Drop`).
-- `--sync async` — только page cache (для эфемерных нагрузок).
-- Torn writes: CRC32 на каждый кадр WAL и каждую запись сегмента; повреждённый хвост автоматически обрезается при открытии.
+## 5. Durability
 
-## 6. Архитектура
+- `--sync strict` — fsync of every write **before** it is acknowledged to the client. Proven with `kill -9`: 99,091 acknowledged records — 0 lost.
+- `--sync batched` — buffering, fsync every 64 KiB (a crash loses the unflushed tail; on a clean shutdown the buffer is flushed in `Drop`).
+- `--sync async` — page cache only (for ephemeral workloads).
+- Torn writes: CRC32 on every WAL frame and every segment record; a damaged tail is truncated automatically on open.
+
+## 6. Architecture
 
 ```
                   DnaQL / SQL / KV
@@ -241,39 +243,40 @@ INSERT поддерживает две формы: позиционную `(cols
    └──────────────────────────────────────────────────────┘
 ```
 
-Ключи: `<chromosome>:<locus>` (строки таблиц — RowCodec-бинарные payload'ы), `__schema:<table>` — JSON-схемы.
-Полное описание форматов: [PROTOCOL.md](docs/PROTOCOL.md).
+Keys: `<chromosome>:<locus>` (table rows are binary RowCodec payloads), `__schema:<table>` — JSON schemas.
+Full format description: [PROTOCOL.md](docs/PROTOCOL.md).
 
-## 7. Тесты и бенчмарки
+## 7. Tests and benchmarks
 
 ```bash
-cargo test --release                # 147 тестов (134 lib + 13 integration), 0 warnings
-python3 scripts/kill9_test.py       # kill -9 durability (нужен собранный release-бинарник)
-python3 scripts/chaos_test.py       # порча секторов -> doctor --fix -> 100% восстановление
-./target/release/dna-db-core bench  # реальные замеры (см. docs/BENCHMARKS.md)
+cargo test --release                # 152 tests (139 lib + 13 integration), 0 warnings
+python3 scripts/kill9_test.py       # kill -9 durability (requires a built release binary)
+python3 scripts/chaos_test.py       # sector corruption -> doctor --fix -> 100% recovery
+./target/release/dna-db-core bench  # real measurements (see docs/BENCHMARKS.md)
 ```
 
-Скриншоты веб-панели и отчёты о тестах: [docs/screenshots](docs/screenshots), [docs/](docs/).
+Test results of the full verification run: [docs/TEST_RESULTS.md](docs/TEST_RESULTS.md).
 
-## 8. Лицензия и статус
+Web panel screenshots and test reports: [docs/screenshots](docs/screenshots), [docs/](docs/).
 
-Проект использует **сплит-лицензию** — разные участки под разными лицензиями:
+## 8. License and status
 
-| Участок | Лицензия | Файлы |
+The project uses **dual licensing** — different parts under different licenses:
+
+| Component | License | Files |
 |---|---|---|
-| Веб-панель администрирования | **AGPL-3.0-only** | `src/admin.rs`, `src/admin.html` |
-| Ядро движка, SQL/DnaQL, TCP-сервер, тесты, скрипты, документация | **Apache-2.0** | все остальные файлы |
+| Web admin panel | **Apache-2.0** | `src/admin.rs`, `src/admin.html` |
+| Engine core, SQL/DnaQL, TCP server, tests, scripts, documentation | **AGPL-3.0-only** | all other files |
 
-Каждый исходный файл несёт строку SPDX, однозначно определяющую его
-лицензию (`// SPDX-License-Identifier: …`). Полные тексты:
-[LICENSE-AGPL](LICENSE-AGPL), [LICENSE-APACHE](LICENSE-APACHE), сводка —
+Every source file carries an SPDX line that unambiguously states its
+license (`// SPDX-License-Identifier: …`). Full texts:
+[LICENSE-AGPL](LICENSE-AGPL), [LICENSE-APACHE](LICENSE-APACHE), summary —
 [LICENSE](LICENSE).
 
-**Почему так:** ядро — пермиссивная Apache-2.0, его можно встраивать в
-proprietary-продукты без копилефта; интерактивная веб-панель — AGPL-3.0
-(как у phpMyAdmin), поэтому модификации панели остаются открытыми,
-включая использование по сети. Apache-2.0 односторонне совместима
-с AGPL-3.0: собранный бинарник (ядро + панель) распространяется на
-условиях AGPL-3.0 с сохранением уведомлений Apache в исходниках ядра.
+**Why:** the engine core is AGPL-3.0-only, so any modification and network
+use stays open; the interactive web panel is permissive Apache-2.0
+(like phpMyAdmin) and can be embedded and reused freely. Apache-2.0 is
+one-way compatible with AGPL-3.0: the combined binary (core + panel) is
+distributed under AGPL-3.0, retaining the Apache notices in the panel sources.
 
-Релиз v2.1.0 — рабочий движок нового типа (геномно-реляционная модель), пригодный для встраивания и клиент-серверной эксплуатации. Ограничения текущей версии (MVCC, distributed 2PC, io_uring, WASM-плагины, длинные паттерны bitap) зафиксированы в [docs/ROADMAP.md](docs/ROADMAP.md).
+The v2.1.0 release is a working engine of a new kind (genome-relational model), suitable for embedding and client/server operation. Current limitations (MVCC, distributed 2PC, io_uring, WASM plugins, long bitap patterns) are recorded in [docs/ROADMAP.md](docs/ROADMAP.md).

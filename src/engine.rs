@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Main Storage Engine: WAL + MemTable + SSTable Segments + Dual-Strand Mirror
 //!
 //! v3.0 «Repairosome» — complete write/read lifecycle with self-healing:

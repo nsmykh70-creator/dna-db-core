@@ -1,7 +1,9 @@
 # Полное руководство: SQL и веб-панель DNA-DB v3.1
 
+> **English:** [SQL_MANUAL.md](SQL_MANUAL.md)
+
 **Официальная документация DNA-DB Core.** Все примеры проверены на собранном
-движке (см. `cargo test --release`: 147 тестов, 0 warnings).
+движке (см. `cargo test --release`: 152 теста, 0 warnings).
 
 ---
 
@@ -297,7 +299,7 @@ DROP INDEX idx_orders_total ON chr_orders;
 ## Глава 4. Тесты — как воспроизвести
 
 ```bash
-cargo test --release              # 147 тестов: 134 lib + 13 integration
+cargo test --release              # 152 теста: 139 lib + 13 integration
 python3 scripts/kill9_test.py     # kill -9: 99 091 записей, 0 потеряно
 python3 scripts/chaos_test.py     # порча 80 секторов -> doctor --fix -> 100%
 ./target/release/dna-db-core bench # реальные замеры CPU/диска

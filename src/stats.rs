@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Engine Statistics — real atomic counters (no fabrication).
 //!
 //! Counters are monotonically increasing since engine open. Latency is

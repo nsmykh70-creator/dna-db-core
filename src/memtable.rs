@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Concurrent In-Memory Table (MemTable)
 //!
 //! 1. Memory tracking (approximate) to trigger flushes before unbounded growth

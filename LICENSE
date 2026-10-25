@@ -6,9 +6,9 @@ DNA-DB Core — сплит-лицензия / Dual licensing
   * Веб-панель администрирования (phpMyAdmin-подобный интерфейс):
         src/admin.rs
         src/admin.html
-    → GNU AGPL, версия 3 (AGPL-3.0-only)
-      Полный текст: см. файл LICENSE-AGPL
-      https://www.gnu.org/licenses/agpl-3.0.html
+    → Apache License, версия 2.0 (Apache-2.0)
+      Полный текст: см. файл LICENSE-APACHE
+      https://www.apache.org/licenses/LICENSE-2.0.html
 
   * Ядро движка, SQL/DnaQL, TCP-сервер, тесты, скрипты и документация:
         src/*.rs  (кроме src/admin.rs)
@@ -16,21 +16,21 @@ DNA-DB Core — сплит-лицензия / Dual licensing
         scripts/
         docs/
         README.md
-    → Apache License, версия 2.0 (Apache-2.0)
-      Полный текст: см. файл LICENSE-APACHE
-      https://www.apache.org/licenses/LICENSE-2.0.html
+    → GNU Affero General Public License, версия 3 (AGPL-3.0-only)
+      Полный текст: см. файл LICENSE-AGPL
+      https://www.gnu.org/licenses/agpl-3.0.html
 
 Каждый исходный файл несёт строку SPDX, однозначно указывающую его
 лицензию:
 
-    // SPDX-License-Identifier: AGPL-3.0-only     (панель)
-    // SPDX-License-Identifier: Apache-2.0        (ядро и всё остальное)
+    // SPDX-License-Identifier: Apache-2.0        (панель)
+    // SPDX-License-Identifier: AGPL-3.0-only     (ядро и всё остальное)
 
 The web admin panel (src/admin.rs, src/admin.html) is licensed under the
-GNU Affero General Public License version 3 (AGPL-3.0-only).
+Apache License, version 2.0 (Apache-2.0).
 Everything else — the storage engine, SQL/DnaQL engines, TCP server,
-tests, scripts and documentation — is licensed under the Apache License,
-version 2.0 (Apache-2.0).
+tests, scripts and documentation — is licensed under the GNU Affero
+General Public License version 3 (AGPL-3.0-only).
 
 Each source file carries an SPDX-License-Identifier line stating which of
 the two licenses applies to it. In case of contradiction between this

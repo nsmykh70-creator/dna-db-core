@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Repairosome — the repair engine of DNA-DB v3.0.
 //!
 //! Implements the DNA-repair analogy end to end:

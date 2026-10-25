@@ -1,0 +1,178 @@
+   Compiling dna-db-core v3.0.0 (C:\dnadb\extracted\dna-db-core-v2.1.0)
+    Finished `release` profile [optimized] target(s) in 1m 49s
+     Running unittests src\lib.rs (target\release\deps\dna_db_core-4e43468d408f3c3e.exe)
+
+running 139 tests
+test bio_plugins::tests::orf_finder_min_length ... ok
+test bloom::tests::serialize_roundtrip ... ok
+test bio_plugins::tests::gc_windows_slides ... ok
+test bio_plugins::tests::registry_lists_builtins ... ok
+test bio_plugins::tests::unknown_plugin_errors ... ok
+test bloom::tests::false_positive_rate_bounded ... ok
+test bloom::tests::insert_contains ... ok
+test bloom::tests::rejects_corrupt ... ok
+test bio_plugins::tests::pam_scan_finds_ngg ... ok
+test bio_plugins::tests::smith_waterman_exact_substring ... ok
+test complement_index::tests::duplicate_values_keep_all_rows_and_remove_independently ... ok
+test complement_index::tests::lookup_roundtrip ... ok
+test complement_index::tests::remove_and_reinsert ... ok
+test complement_index::tests::text_and_dna_values ... ok
+test dna::tests::case_insensitive ... ok
+test dna::tests::compression_ratio ... ok
+test dna::tests::gc_content_values ... ok
+test dna::tests::kmer_hashes ... ok
+test dna::tests::melting_temp_wallace ... ok
+test dna::tests::orf_detection ... ok
+test dna::tests::padding_no_artifacts ... ok
+test dna::tests::rejects_invalid ... ok
+test dna::tests::reverse_complement_matches_definition ... ok
+test dna::tests::reverse_complement_partial_byte ... ok
+test dna::tests::roundtrip ... ok
+test dna::tests::transcription_and_translation ... ok
+test expr::tests::and_or_not ... ok
+test expr::tests::comparisons ... ok
+test memtable::tests::capacity_signal_and_size_accounting ... ok
+test memtable::tests::prefix_scan ... ok
+test memtable::tests::prefix_scan_boundary ... ok
+test memtable::tests::put_get_delete ... ok
+test memtable::tests::sorted_iteration ... ok
+test protocol::tests::parse_auth ... ok
+test protocol::tests::parse_put_get_delete ... ok
+test protocol::tests::reject_unknown_opcode ... ok
+test reed_solomon::tests::over_damage_is_honest ... ok
+test reed_solomon::tests::parity_is_deterministic ... ok
+test reed_solomon::tests::rejects_bad_geometry ... ok
+test reed_solomon::tests::rejects_ragged_input ... ok
+test relational::tests::index_encoding_distinguishes_types ... ok
+test relational::tests::rowcodec_map_roundtrip ... ok
+test relational::tests::rowcodec_rejects_corrupt ... ok
+test relational::tests::rowcodec_rejects_untrusted_field_count_without_large_allocation ... ok
+test relational::tests::rowcodec_roundtrip_all_types ... ok
+test relational::tests::table_schema ... ok
+test relational::tests::value_ordering ... ok
+test admin::tests::panel_requires_auth_and_serves_api ... ok
+test mirror::tests::mirror_writes_and_resync ... ok
+test dna_ql::tests::tx_block_mutates_atomically ... ok
+test reed_solomon::tests::acceptance_roundtrip_all_damage_patterns ... ok
+test dna_ql::tests::quick_search_finds_exact_and_fuzzy ... ok
+test dna_ql::tests::bio_analysis_real_values ... ok
+test mirror::tests::corrupt_primary_segment_is_repaired_from_verified_backup ... ok
+test repair::tests::policy_default_is_repair_on_read ... ok
+test dna_ql::tests::parse_errors_are_informative ... ok
+test dna_ql::tests::standard_search_with_link ... ok
+test dna_ql::tests::pipeline_where_and_emit ... ok
+test repair::tests::cascade_heals_closed_wal_both_directions ... ok
+test dna_ql::tests::drop_locus_removes_row ... ok
+test repair::tests::journal_roundtrip ... ok
+test segment::tests::bad_magic_rejected ... ok
+test repair::tests::cascade_refuses_to_guess_when_both_strands_are_damaged ... ok
+test repair::tests::cascade_heals_segment_a_from_b ... ok
+test segment::tests::corrupted_record_detected ... ok
+test segment_block::tests::interleave_is_a_bijection ... ok
+test segment::tests::write_then_read ... ok
+test segment_block::tests::interleave_spreads_sequential_damage ... ok
+test segment_block::tests::legacy_magic_rejected ... ok
+test segment::tests::missing_bloom_degrades ... ok
+test segment::tests::lookup_scans_more_than_four_megabytes_within_sparse_block ... ok
+test repair::tests::doctor_migrates_legacy ... ok
+test segment_block::tests::damage_without_hook_is_an_error ... ok
+test segment_block::tests::crc_table_copy_b_fallback ... ok
+test segment_block::tests::superblock_loss_survives_via_footer ... ok
+test repair::tests::cascade_heals_segment_b_from_a ... ok
+test segment_block::tests::write_read_roundtrip_small_and_spanning ... ok
+test server::tests::connection_limit_reservation_is_atomic ... ok
+test server::tests::query_results_are_valid_json_with_escaped_values ... ok
+test simd_bitap::tests::exact_matches_found ... ok
+test server::tests::server_refuses_to_listen_without_a_configured_password ... ok
+test simd_bitap::tests::insertion_and_deletion_detected ... ok
+test simd_bitap::tests::long_pattern_rejected ... ok
+test simd_bitap::tests::real_world_snp_scenario ... ok
+test simd_bitap::tests::single_snp_detected_with_true_distance ... ok
+test sql_engine::tests::aggregates_count_sum_avg_min_max ... ok
+test simd_bitap::tests::fuzz_hamming_vs_reference ... ok
+test sql_engine::tests::complement_index_maintained ... ok
+test repair::tests::doctor_scan_and_fix_roundtrip ... ok
+test sql_engine::tests::complement_index_updates_removes_and_rebuilds ... ok
+test segment_block::tests::detects_and_repairs_bit_flip ... ok
+test segment_block::tests::zero_fill_damage_repaired ... ok
+test sql_engine::tests::delete_restrict_blocks_referenced_parent ... ok
+test sql_engine::tests::create_insert_select ... ok
+test sql_engine::tests::dna_values_stored_typed ... ok
+test sql_engine::tests::fk_violation_rejected ... ok
+test segment_block::tests::over_damage_reports_localised_unrecoverable ... ok
+test segment_block::tests::index_region_damage_is_repairable_too ... ok
+test segment_block::tests::index_region_overdamage_falls_back_to_rebuild_on_restart ... ok
+test sql_engine::tests::hash_join_select ... ok
+test sql_engine::tests::group_by_with_having_and_order_of_aggregates ... ok
+test sql_engine::tests::index_maintained_on_update_and_delete ... ok
+test sql_engine::tests::index_survives_restart_and_cascade_delete_cleans_entries ... ok
+test sql_engine::tests::left_join_keeps_unmatched ... ok
+test sql_engine::tests::limit_and_multi_insert ... ok
+test sql_engine::tests::null_values_stay_out_of_the_index ... ok
+test sql_engine::tests::tokenizer_negative_numbers_and_escaped_quotes ... ok
+test sql_engine::tests::in_list_and_in_subquery ... ok
+test sql_engine::tests::order_by_asc_desc_and_limit ... ok
+test sql_engine::tests::persistence_across_restart ... ok
+test server::tests::lockout_after_max_attempts ... ok
+test server::tests::auth_rejected_and_ops_blocked ... ok
+test sql_engine::tests::point_get_with_text_pk_and_joins ... ok
+test server::tests::full_client_flow ... ok
+test stats::tests::counters_accumulate ... ok
+test stats::tests::repair_counters ... ok
+test stats::tests::scrub_progress_zero_when_no_total ... ok
+test sql_engine::tests::unique_index_creation_fails_on_existing_duplicates ... ok
+test tiered_storage::tests::demote_and_locate ... ok
+test tiered_storage::tests::promote_back ... ok
+test sql_engine::tests::unique_index_rejects_duplicate_insert ... ok
+test sql_engine::tests::update_primary_key_moves_row_without_leaving_stale_key ... ok
+test tx::tests::double_commit_rejected ... ok
+test sql_engine::tests::update_and_delete_with_cascade ... ok
+test sql_engine::tests::update_with_negative_and_quoted_values ... ok
+test tx::tests::rollback_discards_writes ... ok
+test sql_engine::tests::unique_index_rejects_duplicate_update_and_allows_nulls ... ok
+test wal::tests::batch_atomic_roundtrip ... ok
+test tx::tests::commit_persists_rows_atomically ... ok
+test wal::tests::mixed_single_and_batch ... ok
+test wal::tests::reset_empties_log ... ok
+test wal::tests::single_roundtrip ... ok
+test wal::tests::torn_write_truncated ... ok
+test wal::tests::truncated_mid_record ... ok
+test sql_engine::tests::index_range_scan_bounded ... ok
+test sql_engine::tests::create_index_equijoin_lookup_uses_index_scan ... ok
+test sql_engine::tests::update_and_delete_where_pk_use_point_get ... ok
+test simd_bitap::tests::fuzz_levenshtein_vs_reference ... ok
+test sql_engine::tests::select_where_pk_uses_point_get ... ok
+
+test result: ok. 139 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.63s
+
+     Running unittests src\main.rs (target\release\deps\dna_db_core-f6b9bf3e2a7682a5.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\integration_recovery.rs (target\release\deps\integration_recovery-216200d0e47eaff7.exe)
+
+running 13 tests
+test basic_put_get_delete ... ok
+test write_batch_is_atomic_on_recovery ... ok
+test torn_wal_tail_auto_repairs ... ok
+test dual_strand_repairs_a_missing_active_segment ... ok
+test dual_strand_repairs_a_corrupt_segment_and_wal ... ok
+test checkpoint_truncates_wal_and_preserves_data ... ok
+test dual_strand_heals_closed_wal_on_strand_b_from_a ... ok
+test dual_strand_heals_closed_wal_on_strand_a_from_b ... ok
+test crash_recovery_preserves_all_data ... ok
+test prefix_scan_across_layers ... ok
+test compaction_merges_and_preserves_data ... ok
+test flush_creates_readable_segments ... ok
+test concurrent_writes_survive_restart ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.06s
+
+   Doc-tests dna_db_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

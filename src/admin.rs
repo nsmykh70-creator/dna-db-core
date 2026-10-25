@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 //! Embedded HTTP admin panel (phpMyAdmin-style) — `serve --admin-port N`.
 //!
 //! Zero new dependencies: a small HTTP/1.1 implementation over std TcpListener

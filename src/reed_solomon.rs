@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Reed–Solomon erasure codec over GF(2^8) — the "genome redundancy" layer.
 //!
 //! Wraps the battle-tested `reed-solomon-erasure` crate (Backblaze Cauchy

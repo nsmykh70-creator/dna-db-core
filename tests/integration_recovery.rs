@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Integration tests: full lifecycle — write, crash (drop), recovery, flush,
 //! checkpoint, torn WAL, compaction, prefix scans across layers.
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: AGPL-3.0-only
 """Генерирует итоговый HTML-отчёт DNA-DB из результатов тестов/бенчмарков.
 
 Читает:
@@ -19,9 +19,40 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 DOCS = os.path.join(os.path.dirname(HERE), "docs")
 
-# Значения последнего прогона `cargo test --release`.
-UNIT_TESTS = 124
-INTEG_TESTS = 13
+def _test_counts_from_log():
+    """Реальные счётчики тестов из docs/cargo_test_output.txt.
+
+    Файл — сохранённый вывод `cargo test --release`; из него берутся
+    количество тестов unit-набора (unittests) и интеграционного набора
+    (tests/*.rs). Если файла нет — возвращается None.
+    """
+    import re
+
+    path = os.path.join(DOCS, "cargo_test_output.txt")
+    if not os.path.exists(path):
+        return None, None
+    with open(path, encoding="utf-8", errors="replace") as f:
+        text = f.read()
+
+    def count_after(marker):
+        idx = text.find(marker)
+        if idx < 0:
+            return None
+        m = re.search(r"running (\d+) tests", text[idx:])
+        return int(m.group(1)) if m else None
+
+    unit = count_after("Running unittests")
+    integ = count_after("Running tests/")
+    return unit, integ
+
+
+# Реальные счётчики последнего прогона `cargo test --release`
+# (docs/cargo_test_output.txt); без лога — значения последнего известного прогона.
+UNIT_TESTS, INTEG_TESTS = _test_counts_from_log()
+if UNIT_TESTS is None:
+    UNIT_TESTS = 139
+if INTEG_TESTS is None:
+    INTEG_TESTS = 13
 TOTAL_TESTS = UNIT_TESTS + INTEG_TESTS
 
 

@@ -8,9 +8,9 @@
       "missing": 0,
       "corrupted": 0,
       "verdict": "PASS",
-      "load_secs": 107.6,
-      "doctor_secs": 1.8,
-      "verify_secs": 23.0
+      "load_secs": 94.5,
+      "doctor_secs": 1.4,
+      "verify_secs": 21.2
     },
     {
       "scenario": "live",
@@ -19,7 +19,7 @@
       "missing": 0,
       "corrupted": 0,
       "verdict": "PASS",
-      "verify_secs": 20.7,
+      "verify_secs": 21.9,
       "lesions_repaired": 45
     },
     {

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 //! DNA-DB Core: High-performance storage engine
 //! Features:
 //! - LSM-Tree architecture with append-only WAL & SSTable segments

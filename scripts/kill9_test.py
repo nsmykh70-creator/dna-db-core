@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: AGPL-3.0-only
 """
 DNA-DB Core Crash Durability Verification (kill -9)
 Simulates sudden SIGKILL terminations during intensive concurrent writes

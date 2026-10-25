@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: AGPL-3.0-only
 """Сравнительный бенчмарк: DNA-DB vs MySQL vs PostgreSQL.
 
 Одинаковая нагрузка на всех трёх системах с локального клиента (Python),

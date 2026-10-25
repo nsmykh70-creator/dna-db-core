@@ -4,9 +4,9 @@ version = "3.0.0"
 edition = "2021"
 authors = ["DNA-DB Engineering Team"]
 description = "High-performance LSM storage engine with 2-bit DNA packing, dual-strand disk hot-swap, DnaQL language, and crash resilience"
-# Сплит-лицензия: веб-панель (src/admin.rs, src/admin.html) — AGPL-3.0-only,
-# ядро, SQL/DnaQL, сервер, тесты и скрипты — Apache-2.0. См. LICENSE.
-license = "Apache-2.0 AND AGPL-3.0-only"
+# Сплит-лицензия: веб-панель (src/admin.rs, src/admin.html) — Apache-2.0,
+# ядро, SQL/DnaQL, сервер, тесты, скрипты и документация — AGPL-3.0-only. См. LICENSE.
+license = "AGPL-3.0-only AND Apache-2.0"
 
 [dependencies]
 crc32fast = "1.4"

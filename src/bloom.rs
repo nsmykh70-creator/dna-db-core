@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Deterministic, serializable Bloom filter (double hashing, k=4 probes).
 //!
 //! Replaced the `fastbloom` dependency: this implementation has fixed,

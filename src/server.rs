@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 //! TCP Server — real multi-threaded server with authentication,
 //! rate limiting, frame validation, and durable request handling.
 //!

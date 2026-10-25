@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 //! DNA-DB Core CLI
 //!
 //!   dna-db-core serve   --data-dir ./dna_data --port 9999 ...

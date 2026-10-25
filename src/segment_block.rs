@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 //! DNASST02 — Block-based, erasure-coded segment format ("chromatin").
 //!
 //! A segment is a sequence of 4 KiB blocks organised into Reed–Solomon
