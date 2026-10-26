@@ -13,10 +13,10 @@
 //! - Per-record CRC32 (detects bit-rot and torn flushes)
 //! - Atomic segment creation via .tmp + rename, dir fsync afterwards
 
+use crc32fast::Hasher;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use crc32fast::Hasher;
 
 use crate::bloom::Bloom;
 use crate::memtable::EntryValue;
@@ -263,7 +263,10 @@ impl SegmentReader {
         // Footer
         let len = file.metadata()?.len();
         if len < 16 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "segment too small"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "segment too small",
+            ));
         }
         file.seek(SeekFrom::Start(len - 16))?;
         let mut footer = [0u8; 16];
@@ -322,7 +325,10 @@ impl SegmentReader {
             index_pos += klen as u64 + 8;
             let offset = u64::from_le_bytes(off_buf);
             if offset >= index_offset
-                || previous_key.as_ref().map(|prev| prev >= &key).unwrap_or(false)
+                || previous_key
+                    .as_ref()
+                    .map(|prev| prev >= &key)
+                    .unwrap_or(false)
             {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -340,11 +346,10 @@ impl SegmentReader {
             let raw = fs::read(&bloom_path).map_err(|e| {
                 io::Error::new(e.kind(), format!("bloom sidecar unreadable: {}", e))
             })?;
-            Bloom::from_bytes(&raw)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+            Bloom::from_bytes(&raw).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
         } else {
-        // Permissive filter (all bits set) = always probe disk
-        Bloom::permissive()
+            // Permissive filter (all bits set) = always probe disk
+            Bloom::permissive()
         };
 
         let entry_count = count * SPARSE_EVERY; // approximation, for stats only
@@ -398,7 +403,9 @@ impl SegmentReader {
             let payload_len = klen.checked_add(vlen).filter(|n| *n <= MAX_SEGMENT_RECORD);
             let rec_len = payload_len
                 .and_then(|n| 13usize.checked_add(n))
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid segment record size"))?;
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid segment record size")
+                })?;
             if (rec_len as u64) > index_offset - pos || hdr[8] > 1 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -421,7 +428,11 @@ impl SegmentReader {
                 ));
             }
 
-            if previous_key.as_ref().map(|prev| prev >= &rec_key).unwrap_or(false) {
+            if previous_key
+                .as_ref()
+                .map(|prev| prev >= &rec_key)
+                .unwrap_or(false)
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("segment {:?} keys are not strictly sorted", self.path),
@@ -545,7 +556,9 @@ impl SegmentReader {
             let payload_len = klen.checked_add(vlen).filter(|n| *n <= MAX_SEGMENT_RECORD);
             let rec_len = payload_len
                 .and_then(|n| 13usize.checked_add(n))
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid segment record size"))?;
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid segment record size")
+                })?;
             if hdr[8] > 1 || (rec_len as u64) > range_len - scanned {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,

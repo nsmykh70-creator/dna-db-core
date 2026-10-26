@@ -37,7 +37,10 @@ fn basic_put_get_delete() {
     let engine = Engine::open(config(&dir)).unwrap();
 
     engine.put(b"chr1:100", b"ATGCCCGGTAAA").unwrap();
-    assert_eq!(engine.get(b"chr1:100").unwrap(), Some(b"ATGCCCGGTAAA".to_vec()));
+    assert_eq!(
+        engine.get(b"chr1:100").unwrap(),
+        Some(b"ATGCCCGGTAAA".to_vec())
+    );
 
     engine.delete(b"chr1:100").unwrap();
     assert_eq!(engine.get(b"chr1:100").unwrap(), None);
@@ -64,7 +67,13 @@ fn crash_recovery_preserves_all_data() {
 
     // Reopen: WAL must replay everything
     let engine = Engine::open(config(&dir)).unwrap();
-    assert_eq!(engine.stats.wal_replayed_entries.load(std::sync::atomic::Ordering::Relaxed), 1000);
+    assert_eq!(
+        engine
+            .stats
+            .wal_replayed_entries
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1000
+    );
     for i in 0..1000u32 {
         let key = format!("chr1:{:06}", i);
         let want = format!("ACTGACTGACTGACTG_{}", i);
@@ -114,7 +123,9 @@ fn checkpoint_truncates_wal_and_preserves_data() {
     let engine = Engine::open(config(&dir)).unwrap();
 
     for i in 0..100u32 {
-        engine.put(format!("k{}", i).as_bytes(), format!("v{}", i).as_bytes()).unwrap();
+        engine
+            .put(format!("k{}", i).as_bytes(), format!("v{}", i).as_bytes())
+            .unwrap();
     }
     engine.checkpoint().unwrap();
     assert_eq!(engine.wal_size_bytes(), 0);
@@ -170,7 +181,10 @@ fn dual_strand_repairs_a_corrupt_segment_and_wal() {
         .find(|path| path.extension().is_some_and(|ext| ext == "sst"))
         .unwrap();
     {
-        let mut file = std::fs::OpenOptions::new().write(true).open(&segment).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&segment)
+            .unwrap();
         file.seek(SeekFrom::Start(25)).unwrap();
         file.write_all(&[0xff]).unwrap();
         file.sync_all().unwrap();
@@ -218,7 +232,9 @@ fn dual_strand_repairs_a_missing_active_segment() {
 
     let segment = {
         let engine = Engine::open(mirrored_config()).unwrap();
-        engine.put(b"missing-segment-key", b"recover-from-b").unwrap();
+        engine
+            .put(b"missing-segment-key", b"recover-from-b")
+            .unwrap();
         engine.checkpoint().unwrap();
         std::fs::read_dir(&primary)
             .unwrap()
@@ -262,7 +278,10 @@ fn dual_strand_heals_closed_wal_on_strand_b_from_a() {
         let engine = Engine::open(cfg()).unwrap();
         for i in 0..300u32 {
             engine
-                .put(format!("cwal:{:05}", i).as_bytes(), format!("payload_{:04}", i).as_bytes())
+                .put(
+                    format!("cwal:{:05}", i).as_bytes(),
+                    format!("payload_{:04}", i).as_bytes(),
+                )
                 .unwrap();
         }
     }
@@ -286,7 +305,10 @@ fn dual_strand_heals_closed_wal_on_strand_b_from_a() {
     let closed = &closed_on_a[0];
     let closed_name = closed.file_name().unwrap().to_string_lossy().to_string();
     let backup_copy = secondary.join(&closed_name);
-    assert!(backup_copy.exists(), "closed WAL must be mirrored to Strand B");
+    assert!(
+        backup_copy.exists(),
+        "closed WAL must be mirrored to Strand B"
+    );
     let healthy_bytes = std::fs::read(closed).unwrap();
 
     // Damage ONLY Strand B's copy (simulate B-side sector damage).
@@ -330,7 +352,10 @@ fn dual_strand_heals_closed_wal_on_strand_a_from_b() {
         let engine = Engine::open(cfg()).unwrap();
         for i in 0..300u32 {
             engine
-                .put(format!("cwalx:{:05}", i).as_bytes(), format!("value_{:04}", i).as_bytes())
+                .put(
+                    format!("cwalx:{:05}", i).as_bytes(),
+                    format!("value_{:04}", i).as_bytes(),
+                )
                 .unwrap();
         }
     }
@@ -356,7 +381,10 @@ fn dual_strand_heals_closed_wal_on_strand_a_from_b() {
     let _ = std::fs::remove_file(closed.with_extension("wal.parity"));
     {
         use std::io::{Seek, SeekFrom, Write};
-        let mut f = std::fs::OpenOptions::new().write(true).open(closed).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(closed)
+            .unwrap();
         f.seek(SeekFrom::Start(64)).unwrap();
         f.write_all(&[0xFF; 128]).unwrap();
         f.sync_all().unwrap();
@@ -379,9 +407,7 @@ fn dual_strand_heals_closed_wal_on_strand_a_from_b() {
     let mut missing: Vec<u32> = Vec::new();
     for i in 0..300u32 {
         let key = format!("cwalx:{:05}", i);
-        if recovered.get(key.as_bytes()).unwrap()
-            != Some(format!("value_{:04}", i).into_bytes())
-        {
+        if recovered.get(key.as_bytes()).unwrap() != Some(format!("value_{:04}", i).into_bytes()) {
             missing.push(i);
         }
     }
@@ -409,14 +435,22 @@ fn torn_wal_tail_auto_repairs() {
     {
         let engine = Engine::open(config(&dir)).unwrap();
         for i in 0..50u32 {
-            engine.put(format!("torn_key_{}", i).as_bytes(), b"some_value_here".as_slice()).unwrap();
+            engine
+                .put(
+                    format!("torn_key_{}", i).as_bytes(),
+                    b"some_value_here".as_slice(),
+                )
+                .unwrap();
         }
     }
 
     // Corrupt the tail (simulated torn write)
     {
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new().append(true).open(&wal_path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&wal_path)
+            .unwrap();
         f.write_all(&[0xAA; 64]).unwrap();
     }
 
@@ -432,7 +466,10 @@ fn torn_wal_tail_auto_repairs() {
     }
     // WAL must be repaired (truncated) so new writes work
     engine.put(b"new_after_repair", b"ok").unwrap();
-    assert_eq!(engine.get(b"new_after_repair").unwrap(), Some(b"ok".to_vec()));
+    assert_eq!(
+        engine.get(b"new_after_repair").unwrap(),
+        Some(b"ok".to_vec())
+    );
 }
 
 #[test]
@@ -462,10 +499,20 @@ fn compaction_merges_and_preserves_data() {
 
     // Create several segments with overwrites and deletes across them
     for i in 0..3000u32 {
-        engine.put(format!("cmp:{:05}", i).as_bytes(), format!("first_{}", i).as_bytes()).unwrap();
+        engine
+            .put(
+                format!("cmp:{:05}", i).as_bytes(),
+                format!("first_{}", i).as_bytes(),
+            )
+            .unwrap();
     }
     for i in (0..3000u32).step_by(2) {
-        engine.put(format!("cmp:{:05}", i).as_bytes(), format!("second_{}", i).as_bytes()).unwrap();
+        engine
+            .put(
+                format!("cmp:{:05}", i).as_bytes(),
+                format!("second_{}", i).as_bytes(),
+            )
+            .unwrap();
     }
     for i in (0..3000u32).step_by(10) {
         engine.delete(format!("cmp:{:05}", i).as_bytes()).unwrap();
@@ -500,7 +547,12 @@ fn compaction_merges_and_preserves_data() {
         } else {
             Some(format!("first_{}", i).into_bytes())
         };
-        assert_eq!(engine.get(key.as_bytes()).unwrap(), want, "key {} after reopen", key);
+        assert_eq!(
+            engine.get(key.as_bytes()).unwrap(),
+            want,
+            "key {} after reopen",
+            key
+        );
     }
 }
 
@@ -512,7 +564,10 @@ fn prefix_scan_across_layers() {
     // Fill enough to flush
     for i in 0..4000u32 {
         engine
-            .put(format!("chr7:{:05}", i).as_bytes(), format!("seq_{}", i).as_bytes())
+            .put(
+                format!("chr7:{:05}", i).as_bytes(),
+                format!("seq_{}", i).as_bytes(),
+            )
             .unwrap();
     }
     // Newer writes in memtable shadow segment data
@@ -544,7 +599,8 @@ fn concurrent_writes_survive_restart() {
             handles.push(std::thread::spawn(move || {
                 for i in 0..2000u32 {
                     let key = format!("w{}_k{}", worker, i);
-                    e.put(key.as_bytes(), format!("val_{}_{}", worker, i).as_bytes()).unwrap();
+                    e.put(key.as_bytes(), format!("val_{}_{}", worker, i).as_bytes())
+                        .unwrap();
                 }
             }));
         }

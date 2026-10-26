@@ -9,12 +9,12 @@
 
 use clap::{Parser, Subcommand, ValueEnum};
 use std::io::{BufRead, Read, Write};
-use std::sync::Arc;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
-use dna_db_core::engine::{Engine, EngineConfig};
 use dna_db_core::dna_ql::DnaQlEngine;
+use dna_db_core::engine::{Engine, EngineConfig};
 use dna_db_core::repair::{RepairPolicy, ScrubConfig};
 use dna_db_core::server::{DnaDbServer, ServerConfig};
 use dna_db_core::sql_engine::SqlEngine;
@@ -38,7 +38,11 @@ impl SyncArg {
 }
 
 #[derive(Parser)]
-#[command(name = "dna-db-core", version, about = "DNA-DB: genomic-relational LSM storage engine with self-healing (v3.0 Repairosome)")]
+#[command(
+    name = "dna-db-core",
+    version,
+    about = "DNA-DB: genomic-relational LSM storage engine with self-healing, TLS and encryption at rest (v3.2)"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -59,9 +63,26 @@ enum Command {
         mirror_dir: Option<String>,
         #[arg(long, default_value = "admin")]
         admin_user: String,
-        /// Set directly or through DNA_DB_ADMIN_PASS; there is no default password.
+        /// Set directly or through DNA_DB_ADMIN_PASS. The first start defaults
+        /// to admin/password and prints a prominent change-it warning.
         #[arg(long)]
         admin_pass: Option<String>,
+        /// Disable TLS (development/legacy clients only)
+        #[arg(long, default_value_t = false)]
+        no_tls: bool,
+        /// PEM certificate chain (default: generated self-signed under DATA/tls)
+        #[arg(long)]
+        tls_cert: Option<String>,
+        /// PEM private key (required together with --tls-cert)
+        #[arg(long)]
+        tls_key: Option<String>,
+        /// Disable payload encryption at rest (not recommended)
+        #[arg(long, default_value_t = false)]
+        no_encryption: bool,
+        /// Master key file (32 raw bytes or 64 hex chars). Default:
+        /// DNA/data/.dna-db.key, or DNA_DB_ENCRYPTION_KEY.
+        #[arg(long)]
+        encryption_key_file: Option<String>,
         #[arg(long, value_enum, default_value = "strict")]
         sync: SyncArg,
         #[arg(long, default_value_t = 8)]
@@ -109,6 +130,12 @@ enum Command {
         user: String,
         #[arg(long)]
         pass: Option<String>,
+        /// Connect with plaintext (development only)
+        #[arg(long, default_value_t = false)]
+        no_tls: bool,
+        /// PEM CA/certificate for a private or self-signed server
+        #[arg(long)]
+        tls_ca: Option<String>,
     },
     /// Offline genome health check: scan / repair / migrate segments
     Doctor {
@@ -159,6 +186,11 @@ fn main() {
             mirror_dir,
             admin_user,
             admin_pass,
+            no_tls,
+            tls_cert,
+            tls_key,
+            no_encryption,
+            encryption_key_file,
             sync,
             memtable_mb,
             demo_data,
@@ -172,33 +204,39 @@ fn main() {
         } => {
             let admin_pass = admin_pass
                 .clone()
-                .or_else(|| std::env::var("DNA_DB_ADMIN_PASS").ok());
-            match admin_pass {
-                Some(pass) if !pass.is_empty() => run_server(
-                    data_dir,
-                    *port,
-                    *bind,
-                    mirror_dir.as_deref(),
-                    admin_user,
-                    &pass,
-                    sync_arg_to_mode(sync),
-                    *memtable_mb,
-                    *demo_data,
-                    *erasure_k,
-                    *erasure_m,
-                    *no_scrub,
-                    *scrub_interval_secs,
-                    *scrub_rate_mib,
-                    *wal_rotate_mb,
-                    *admin_port,
-                ),
-                _ => {
+                .or_else(|| std::env::var("DNA_DB_ADMIN_PASS").ok())
+                .filter(|pass| !pass.is_empty())
+                .unwrap_or_else(|| {
                     eprintln!(
-                        "[FATAL] provide --admin-pass or set DNA_DB_ADMIN_PASS; no default password is configured"
+                        "[SECURITY] no --admin-pass/DNA_DB_ADMIN_PASS supplied; on a new \
+                         data directory the bootstrap account is admin/password. \
+                         Change it in the web panel immediately."
                     );
-                    2
-                }
-            }
+                    "password".to_string()
+                });
+            run_server(
+                data_dir,
+                *port,
+                *bind,
+                mirror_dir.as_deref(),
+                admin_user,
+                &admin_pass,
+                sync_arg_to_mode(sync),
+                *memtable_mb,
+                *demo_data,
+                *erasure_k,
+                *erasure_m,
+                *no_scrub,
+                *scrub_interval_secs,
+                *scrub_rate_mib,
+                *wal_rotate_mb,
+                *admin_port,
+                *no_tls,
+                tls_cert.as_deref(),
+                tls_key.as_deref(),
+                *no_encryption,
+                encryption_key_file.as_deref(),
+            )
         }
         Command::Bench { data_dir, ops } => run_bench(data_dir, *ops),
         Command::Shell {
@@ -206,15 +244,14 @@ fn main() {
             port,
             user,
             pass,
+            no_tls,
+            tls_ca,
         } => {
-            let pass = pass.clone().or_else(|| std::env::var("DNA_DB_ADMIN_PASS").ok());
-            match pass {
-                Some(pass) => run_shell(host, *port, user, &pass),
-                None => {
-                    eprintln!("[FATAL] provide --pass or set DNA_DB_ADMIN_PASS");
-                    2
-                }
-            }
+            let pass = pass
+                .clone()
+                .or_else(|| std::env::var("DNA_DB_ADMIN_PASS").ok())
+                .unwrap_or_else(|| "password".to_string());
+            run_shell(host, *port, user, &pass, *no_tls, tls_ca.as_deref())
         }
         Command::Doctor {
             data_dir,
@@ -257,11 +294,20 @@ fn run_sql2dnaql(data_dir: &str, sql: Option<&str>) -> i32 {
         eprintln!("[FATAL] no SQL given (use --sql \"...\" or pipe it on stdin)");
         return 2;
     }
+    let crypto =
+        match dna_db_core::crypto::Crypto::load_existing(std::path::Path::new(data_dir), None) {
+            Ok(crypto) => crypto,
+            Err(e) => {
+                eprintln!("[FATAL] cannot load encryption key: {e}");
+                return 2;
+            }
+        };
     let engine = match Engine::open(EngineConfig {
         dir_path: std::path::PathBuf::from(data_dir),
         memtable_capacity: 8 * 1024 * 1024,
         sync_mode: SyncMode::Strict,
         mirror_disk_path: None,
+        crypto,
         ..Default::default()
     }) {
         Ok(e) => e,
@@ -283,6 +329,7 @@ fn run_sql2dnaql(data_dir: &str, sql: Option<&str>) -> i32 {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_server(
     data_dir: &str,
     port: u16,
@@ -300,11 +347,70 @@ fn run_server(
     scrub_rate_mib: u64,
     wal_rotate_mb: u64,
     admin_port: u16,
+    no_tls: bool,
+    tls_cert: Option<&str>,
+    tls_key: Option<&str>,
+    no_encryption: bool,
+    encryption_key_file: Option<&str>,
 ) -> i32 {
-    if admin_pass.is_empty() {
-        eprintln!("[FATAL] admin password must not be empty");
+    let data_path = std::path::Path::new(data_dir);
+    if let Err(e) = std::fs::create_dir_all(data_path) {
+        eprintln!("[FATAL] cannot create data dir {:?}: {e}", data_path);
         return 2;
     }
+
+    let security =
+        match dna_db_core::server::SecurityManager::open(data_path, admin_user, admin_pass) {
+            Ok(security) => Arc::new(security),
+            Err(e) => {
+                eprintln!("[FATAL] cannot open user database: {e}");
+                return 2;
+            }
+        };
+    eprintln!(
+        "[AUTH] user database {:?} (Argon2id, persistent IP+username lockout)",
+        data_path.join("users.json")
+    );
+
+    let crypto = if no_encryption {
+        eprintln!("[CRYPTO] WARNING: payload encryption at rest is disabled");
+        None
+    } else {
+        match dna_db_core::crypto::Crypto::load_or_create(
+            data_path,
+            encryption_key_file.map(std::path::Path::new),
+        ) {
+            Ok(crypto) => {
+                eprintln!(
+                    "[CRYPTO] at-rest payload encryption enabled (key fingerprint {})",
+                    crypto.fingerprint()
+                );
+                Some(crypto)
+            }
+            Err(e) => {
+                eprintln!("[FATAL] cannot load/create encryption key: {e}");
+                return 2;
+            }
+        }
+    };
+
+    let tls = if no_tls {
+        eprintln!("[TLS] WARNING: TLS disabled by --no-tls");
+        None
+    } else {
+        match dna_db_core::tls::load_or_generate(
+            data_path,
+            tls_cert.map(std::path::Path::new),
+            tls_key.map(std::path::Path::new),
+        ) {
+            Ok(tls) => Some(tls),
+            Err(e) => {
+                eprintln!("[FATAL] cannot configure TLS: {e}");
+                return 2;
+            }
+        }
+    };
+
     let scrub = if no_scrub {
         None
     } else {
@@ -314,7 +420,7 @@ fn run_server(
         })
     };
     let config = EngineConfig {
-        dir_path: data_dir.into(),
+        dir_path: data_path.to_path_buf(),
         memtable_capacity: memtable_mb * 1024 * 1024,
         sync_mode: sync,
         mirror_disk_path: mirror_dir.map(std::path::PathBuf::from),
@@ -323,6 +429,7 @@ fn run_server(
         repair_policy: RepairPolicy::RepairOnRead,
         scrub,
         wal_segment_capacity: wal_rotate_mb * 1024 * 1024,
+        crypto,
     };
     let engine = match Engine::open(config) {
         Ok(e) => e,
@@ -351,9 +458,11 @@ fn run_server(
             engine.clone(),
             sql.clone(),
             dnaql.clone(),
-            admin_user,
-            admin_pass,
+            security.clone(),
+            tls.clone(),
         );
+        let scheme = if tls.is_some() { "https" } else { "http" };
+        eprintln!("[ADMIN] open {scheme}://{bind_address}:{admin_port}/ (default admin/password on first start)");
     }
     let server = Arc::new(DnaDbServer::new(
         engine,
@@ -364,6 +473,8 @@ fn run_server(
             port,
             admin_user: admin_user.into(),
             admin_pass: admin_pass.into(),
+            tls,
+            security: Some(security),
             ..Default::default()
         },
     ));
@@ -418,7 +529,9 @@ fn ctrlc_watcher<F: Fn() + Send + 'static>(f: F) {
 }
 
 fn seed_demo_data(engine: &Arc<Engine>) {
-    use dna_db_core::relational::{ChromosomeTable, ColumnType, ForeignKeyConstraint, RowCodec, Value};
+    use dna_db_core::relational::{
+        ChromosomeTable, ColumnType, ForeignKeyConstraint, RowCodec, Value,
+    };
     use std::collections::BTreeMap;
 
     let mut users = ChromosomeTable::new("chr_users", "user_id");
@@ -461,7 +574,9 @@ fn seed_demo_data(engine: &Arc<Engine>) {
         ("chr_variants", variants),
     ] {
         let payload = serde_json::to_vec(&t).unwrap();
-        engine.put(format!("__schema:{}", name).as_bytes(), &payload).unwrap();
+        engine
+            .put(format!("__schema:{}", name).as_bytes(), &payload)
+            .unwrap();
     }
 
     let demo_users = [
@@ -469,11 +584,7 @@ fn seed_demo_data(engine: &Arc<Engine>) {
         (14, "prof_crick", "crick@cam.ac.uk"),
         (18, "rosalind_f", "franklin@kcl.ac.uk"),
     ];
-    let demo_orders = [
-        (1042, 12, 350.00),
-        (1089, 14, 740.00),
-        (1105, 18, 520.00),
-    ];
+    let demo_orders = [(1042, 12, 350.00), (1089, 14, 740.00), (1105, 18, 520.00)];
     let demo_patients = [(100, "alice"), (101, "bob")];
     let demo_variants: [(i64, &str, &str, i64); 3] = [
         (1, "rs_demo_1", "ATGCGATCGATCCGTA", 100),
@@ -490,7 +601,11 @@ fn seed_demo_data(engine: &Arc<Engine>) {
         batch.push((
             dna_db_core::wal::WalOp::Put,
             format!("chr_users:{}", id).into_bytes(),
-            Some(RowCodec::encode(&row.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>())),
+            Some(RowCodec::encode(
+                &row.iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect::<Vec<_>>(),
+            )),
         ));
     }
     for (oid, uid, total) in demo_orders {
@@ -502,7 +617,11 @@ fn seed_demo_data(engine: &Arc<Engine>) {
         batch.push((
             dna_db_core::wal::WalOp::Put,
             format!("chr_orders:{}", oid).into_bytes(),
-            Some(RowCodec::encode(&row.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>())),
+            Some(RowCodec::encode(
+                &row.iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect::<Vec<_>>(),
+            )),
         ));
     }
     for (id, name) in demo_patients {
@@ -512,7 +631,11 @@ fn seed_demo_data(engine: &Arc<Engine>) {
         batch.push((
             dna_db_core::wal::WalOp::Put,
             format!("chr_patients:{}", id).into_bytes(),
-            Some(RowCodec::encode(&row.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>())),
+            Some(RowCodec::encode(
+                &row.iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect::<Vec<_>>(),
+            )),
         ));
     }
     for (id, vname, seq, pid) in demo_variants {
@@ -524,7 +647,11 @@ fn seed_demo_data(engine: &Arc<Engine>) {
         batch.push((
             dna_db_core::wal::WalOp::Put,
             format!("chr_variants:{}", id).into_bytes(),
-            Some(RowCodec::encode(&row.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>())),
+            Some(RowCodec::encode(
+                &row.iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect::<Vec<_>>(),
+            )),
         ));
     }
     let _ = engine.write_batch(&batch);
@@ -633,7 +760,12 @@ fn run_bench(data_dir: &str, ops: usize) -> i32 {
             state ^= state << 13;
             state ^= state >> 7;
             state ^= state << 17;
-            seq.push(["A", "C", "G", "T"][(state % 4) as usize].chars().next().unwrap());
+            seq.push(
+                ["A", "C", "G", "T"][(state % 4) as usize]
+                    .chars()
+                    .next()
+                    .unwrap(),
+            );
         }
         // embed 3 known occurrences of the pattern
         let pattern = "GATTACA";
@@ -839,16 +971,90 @@ fn run_doctor(
     }
 }
 
-fn run_shell(host: &str, port: u16, user: &str, pass: &str) -> i32 {
-    use std::net::TcpStream;
-    let mut stream = match TcpStream::connect((host, port)) {
+enum ShellStream {
+    Plain(std::net::TcpStream),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>>),
+}
+
+impl Read for ShellStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            ShellStream::Plain(stream) => stream.read(buf),
+            ShellStream::Tls(stream) => stream.read(buf),
+        }
+    }
+}
+
+impl Write for ShellStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            ShellStream::Plain(stream) => stream.write(buf),
+            ShellStream::Tls(stream) => stream.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            ShellStream::Plain(stream) => stream.flush(),
+            ShellStream::Tls(stream) => stream.flush(),
+        }
+    }
+}
+
+fn shell_connect(
+    host: &str,
+    port: u16,
+    no_tls: bool,
+    tls_ca: Option<&str>,
+) -> std::io::Result<ShellStream> {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, ServerName};
+
+    let tcp = std::net::TcpStream::connect((host, port))?;
+    tcp.set_nodelay(true).ok();
+    if no_tls {
+        return Ok(ShellStream::Plain(tcp));
+    }
+
+    let mut roots = rustls::RootCertStore::empty();
+    if let Some(path) = tls_ca {
+        let cert = CertificateDer::from_pem_file(path)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+        roots
+            .add(cert)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+    } else {
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    }
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let server_name = match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ServerName::IpAddress(ip.into()),
+        Err(_) => ServerName::try_from(host.to_string())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?,
+    };
+    let connection = rustls::ClientConnection::new(std::sync::Arc::new(config), server_name)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    Ok(ShellStream::Tls(Box::new(rustls::StreamOwned::new(
+        connection, tcp,
+    ))))
+}
+
+fn run_shell(
+    host: &str,
+    port: u16,
+    user: &str,
+    pass: &str,
+    no_tls: bool,
+    tls_ca: Option<&str>,
+) -> i32 {
+    let mut stream = match shell_connect(host, port, no_tls, tls_ca) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("cannot connect to {}:{}: {}", host, port, e);
             return 1;
         }
     };
-    stream.set_nodelay(true).ok();
 
     // Auth
     let msg = format!("\x01{}:{}", user, pass);
@@ -860,7 +1066,13 @@ fn run_shell(host: &str, port: u16, user: &str, pass: &str) -> i32 {
         eprintln!("authentication failed");
         return 1;
     }
-    println!("Connected to {}:{} as {} (type SQL or DnaQL; .quit to exit)", host, port, user);
+    println!(
+        "Connected to {}:{} as {}{} (type SQL or DnaQL; .quit to exit)",
+        host,
+        port,
+        user,
+        if no_tls { " [plaintext]" } else { " [TLS]" }
+    );
 
     let stdin = std::io::stdin();
     let mut line = String::new();
@@ -918,12 +1130,12 @@ fn run_shell(host: &str, port: u16, user: &str, pass: &str) -> i32 {
     0
 }
 
-fn send_frame(stream: &mut std::net::TcpStream, payload: &[u8]) -> std::io::Result<()> {
+fn send_frame<W: Write + ?Sized>(stream: &mut W, payload: &[u8]) -> std::io::Result<()> {
     stream.write_all(&(payload.len() as u32).to_le_bytes())?;
     stream.write_all(payload)
 }
 
-fn read_frame_resp(stream: &mut std::net::TcpStream) -> std::io::Result<Option<Vec<u8>>> {
+fn read_frame_resp<R: Read + ?Sized>(stream: &mut R) -> std::io::Result<Option<Vec<u8>>> {
     let mut len_buf = [0u8; 4];
     match stream.read_exact(&mut len_buf) {
         Ok(()) => {}

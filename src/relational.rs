@@ -10,9 +10,9 @@
 //! - Value total ordering (for WHERE comparisons and index encoding)
 //! - Schema persistence (schema rows stored under '<table>:schema')
 
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
-use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ColumnType {
@@ -21,7 +21,10 @@ pub enum ColumnType {
     Text,
     Dna2Bit,
     Timestamp,
-    ForeignLink { target_chromosome: String, target_column: String },
+    ForeignLink {
+        target_chromosome: String,
+        target_column: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -261,14 +264,22 @@ impl RowCodec {
         let mut out = Vec::with_capacity(count.min(max_possible_fields));
 
         for _ in 0..count {
-            if pos.checked_add(4).filter(|end| *end <= bytes.len()).is_none() {
+            if pos
+                .checked_add(4)
+                .filter(|end| *end <= bytes.len())
+                .is_none()
+            {
                 return Err("row: truncated key length".into());
             }
             let klen = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
             pos += 4;
             let key_end = pos
                 .checked_add(klen)
-                .filter(|end| end.checked_add(1).map(|tag_end| tag_end <= bytes.len()).unwrap_or(false))
+                .filter(|end| {
+                    end.checked_add(1)
+                        .map(|tag_end| tag_end <= bytes.len())
+                        .unwrap_or(false)
+                })
                 .ok_or_else(|| "row: truncated key".to_string())?;
             if key_end >= bytes.len() {
                 return Err("row: truncated key".into());
@@ -280,7 +291,11 @@ impl RowCodec {
             let value = match tag {
                 0 => Value::Null,
                 1 => {
-                    if pos.checked_add(8).filter(|end| *end <= bytes.len()).is_none() {
+                    if pos
+                        .checked_add(8)
+                        .filter(|end| *end <= bytes.len())
+                        .is_none()
+                    {
                         return Err("row: truncated int".into());
                     }
                     let v = i64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
@@ -288,17 +303,24 @@ impl RowCodec {
                     Value::Int(v)
                 }
                 2 => {
-                    if pos.checked_add(8).filter(|end| *end <= bytes.len()).is_none() {
+                    if pos
+                        .checked_add(8)
+                        .filter(|end| *end <= bytes.len())
+                        .is_none()
+                    {
                         return Err("row: truncated float".into());
                     }
-                    let v = f64::from_bits(u64::from_le_bytes(
-                        bytes[pos..pos + 8].try_into().unwrap(),
-                    ));
+                    let v =
+                        f64::from_bits(u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap()));
                     pos += 8;
                     Value::Float(v)
                 }
                 3 | 4 => {
-                    if pos.checked_add(4).filter(|end| *end <= bytes.len()).is_none() {
+                    if pos
+                        .checked_add(4)
+                        .filter(|end| *end <= bytes.len())
+                        .is_none()
+                    {
                         return Err("row: truncated string length".into());
                     }
                     let slen = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
@@ -309,7 +331,11 @@ impl RowCodec {
                         .ok_or_else(|| "row: truncated string".to_string())?;
                     let s = String::from_utf8_lossy(&bytes[pos..end]).to_string();
                     pos = end;
-                    if tag == 3 { Value::Text(s) } else { Value::Dna(s) }
+                    if tag == 3 {
+                        Value::Text(s)
+                    } else {
+                        Value::Dna(s)
+                    }
                 }
                 other => return Err(format!("row: unknown type tag {}", other)),
             };
@@ -322,7 +348,8 @@ impl RowCodec {
     }
 
     pub fn encode_map(map: &BTreeMap<String, Value>) -> Vec<u8> {
-        let fields: Vec<(String, Value)> = map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let fields: Vec<(String, Value)> =
+            map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         Self::encode(&fields)
     }
 
@@ -338,10 +365,22 @@ mod tests {
 
     #[test]
     fn value_ordering() {
-        assert_eq!(Value::Null.compare(&Value::Int(1)), std::cmp::Ordering::Less);
-        assert_eq!(Value::Int(1).compare(&Value::Int(2)), std::cmp::Ordering::Less);
-        assert_eq!(Value::Int(5).compare(&Value::Float(5.0)), std::cmp::Ordering::Equal);
-        assert_eq!(Value::Float(1.5).compare(&Value::Int(2)), std::cmp::Ordering::Less);
+        assert_eq!(
+            Value::Null.compare(&Value::Int(1)),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            Value::Int(1).compare(&Value::Int(2)),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            Value::Int(5).compare(&Value::Float(5.0)),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            Value::Float(1.5).compare(&Value::Int(2)),
+            std::cmp::Ordering::Less
+        );
         assert_eq!(
             Value::Text("abc".into()).compare(&Value::Text("abd".into())),
             std::cmp::Ordering::Less
@@ -366,7 +405,10 @@ mod tests {
     fn rowcodec_map_roundtrip() {
         let mut map = BTreeMap::new();
         map.insert("user_id".to_string(), Value::Int(14));
-        map.insert("username".to_string(), Value::Text("prof_crick".to_string()));
+        map.insert(
+            "username".to_string(),
+            Value::Text("prof_crick".to_string()),
+        );
         map.insert("balance".to_string(), Value::Float(890.5));
         let bytes = RowCodec::encode_map(&map);
         let decoded = RowCodec::decode_map(&bytes).unwrap();
@@ -378,7 +420,7 @@ mod tests {
         assert!(RowCodec::decode(&[1, 2, 3]).is_err());
         let mut good = RowCodec::encode(&[("a".into(), Value::Int(1))]);
         good.push(0xEE); // unknown tag appended -> count mismatch tolerated? decode ignores trailing? No:
-        // trailing byte alone doesn't break; corrupt the tag:
+                         // trailing byte alone doesn't break; corrupt the tag:
         let mut bad = RowCodec::encode(&[("a".into(), Value::Int(1))]);
         let n = bad.len();
         bad[n - 9] = 99; // overwrite type tag
@@ -393,7 +435,10 @@ mod tests {
 
     #[test]
     fn index_encoding_distinguishes_types() {
-        assert_ne!(encode_index_value(&Value::Int(1)), encode_index_value(&Value::Text("1".into())));
+        assert_ne!(
+            encode_index_value(&Value::Int(1)),
+            encode_index_value(&Value::Text("1".into()))
+        );
         assert_eq!(
             encode_index_value(&Value::Int(14)),
             encode_index_value(&Value::Int(14))

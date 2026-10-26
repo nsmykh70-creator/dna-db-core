@@ -60,7 +60,8 @@ impl EngineStats {
 
     pub fn record_put(&self, bytes: usize, nanos: u64) {
         self.puts.fetch_add(1, Ordering::Relaxed);
-        self.bytes_written.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.bytes_written
+            .fetch_add(bytes as u64, Ordering::Relaxed);
         self.put_time_nanos.fetch_add(nanos, Ordering::Relaxed);
     }
 

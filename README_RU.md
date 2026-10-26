@@ -1,8 +1,48 @@
-# DNA-DB Core v3.1 «Paneldb» (SQL + Web Admin Release)
+# DNA-DB Core v3.2 «Paneldb Security» (production hardening)
 
 > **English:** [README.md](README.md) · здесь — [русская версия](README_RU.md)
 
 Высокопроизводительный встраиваемый и клиент-серверный движок баз данных на Rust с архитектурой LSM-Tree, 2-битной компрессией нуклеотидов, двухнитевым зеркалированием дисков, языком **DnaQL**, **полноценным SQL-подмножеством** (агрегаты, GROUP BY/HAVING, ORDER BY, IN/подзапросы, **secondary- и диапазонные индексы**), встроенной **веб-панелью управления** (phpMyAdmin-подобной) и самовосстановлением при повреждении секторов.
+
+## 0.2. Production-безопасность (v3.2)
+
+| Контроль | Реализация |
+|---|---|
+| Транспорт | **rustls TLS 1.2/1.3 на обоих слушателях** (бинарный TCP-протокол и HTTPS-панель), HSTS для HTTPS, plaintext на TLS-порт не принимается |
+| Сертификаты | пара PEM через `--tls-cert/--tls-key`; при первом старте генерируется self-signed сертификат для localhost в `DATA/tls/` (только для разработки) |
+| Пароли | **Argon2id** PHC-хеши в `DATA/users.json`, соль на пользователя, выравнивание времени для несуществующих пользователей |
+| Пользователи | bootstrap `admin` / `password`, затем создание/отключение/удаление пользователей и сброс/смена пароля в панели; роли `admin`, `operator`, `viewer`; последнего активного администратора удалить нельзя |
+| Сессии | 256-битные CSPRNG bearer-токены, TTL 12 ч, отзыв при смене пароля/отключении |
+| Brute force | персистентный **lockout по IP и по логину** (5 ошибок / 60 с), глобальный throttle, последовательный Argon2 (ограниченная память) |
+| Шифрование at rest | XChaCha20-Poly1305 AEAD для значения до записи в WAL/SST/зеркало; ключ из `DNA_DB_ENCRYPTION_KEY`, `--encryption-key-file` или `DATA/.dna-db.key`; старые plaintext-строки читаются |
+| Защита панели | CSP с SHA-256-хешем inline-скрипта SPA (без `unsafe-inline` для скриптов), `X-Frame-Options: DENY`, `nosniff`, `no-referrer`, ограничивающий `Permissions-Policy` |
+| Pre-auth DoS | лимит pre-auth кадра 64 KiB (вместо 128 × 16 MiB), 10 с таймаут до аутентификации, 64 одновременных соединения панели, 128 TCP-соединений |
+| Bind | по умолчанию loopback (`127.0.0.1`); публикация — только явный `--bind` |
+
+```bash
+# production-подобный запуск: TLS и шифрование включены по умолчанию.
+# При первом старте создаётся admin/password — сразу смените его в панели.
+./target/release/dna-db-core serve --data-dir ./dna_data --port 9999 --admin-port 8080
+# https://127.0.0.1:8080/  (self-signed: передайте DATA/tls/cert.pem клиентам)
+
+# свой CA / публичный сертификат:
+./target/release/dna-db-core serve --data-dir ./dna_data \
+  --tls-cert /etc/letsencrypt/live/db.example/fullchain.pem \
+  --tls-key  /etc/letsencrypt/live/db.example/privkey.pem \
+  --admin-pass 'change-me-now'
+
+# shell по TLS к локальному self-signed серверу:
+./target/release/dna-db-core shell --tls-ca ./dna_data/tls/cert.pem
+
+# только для локальной диагностики (не на недоверенной сети):
+#   --no-tls   --no-encryption
+```
+
+> **Храните ключ шифрования отдельно от каталога данных.** Без ключа значения
+> не восстановить. Ключи записей и их количество остаются видимыми в WAL/SST
+> by design; AEAD защищает значения приложения, а не ключевое пространство LSM.
+> Модель угроз, чек-лист эксплуатации и остаточные `cargo audit`-предупреждения
+> — в [SECURITY.md](SECURITY.md) и [SECURITY_RU.md](SECURITY_RU.md).
 
 ## 0.1. Новое в v3.1 — SQL и веб-панель
 
@@ -15,14 +55,14 @@
 | `LIMIT` / `OFFSET` | пагинация | веб-панель использует |
 | **Secondary-индексы** | `CREATE INDEX idx ON t (col)` / `DROP INDEX` — хранятся в схеме, поддерживаются при DML | unit-тесты индексов |
 | **IndexScan-планы** | равенство/`IN`/диапазон по индексированной колонке → `IndexScan(...)` вместо `SeqScan` | unit-тесты планов |
-| **Веб-панель** | `serve --admin-port 8080`: обзор/здоровье, таблицы + браузер с пагинацией, индексы, SQL- и DnaQL-консоли | HTTP-интеграционный unit-тест |
+| **Веб-панель** | `serve --admin-port 8080`: обзор/здоровье, таблицы + браузер с пагинацией, индексы, SQL- и DnaQL-консоли, управление пользователями | HTTPS/API-интеграция + `scripts/security_probe.py` |
 | **Редактирование строк** | клик по строке → модальное окно (phpMyAdmin-стиль): поля по схеме, NULL-галочки, живое SQL-превью, UPDATE/DELETE с подтверждением | ручной e2e-сценарий в браузере |
 | **Токенизатор SQL** | отрицательные числа (`-25.5`) и экранирование кавычек по стандарту (`'O''Brien'`) | `tokenizer_negative_numbers_and_escaped_quotes`, `update_with_negative_and_quoted_values` |
 
 ```bash
 # панель управления (учётки те же, что у TCP-сервера):
 ./target/release/dna-db-core serve --data-dir ./dna_data --admin-pass secret --admin-port 8080
-# затем откройте http://127.0.0.1:8080/
+# затем откройте https://127.0.0.1:8080/ (TLS включён по умолчанию)
 ```
 
 Скриншоты панели: [docs/screenshots](docs/screenshots).
@@ -56,7 +96,7 @@
 Доказательства (все — исполняемые):
 
 - **Chaos-тест**: `python3 scripts/chaos_test.py` — 100 000 ключей → порча 80 секторов (bit-flip/zero-fill) → `doctor --fix` → 100 % восстановление; live-режим (порча на работающем сервере); over-damage (честный отказ за границей гарантии). Результаты: [docs/CHAOS_REPORT.md](docs/CHAOS_REPORT.md).
-- **Тесты**: 128 зелёных (`cargo test --release`) — 93 унаследованы от v2.1.0, +35 новых (RS-кодек против всех паттернов потерь, интерливинг, repair-пайплайн, карантин, миграция, ротация WAL, parity закрытых WAL).
+- **Тесты**: 174 зелёных (`cargo test --release`) — 159 lib + 15 integration, включая RS-кодек, репарацию, карантин, миграцию, ротацию WAL, parity закрытых WAL и encryption integration.
 - **Формат**: DNASST02 задокументирован в [docs/PROTOCOL.md](docs/PROTOCOL.md); DNASST01 читается, миграция — вручную `doctor --migrate` (приоритет — надёжность).
 
 Быстрый старт самовосстановления:
@@ -95,7 +135,7 @@ cargo build --release
 | Веб-панель администрирования | HTTP/1.1 + SPA (без внешних зависимостей): обзор, таблицы, консоли SQL/DnaQL | `admin::tests::panel_requires_auth_and_serves_api` |
 | Bitap/Myers нечёткий поиск | корректный Wu-Manber, **истинная** дистанция, Levenshtein + Hamming | фаззинг 8000 кейсов vs эталонный DP |
 | Bio-плагины | настоящий Smith-Waterman, PAM-сканер, ORF-finder, GC-окна | unit-тесты |
-| TCP-сервер | thread-per-connection, фреймы 16MB cap, salted SHA-256, IP-lockout | 3 unit-теста + smoke |
+| TCP-сервер | thread-per-connection, TLS, фреймы 16 MiB (64 KiB до auth), Argon2id, персистентный IP/username-lockout | unit-тесты + `scripts/security_probe.py` |
 | CLI | `serve` / `bench` / `shell` | ручная проверка |
 | Метрики | реальные счётчики (ops, байты, средние латентности) | unit-тест |
 
@@ -117,13 +157,16 @@ cargo build --release
   --sync strict \
   --demo-data          # опционально: демо-таблицы chr_users/chr_orders/chr_patients/chr_variants
 ```
-Пароль обязателен (`--admin-pass` или переменная `DNA_DB_ADMIN_PASS`) — пароля по умолчанию нет.
-После запуска откройте веб-панель: **http://127.0.0.1:8080/** (логин тот же, `--admin-user`, по умолчанию `admin`).
+TLS и шифрование payload включены по умолчанию. На новом каталоге данных
+bootstrap-учётка — **`admin` / `password`**; сразу смените её в панели.
+Для явного пароля первого старта используйте `--admin-pass` или `DNA_DB_ADMIN_PASS`.
+После запуска откройте **https://127.0.0.1:8080/** (сгенерированный сертификат
+self-signed; передайте `DATA/tls/cert.pem` CLI/HTTP-клиентам или укажите реальный).
 `--admin-port 0` отключает панель; панель слушает тот же интерфейс, что и `--bind` (по умолчанию loopback).
 
 ### Shell-клиент
 ```bash
-./target/release/dna-db-core shell --port 9999
+./target/release/dna-db-core shell --port 9999 --tls-ca ./dna_data/tls/cert.pem
 dna-db> SELECT order_id, username, total_usd FROM chr_orders JOIN chr_users ON user_id = user_id WHERE total_usd > 400;
 dna-db> ANALYZE SEQUENCE 'ATGGCCTAA' |> GC_CONTENT() |> TRANSLATE();
 dna-db> .status
@@ -249,7 +292,7 @@ INSERT поддерживает две формы: позиционную `(cols
 ## 7. Тесты и бенчмарки
 
 ```bash
-cargo test --release                # 152 теста (139 lib + 13 integration), 0 warnings
+cargo test --release                # 174 тестов (159 lib + 15 integration)
 python3 scripts/kill9_test.py       # kill -9 durability (нужен собранный release-бинарник)
 python3 scripts/chaos_test.py       # порча секторов -> doctor --fix -> 100% восстановление
 ./target/release/dna-db-core bench  # реальные замеры (см. docs/BENCHMARKS.md)

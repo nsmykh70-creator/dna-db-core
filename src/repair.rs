@@ -173,14 +173,22 @@ impl RepairHook for EngineRepairHook {
     }
 
     fn on_repaired(&self, segment: &Path, stripe: usize, shards: &[usize], bytes: u64) {
-        self.stats.lesions_found.fetch_add(shards.len() as u64, Ordering::Relaxed);
-        self.stats.lesions_repaired.fetch_add(shards.len() as u64, Ordering::Relaxed);
-        self.stats.bytes_repaired.fetch_add(bytes, Ordering::Relaxed);
+        self.stats
+            .lesions_found
+            .fetch_add(shards.len() as u64, Ordering::Relaxed);
+        self.stats
+            .lesions_repaired
+            .fetch_add(shards.len() as u64, Ordering::Relaxed);
+        self.stats
+            .bytes_repaired
+            .fetch_add(bytes, Ordering::Relaxed);
         self.journalise(segment, stripe, shards, "data", "repaired", bytes);
     }
 
     fn on_unrecoverable(&self, segment: &Path, stripe: usize, shards: &[usize]) -> bool {
-        self.stats.lesions_found.fetch_add(shards.len() as u64, Ordering::Relaxed);
+        self.stats
+            .lesions_found
+            .fetch_add(shards.len() as u64, Ordering::Relaxed);
         self.journalise(segment, stripe, shards, "data", "escalated_to_mirror", 0);
         // Homologous recombination: pull the segment copy from Strand B.
         // restore_segment overwrites the primary file IN PLACE (same inode),
@@ -201,7 +209,9 @@ impl RepairHook for EngineRepairHook {
                 }
             }
         }
-        self.stats.lesions_unrecoverable.fetch_add(shards.len() as u64, Ordering::Relaxed);
+        self.stats
+            .lesions_unrecoverable
+            .fetch_add(shards.len() as u64, Ordering::Relaxed);
         self.journalise(segment, stripe, shards, "data", "unrecoverable", 0);
         false
     }
@@ -287,7 +297,9 @@ impl Scrubber {
                         }
                     }
                     stats.scrub_blocks_scanned.store(0, Ordering::Relaxed);
-                    stats.scrub_blocks_total.store(total_blocks, Ordering::Relaxed);
+                    stats
+                        .scrub_blocks_total
+                        .store(total_blocks, Ordering::Relaxed);
                     for seg in &segments {
                         if stop2.load(Ordering::Relaxed) {
                             return;
@@ -304,7 +316,11 @@ impl Scrubber {
                 }
             })
             .expect("spawn scrubber");
-        Self { stop, wake, progress }
+        Self {
+            stop,
+            wake,
+            progress,
+        }
     }
 
     pub fn stop(&self) {
@@ -554,11 +570,7 @@ pub struct CascadeReport {
 /// left alone (obsolete compaction output vs. failed rotation is decided by
 /// the engine at startup, which has the manifest context); files damaged on
 /// both strands are reported, never guessed. Read-only unless `fix`.
-pub fn doctor_cascade_strands(
-    dir_a: &Path,
-    dir_b: &Path,
-    fix: bool,
-) -> io::Result<CascadeReport> {
+pub fn doctor_cascade_strands(dir_a: &Path, dir_b: &Path, fix: bool) -> io::Result<CascadeReport> {
     let mut report = CascadeReport {
         strand_a: dir_a.display().to_string(),
         strand_b: dir_b.display().to_string(),
@@ -614,8 +626,7 @@ pub fn doctor_cascade_strands(
     // ignoring it made B-only data invisible to A (and to the next startup).
     let a_wals = file_names(dir_a, |n| n.starts_with("wal_") && n.ends_with(".wal"))?;
     let b_wals = file_names(dir_b, |n| n.starts_with("wal_") && n.ends_with(".wal"))?;
-    let all_wals: std::collections::BTreeSet<String> =
-        a_wals.union(&b_wals).cloned().collect();
+    let all_wals: std::collections::BTreeSet<String> = a_wals.union(&b_wals).cloned().collect();
     for name in all_wals {
         let path_a = dir_a.join(&name);
         let path_b = dir_b.join(&name);
@@ -681,9 +692,9 @@ fn file_names(
 /// causes false-negative lookups and a stale parity sidecar would "repair"
 /// from wrong data.
 fn copy_across_strand(source: &Path, dest_dir: &Path) -> io::Result<()> {
-    let name = source.file_name().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "source has no filename")
-    })?;
+    let name = source
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "source has no filename"))?;
     let dest = dest_dir.join(name);
     let sidecar = if source.extension().is_some_and(|e| e == "sst") {
         source.with_extension("bloom")
@@ -784,7 +795,11 @@ fn is_legacy(path: &Path) -> io::Result<bool> {
 }
 
 fn scan_one(path: &Path) -> SegmentVerdict {
-    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string();
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("?")
+        .to_string();
     // Legacy segments have per-record CRC but no block parity. Validate them
     // with the legacy reader; previously they were always reported as
     // STRUCTURAL_DAMAGE simply because the block reader cannot open them.
@@ -957,9 +972,7 @@ fn migrate_legacy_segment(path: &Path, k: usize, m: usize) -> io::Result<usize> 
     )?;
     // The temp bloom sidecar is redundant (legacy sidecar already matches
     // the same keys) — remove it.
-    let _ = std::fs::remove_file(
-        dir.join(format!("{:06}.bloom", temp_id)),
-    );
+    let _ = std::fs::remove_file(dir.join(format!("{:06}.bloom", temp_id)));
     let tmp_final = dir.join(format!("{:06}.migrating", id));
     std::fs::rename(&new_path, &tmp_final)?;
     std::fs::rename(&tmp_final, path)?;
@@ -991,7 +1004,12 @@ mod tests {
 
     fn entries(n: usize) -> Vec<(Vec<u8>, EntryValue)> {
         (0..n)
-            .map(|i| (format!("k:{:06}", i).into_bytes(), EntryValue::Value(vec![i as u8; 64])))
+            .map(|i| {
+                (
+                    format!("k:{:06}", i).into_bytes(),
+                    EntryValue::Value(vec![i as u8; 64]),
+                )
+            })
             .collect()
     }
 
@@ -1027,7 +1045,10 @@ mod tests {
     fn policy_default_is_repair_on_read() {
         assert_eq!(RepairPolicy::default(), RepairPolicy::RepairOnRead);
         assert_eq!(ScrubConfig::default().interval, Duration::from_secs(86400));
-        assert_eq!(ScrubConfig::default().rate_limit_bytes_per_sec, 32 * 1024 * 1024);
+        assert_eq!(
+            ScrubConfig::default().rate_limit_bytes_per_sec,
+            32 * 1024 * 1024
+        );
     }
 
     #[test]
@@ -1079,7 +1100,9 @@ mod tests {
             let _ = i;
             assert_eq!(
                 r.get(key).unwrap(),
-                Some(crate::segment_block::BlockLookup::Found(val.clone().unwrap_value()))
+                Some(crate::segment_block::BlockLookup::Found(
+                    val.clone().unwrap_value()
+                ))
             );
         }
     }

@@ -116,10 +116,16 @@ mod tests {
         );
 
         let g = [OP_GET, b'k'];
-        assert_eq!(parse_payload(&g).unwrap(), Request::Get { key: b"k".to_vec() });
+        assert_eq!(
+            parse_payload(&g).unwrap(),
+            Request::Get { key: b"k".to_vec() }
+        );
 
         let d = [OP_DELETE, b'k'];
-        assert_eq!(parse_payload(&d).unwrap(), Request::Delete { key: b"k".to_vec() });
+        assert_eq!(
+            parse_payload(&d).unwrap(),
+            Request::Delete { key: b"k".to_vec() }
+        );
     }
 
     #[test]

@@ -1,9 +1,9 @@
 [package]
 name = "dna-db-core"
-version = "3.0.0"
+version = "3.2.0"
 edition = "2021"
 authors = ["DNA-DB Engineering Team"]
-description = "High-performance LSM storage engine with 2-bit DNA packing, dual-strand disk hot-swap, DnaQL language, and crash resilience"
+description = "High-performance LSM storage engine with 2-bit DNA packing, dual-strand hot-swap, DnaQL/SQL, TLS, Argon2id auth and encryption at rest"
 # Сплит-лицензия: веб-панель (src/admin.rs, src/admin.html) — Apache-2.0,
 # ядро, SQL/DnaQL, сервер, тесты, скрипты и документация — AGPL-3.0-only. См. LICENSE.
 license = "AGPL-3.0-only AND Apache-2.0"
@@ -23,6 +23,12 @@ subtle = "2.5"
 reed-solomon-erasure = "6.0"
 # Encryption at rest (XChaCha20-Poly1305 AEAD for row payloads).
 chacha20poly1305 = "0.10"
+argon2 = "0.5"
+rand = "0.8"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = { version = "1", features = ["std"] }
+webpki-roots = "1"
+rcgen = "0.13"
 
 [profile.release]
 opt-level = 3

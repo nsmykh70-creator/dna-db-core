@@ -6,10 +6,10 @@
 //! 3. Lock-free SkipList (crossbeam) for high-concurrency reads/writes
 //! 4. Sorted iteration + prefix range scans for chromosome queries
 
+use crossbeam_skiplist::SkipMap;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::Arc;
-use crossbeam_skiplist::SkipMap;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EntryValue {
@@ -119,7 +119,9 @@ impl MemTable {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (Vec<u8>, EntryValue)> + '_ {
-        self.map.iter().map(|e| (e.key().clone(), e.value().clone()))
+        self.map
+            .iter()
+            .map(|e| (e.key().clone(), e.value().clone()))
     }
 
     /// Sorted scan of all entries whose key starts with `prefix`.
@@ -193,7 +195,10 @@ mod tests {
             m.put(k.as_bytes().to_vec(), b"v".to_vec());
         }
         let keys: Vec<_> = m.iter().map(|(k, _)| k).collect();
-        assert_eq!(keys, vec![b"a".to_vec(), b"aa".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+        assert_eq!(
+            keys,
+            vec![b"a".to_vec(), b"aa".to_vec(), b"b".to_vec(), b"c".to_vec()]
+        );
     }
 
     #[test]

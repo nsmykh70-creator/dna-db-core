@@ -83,6 +83,7 @@
   .result-meta{color:var(--muted);font-size:12.5px;margin:10px 0 4px;display:flex;gap:14px;flex-wrap:wrap}
   .plan{font-family:var(--mono);font-size:12px;color:var(--accent2);background:#0d1426;border:1px dashed var(--line);border-radius:8px;padding:8px 10px;margin:8px 0;white-space:pre-wrap}
   .errbox{background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.4);color:#fecaca;border-radius:8px;padding:10px 12px;font-family:var(--mono);font-size:12.5px;white-space:pre-wrap;margin:8px 0}
+.okbox{background:rgba(34,211,238,.1);border-color:rgba(34,211,238,.4);color:#a5f3fc}
   .examples{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
   .examples button{background:var(--panel2);border:1px solid var(--line);color:var(--muted);border-radius:20px;padding:4px 12px;font-size:11.5px;cursor:pointer;font-family:var(--mono)}
   .examples button:hover{color:var(--text);border-color:var(--accent)}
@@ -138,6 +139,7 @@
       <button data-view="tables">Таблицы</button>
       <button data-view="sql">SQL-консоль</button>
       <button data-view="dnaql">DnaQL-консоль</button>
+      <button data-view="users">Пользователи</button>
     </nav>
     <div class="who">
       <span id="who-user"></span>
@@ -219,6 +221,39 @@
         <div id="ql-out"></div>
       </div>
     </section>
+
+    <!-- ---------- users / security ---------- -->
+    <section class="view" id="view-users">
+      <div class="panel">
+        <h2>Пользователи панели <span class="badge" id="users-badge">—</span></h2>
+        <div class="console-bar">
+          <input class="txt" id="nu-user" placeholder="логин" autocomplete="off" style="width:150px">
+          <input class="txt" id="nu-pass" type="password" placeholder="пароль (мин. 8)" autocomplete="new-password" style="width:190px">
+          <select id="nu-role" class="txt">
+            <option value="viewer">viewer</option>
+            <option value="operator">operator</option>
+            <option value="admin">admin</option>
+          </select>
+          <label style="color:var(--muted);font-size:12px"><input type="checkbox" id="nu-change" checked> сменить пароль при входе</label>
+          <button class="act" id="nu-create">Создать пользователя</button>
+        </div>
+        <div id="users-out" class="errbox hidden" style="margin:10px 0"></div>
+        <div class="grid-wrap"><table class="grid" id="users-table"></table></div>
+        <p style="color:var(--muted);font-size:12px;margin-top:12px">
+          Пароли хранятся как Argon2id. Сессии — CSPRNG bearer-токены с TTL 12 часов.
+          Удалить или отключить последнего администратора нельзя.
+        </p>
+      </div>
+      <div class="panel">
+        <h2>Сменить свой пароль</h2>
+        <div class="console-bar">
+          <input class="txt" id="pw-old" type="password" placeholder="текущий пароль" autocomplete="current-password" style="width:200px">
+          <input class="txt" id="pw-new" type="password" placeholder="новый пароль (мин. 8)" autocomplete="new-password" style="width:220px">
+          <button class="act" id="pw-change">Сменить пароль</button>
+        </div>
+        <div id="pw-out" class="errbox hidden" style="margin:10px 0"></div>
+      </div>
+    </section>
   </main>
 </div>
 
@@ -246,6 +281,8 @@
 "use strict";
 const $ = s => document.querySelector(s);
 let TOKEN = sessionStorage.getItem("dnadb_token") || "";
+let ROLE = sessionStorage.getItem("dnadb_role") || "";
+let MUST_CHANGE = sessionStorage.getItem("dnadb_must_change") === "1";
 let TABLES = [];
 let CURRENT = null, OFFSET = 0, LIMIT = 50;
 let BROWSE_ROWS = [], RM_ROW = null, RM_COLS = null, RM_PK = null;
@@ -265,9 +302,18 @@ function showLogin() {
   TOKEN = ""; sessionStorage.removeItem("dnadb_token");
   $("#app").classList.add("hidden"); $("#login").classList.remove("hidden");
 }
-function showApp(user) {
+function showApp(user, role, mustChange) {
   $("#login").classList.add("hidden"); $("#app").classList.remove("hidden");
-  $("#who-user").textContent = "👤 " + (user || "admin");
+  ROLE = role || ROLE || "viewer";
+  MUST_CHANGE = !!mustChange;
+  sessionStorage.setItem("dnadb_user", user || "admin");
+  sessionStorage.setItem("dnadb_role", ROLE);
+  sessionStorage.setItem("dnadb_must_change", MUST_CHANGE ? "1" : "0");
+  $("#who-user").textContent = "👤 " + (user || "admin") + " · " + ROLE;
+  if (MUST_CHANGE) {
+    document.querySelector('#nav button[data-view="users"]').click();
+    setTimeout(() => $("#pw-old") && $("#pw-old").focus(), 50);
+  }
 }
 $("#login-form").addEventListener("submit", async e => {
   e.preventDefault();
@@ -278,22 +324,30 @@ $("#login-form").addEventListener("submit", async e => {
   }).catch(() => null);
   if (r && r.ok && r.body && r.body.token) {
     TOKEN = r.body.token; sessionStorage.setItem("dnadb_token", TOKEN);
-    showApp(r.body.user); boot();
+    showApp(r.body.user, r.body.role, r.body.must_change); boot();
   } else {
     errBox.textContent = (r && r.body && r.body.error) || "Ошибка входа";
     errBox.classList.remove("hidden");
   }
 });
-$("#logout").addEventListener("click", showLogin);
+$("#logout").addEventListener("click", async () => {
+  try { await api("/api/logout", { method: "POST" }); } catch (_) {}
+  showLogin();
+});
 
 /* ---------------- navigation ---------------- */
 $("#nav").addEventListener("click", e => {
   const b = e.target.closest("button"); if (!b) return;
+  if (MUST_CHANGE && b.dataset.view !== "users") {
+    alert("Сначала смените пароль.");
+    return;
+  }
   document.querySelectorAll("#nav button").forEach(x => x.classList.toggle("active", x === b));
   document.querySelectorAll("section.view").forEach(x => x.classList.remove("active"));
   $("#view-" + b.dataset.view).classList.add("active");
   if (b.dataset.view === "dashboard") loadHealth();
   if (b.dataset.view === "tables") loadTables();
+  if (b.dataset.view === "users") loadUsers();
 });
 
 /* ---------------- render helpers ---------------- */
@@ -604,6 +658,107 @@ function mountExamples(sel, items, target) {
 mountExamples("#sql-examples", SQL_EXAMPLES, "#sql-input");
 mountExamples("#ql-examples", QL_EXAMPLES, "#ql-input");
 
+/* ---------------- users / security ---------------- */
+function usersMsg(text, ok) {
+  const el = $("#users-out");
+  el.textContent = text || "";
+  el.className = "errbox " + (ok ? "okbox" : "");
+  el.classList.toggle("hidden", !text);
+}
+async function loadUsers() {
+  const r = await api("/api/users");
+  const el = $("#users-table");
+  if (!r.ok) {
+    el.innerHTML = "";
+    usersMsg((r.body && r.body.error) || "Нет доступа к списку пользователей", false);
+    return;
+  }
+  const users = (r.body && r.body.users) || [];
+  $("#users-badge").textContent = users.length + " учётных записей";
+  let h = "<thead><tr><th>Логин</th><th>Роль</th><th>Статус</th><th>Смена пароля</th><th>Создан</th><th>Действия</th></tr></thead><tbody>";
+  for (const u of users) {
+    const created = u.created_at ? new Date(u.created_at * 1000).toLocaleString("ru-RU") : "—";
+    h += "<tr><td class='mono'>" + esc(u.username) + "</td><td>" + esc(u.role) + "</td><td>" +
+      (u.disabled ? '<span class="badge err">disabled</span>' : '<span class="badge ok">active</span>') +
+      "</td><td>" + (u.must_change ? "да" : "нет") + "</td><td>" + esc(created) + "</td><td>" +
+      '<button class="act ghost" data-user-action="reset" data-user="' + esc(u.username) + '">Пароль</button> ' +
+      '<button class="act ghost" data-user-action="toggle" data-user="' + esc(u.username) + '" data-disabled="' + (u.disabled ? "1" : "0") + '">' +
+      (u.disabled ? "Включить" : "Отключить") + "</button> " +
+      '<button class="act danger" data-user-action="delete" data-user="' + esc(u.username) + '">Удалить</button>' +
+      "</td></tr>";
+  }
+  if (!users.length) h += '<tr><td colspan="6" style="color:var(--muted)">Нет пользователей</td></tr>';
+  el.innerHTML = h + "</tbody>";
+  el.querySelectorAll("button[data-user-action]").forEach(btn => btn.addEventListener("click", async () => {
+    const user = btn.dataset.user, action = btn.dataset.userAction;
+    usersMsg("", true);
+    if (action === "reset") {
+      const pass = prompt("Новый пароль для " + user + " (мин. 8 символов):");
+      if (!pass) return;
+      const r = await api("/api/users/password", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ user, new_password: pass })
+      });
+      usersMsg(r.ok ? "Пароль обновлён; пользователь сменит его при входе." : (r.body && r.body.error) || "Ошибка", r.ok);
+    } else if (action === "toggle") {
+      const disabled = btn.dataset.disabled !== "1";
+      const r = await api("/api/users/disable", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ user, disabled })
+      });
+      usersMsg(r.ok ? "Статус обновлён." : (r.body && r.body.error) || "Ошибка", r.ok);
+    } else if (action === "delete") {
+      if (!confirm("Удалить пользователя " + user + "?")) return;
+      const r = await api("/api/users/delete", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ user })
+      });
+      usersMsg(r.ok ? "Пользователь удалён." : (r.body && r.body.error) || "Ошибка", r.ok);
+    }
+    loadUsers();
+  }));
+}
+$("#nu-create").addEventListener("click", async () => {
+  const payload = {
+    user: $("#nu-user").value.trim(),
+    pass: $("#nu-pass").value,
+    role: $("#nu-role").value,
+    must_change: $("#nu-change").checked
+  };
+  if (!payload.user || !payload.pass) { usersMsg("Укажите логин и пароль", false); return; }
+  const r = await api("/api/users", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload)
+  });
+  if (r.ok) {
+    $("#nu-user").value = ""; $("#nu-pass").value = "";
+    usersMsg("Пользователь создан.", true);
+    loadUsers();
+  } else {
+    usersMsg((r.body && r.body.error) || "Ошибка создания", false);
+  }
+});
+$("#pw-change").addEventListener("click", async () => {
+  const oldPassword = $("#pw-old").value;
+  const newPassword = $("#pw-new").value;
+  const out = $("#pw-out");
+  out.classList.add("hidden");
+  if (newPassword.length < 8) {
+    out.textContent = "Новый пароль должен содержать минимум 8 символов.";
+    out.classList.remove("hidden"); return;
+  }
+  const r = await api("/api/password", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ old_password: oldPassword, new_password: newPassword })
+  });
+  if (r.ok) {
+    alert("Пароль изменён. Войдите заново.");
+    showLogin();
+  } else {
+    out.textContent = (r.body && r.body.error) || "Ошибка смены пароля";
+    out.classList.remove("hidden");
+  }
+});
+
 /* ---------------- boot ---------------- */
 async function boot() {
   loadHealth();
@@ -611,10 +766,15 @@ async function boot() {
   if (recent[0] && !$("#sql-input").value) $("#sql-input").value = recent[0];
 }
 if (TOKEN) {
-  api("/api/health").then(r => { if (r.ok) { showApp(sessionStorage.getItem("dnadb_user") || "admin"); boot(); } })
-    .catch(() => {});
+  api("/api/me").then(r => {
+    if (r.ok && r.body) {
+      showApp(r.body.user, r.body.role, r.body.must_change);
+      if (!r.body.must_change) boot();
+    } else {
+      showLogin();
+    }
+  }).catch(() => showLogin());
 }
-$("#login-user").addEventListener("change", () => {});
 </script>
 </body>
 </html>

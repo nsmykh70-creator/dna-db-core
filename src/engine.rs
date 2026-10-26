@@ -15,20 +15,19 @@
 //!
 //! Durability: SyncMode::Strict fsyncs every WAL frame BEFORE acknowledging.
 
+use parking_lot::{Mutex, RwLock};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use parking_lot::{Mutex, RwLock};
 
+use crate::crypto::Crypto;
 use crate::memtable::{EntryValue, MemTable};
 use crate::mirror::DualStrandMirror;
-use crate::repair::{
-    EngineRepairHook, RepairJournal, RepairPolicy, ScrubConfig, Scrubber,
-};
+use crate::repair::{EngineRepairHook, RepairJournal, RepairPolicy, ScrubConfig, Scrubber};
 use crate::segment::{SegmentFile, SegmentLookup};
 use crate::segment_block::{BlockSegmentReader, BlockSegmentWriter};
 use crate::stats::EngineStats;
-use crate::wal::{SyncMode, WalOp, WalEntry, WalParity, WalReader, WalWriter};
+use crate::wal::{SyncMode, WalEntry, WalOp, WalParity, WalReader, WalWriter};
 
 pub struct EngineConfig {
     pub dir_path: PathBuf,
@@ -45,6 +44,10 @@ pub struct EngineConfig {
     pub scrub: Option<ScrubConfig>,
     /// Rotate the WAL when it exceeds this many bytes (default 64 MiB; 0 = never).
     pub wal_segment_capacity: u64,
+    /// Payload encryption-at-rest. `None` keeps the historical plaintext mode
+    /// (tests, benchmarks and offline diagnostics); the production CLI enables
+    /// it by default.
+    pub crypto: Option<Arc<Crypto>>,
 }
 
 impl Default for EngineConfig {
@@ -59,6 +62,7 @@ impl Default for EngineConfig {
             repair_policy: RepairPolicy::RepairOnRead,
             scrub: Some(ScrubConfig::default()),
             wal_segment_capacity: 64 * 1024 * 1024,
+            crypto: None,
         }
     }
 }
@@ -86,7 +90,10 @@ impl Engine {
     /// replays WAL entries into the memtable, installs the repair hook and
     /// starts the scrubber when configured.
     pub fn open(config: EngineConfig) -> Result<Arc<Self>, std::io::Error> {
-        if config.erasure_k == 0 || config.erasure_m == 0 || config.erasure_k + config.erasure_m > 256 {
+        if config.erasure_k == 0
+            || config.erasure_m == 0
+            || config.erasure_k + config.erasure_m > 256
+        {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "invalid erasure geometry: k, m >= 1 and k + m <= 256 required",
@@ -110,9 +117,7 @@ impl Engine {
         }
 
         let mirror = match config.mirror_disk_path.as_ref() {
-            Some(path) => {
-                Some(Arc::new(DualStrandMirror::new(&config.dir_path, path)?))
-            }
+            Some(path) => Some(Arc::new(DualStrandMirror::new(&config.dir_path, path)?)),
             None => None,
         };
         let mirrored_segment_ids = match &mirror {
@@ -185,9 +190,9 @@ impl Engine {
         // missing from A, then run parity/frame recovery on the primary set.
         if let Some(mirror) = &mirror {
             match mirror.heal_primary_closed_wals(&config.dir_path) {
-                Ok(n) if n > 0 => eprintln!(
-                    "[WAL] restored {n} B-only closed segment(s) to Strand A"
-                ),
+                Ok(n) if n > 0 => {
+                    eprintln!("[WAL] restored {n} B-only closed segment(s) to Strand A")
+                }
                 Ok(_) => {}
                 Err(e) => eprintln!("[WAL] Strand A closed-WAL restore failed: {e}"),
             }
@@ -206,7 +211,11 @@ impl Engine {
         let mut max_wal_seq = 0u64;
         let mut wal_entries: Vec<WalEntry> = Vec::new();
         for path in &closed_wals {
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
             let seq = name
                 .trim_start_matches("wal_")
                 .trim_end_matches(".wal")
@@ -235,11 +244,11 @@ impl Engine {
             // are never discarded for a worse B copy).
             let mut restored_from_b = false;
             if (a_lost_frames || !parity_ok) && mirror.is_some() {
-                match mirror
-                    .as_ref()
-                    .unwrap()
-                    .restore_closed_wal_better(&name, &config.dir_path, a_valid_len)
-                {
+                match mirror.as_ref().unwrap().restore_closed_wal_better(
+                    &name,
+                    &config.dir_path,
+                    a_valid_len,
+                ) {
                     Ok(Some(b_valid_len)) => {
                         eprintln!(
                             "[WAL] {name}: Strand A held {a_valid_len} valid byte(s), \
@@ -273,7 +282,10 @@ impl Engine {
             wal_entries.extend(entries);
             // Keep B byte-identical after an A-side repair.
             if (rs_repaired > 0 || a_lost_frames || restored_from_b) && mirror.is_some() {
-                let _ = mirror.as_ref().unwrap().sync_closed_wal(&name, &config.dir_path);
+                let _ = mirror
+                    .as_ref()
+                    .unwrap()
+                    .sync_closed_wal(&name, &config.dir_path);
             }
         }
 
@@ -304,8 +316,8 @@ impl Engine {
                 .map(|m| m.backup_wal_size() > 0 || m.backup_wal_is_damaged())
                 .unwrap_or(false))
             || wal_len_before
-            .map(|before| wal_len_after < before)
-            .unwrap_or(false);
+                .map(|before| wal_len_after < before)
+                .unwrap_or(false);
         let active_entries = if let Some(mirror) = &mirror {
             mirror.repair_wal(&wal_path, primary_wal_damaged)?
         } else {
@@ -380,19 +392,34 @@ impl Engine {
         let replay_count = wal_entries.len();
         for entry in wal_entries {
             match entry {
-                WalEntry { op: WalOp::Put, key, value: Some(v) } => {
+                WalEntry {
+                    op: WalOp::Put,
+                    key,
+                    value: Some(v),
+                } => {
                     memtable.put(key, v);
                 }
-                WalEntry { op: WalOp::Delete, key, .. } => {
+                WalEntry {
+                    op: WalOp::Delete,
+                    key,
+                    ..
+                } => {
                     memtable.delete(key);
                 }
-                WalEntry { op: WalOp::Put, key, value: None } => {
+                WalEntry {
+                    op: WalOp::Put,
+                    key,
+                    value: None,
+                } => {
                     // batch delete payload quirk: treat as delete
                     let _ = key;
                 }
             }
         }
-        engine.stats.wal_replayed_entries.store(replay_count as u64, Ordering::Relaxed);
+        engine
+            .stats
+            .wal_replayed_entries
+            .store(replay_count as u64, Ordering::Relaxed);
 
         // If replay filled the memtable, flush immediately
         if memtable.is_full() {
@@ -410,28 +437,30 @@ impl Engine {
         if let Some(mirror) = &self.mirror {
             mirror.ensure_writable()?;
         }
+        let stored = self.encrypt_value(key, value)?;
         {
             let mut wal_guard = self.wal.write();
-            wal_guard.append(WalOp::Put, key, Some(value))?;
+            wal_guard.append(WalOp::Put, key, Some(&stored))?;
             self.maybe_rotate_wal(&mut wal_guard)?;
         }
 
         let mirror_result = self
             .mirror
             .as_ref()
-            .map(|mirror| mirror.mirror_write(WalOp::Put, key, Some(value)))
+            .map(|mirror| mirror.mirror_write(WalOp::Put, key, Some(&stored)))
             .transpose();
 
         let is_full = {
             let mem_guard = self.active_memtable.read();
-            mem_guard.put(key.to_vec(), value.to_vec())
+            mem_guard.put(key.to_vec(), stored)
         };
 
         if is_full {
             self.ensure_capacity()?;
         }
 
-        self.stats.record_put(key.len() + value.len(), t0.elapsed().as_nanos() as u64);
+        self.stats
+            .record_put(key.len() + value.len(), t0.elapsed().as_nanos() as u64);
         mirror_result
             .map(|_| ())
             .map_err(|message| std::io::Error::new(std::io::ErrorKind::BrokenPipe, message))
@@ -472,7 +501,10 @@ impl Engine {
 
     /// Atomic multi-key write: one WAL batch frame -> one fsync -> all ops
     /// applied to the memtable. Crash between = whole batch replayed or none.
-    pub fn write_batch(&self, ops: &[(WalOp, Vec<u8>, Option<Vec<u8>>)]) -> Result<(), std::io::Error> {
+    pub fn write_batch(
+        &self,
+        ops: &[(WalOp, Vec<u8>, Option<Vec<u8>>)],
+    ) -> Result<(), std::io::Error> {
         let _mutation_gate = self.mutation_gate.write();
         if ops.is_empty() {
             return Ok(());
@@ -482,7 +514,20 @@ impl Engine {
             mirror.ensure_writable()?;
         }
 
-        let refs: Vec<(&WalOp, &[u8], Option<&[u8]>)> = ops
+        // Encrypt once, then use the same ciphertext for WAL, Strand B and the
+        // memtable. Re-encrypting during replay would produce different
+        // nonces for the same logical row and break crash consistency.
+        let stored_ops: Vec<(WalOp, Vec<u8>, Option<Vec<u8>>)> = ops
+            .iter()
+            .map(|(op, key, value)| {
+                let stored = match value {
+                    Some(value) => Some(self.encrypt_value(key, value)?),
+                    None => None,
+                };
+                Ok((op.clone(), key.clone(), stored))
+            })
+            .collect::<Result<_, std::io::Error>>()?;
+        let refs: Vec<(&WalOp, &[u8], Option<&[u8]>)> = stored_ops
             .iter()
             .map(|(op, k, v)| (op, k.as_slice(), v.as_deref()))
             .collect();
@@ -501,7 +546,7 @@ impl Engine {
         let mut is_full = false;
         {
             let mem_guard = self.active_memtable.read();
-            for (op, key, value) in ops {
+            for (op, key, value) in &stored_ops {
                 match op {
                     WalOp::Put => {
                         is_full |= mem_guard.put(key.clone(), value.clone().unwrap_or_default());
@@ -516,7 +561,10 @@ impl Engine {
             self.ensure_capacity()?;
         }
 
-        let bytes: usize = ops.iter().map(|(_, k, v)| k.len() + v.as_ref().map(|v| v.len()).unwrap_or(0)).sum();
+        let bytes: usize = ops
+            .iter()
+            .map(|(_, k, v)| k.len() + v.as_ref().map(|v| v.len()).unwrap_or(0))
+            .sum();
         self.stats.record_put(bytes, t0.elapsed().as_nanos() as u64);
         mirror_result.map(|_| ())
     }
@@ -527,7 +575,12 @@ impl Engine {
         let _mutation_gate = self.mutation_gate.read();
         let t0 = std::time::Instant::now();
         let result = self.get_inner(key);
-        let bytes = result.as_ref().ok().and_then(|o| o.as_ref()).map(|v| v.len()).unwrap_or(0);
+        let bytes = result
+            .as_ref()
+            .ok()
+            .and_then(|o| o.as_ref())
+            .map(|v| v.len())
+            .unwrap_or(0);
         self.stats.record_get(bytes, t0.elapsed().as_nanos() as u64);
         result
     }
@@ -536,26 +589,64 @@ impl Engine {
         {
             let active = self.active_memtable.read();
             if let Some(res) = active.get(key) {
-                return Ok(res);
+                return self.decrypt_optional(key, res);
             }
         }
         {
             let immut = self.immutable_memtable.read();
             if let Some(ref imm) = *immut {
                 if let Some(res) = imm.get(key) {
-                    return Ok(res);
+                    return self.decrypt_optional(key, res);
                 }
             }
         }
         let segments = self.segments.read().clone();
         for seg in segments.iter() {
             match self.get_from_segment(seg, key)? {
-                Some(SegmentLookup::Found(v)) => return Ok(Some(v)),
+                Some(SegmentLookup::Found(v)) => {
+                    return self.decrypt_optional(key, Some(v));
+                }
                 Some(SegmentLookup::Tombstone) => return Ok(None),
                 None => continue,
             }
         }
         Ok(None)
+    }
+
+    /// Encrypt a payload for the configured at-rest key (identity when
+    /// encryption is disabled).
+    fn encrypt_value(&self, key: &[u8], value: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+        match &self.config.crypto {
+            Some(crypto) => crypto.encrypt_value(key, value),
+            None => Ok(value.to_vec()),
+        }
+    }
+
+    fn decrypt_optional(
+        &self,
+        key: &[u8],
+        value: Option<Vec<u8>>,
+    ) -> Result<Option<Vec<u8>>, std::io::Error> {
+        match value {
+            Some(value) => match &self.config.crypto {
+                Some(crypto) => crypto.decrypt_value(key, &value).map(Some),
+                None => Ok(Some(value)),
+            },
+            None => Ok(None),
+        }
+    }
+
+    fn decrypt_pairs(
+        &self,
+        merged: std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, std::io::Error> {
+        let mut out = Vec::with_capacity(merged.len());
+        for (key, value) in merged {
+            if let Some(value) = self.decrypt_optional(&key, value)? {
+                out.push((key, value));
+            }
+        }
+        Ok(out)
     }
 
     /// Merged scan of all entries with keys starting with `prefix`.
@@ -588,27 +679,30 @@ impl Engine {
             let immut = self.immutable_memtable.read();
             if let Some(ref imm) = *immut {
                 for (k, ev) in imm.scan_prefix(prefix) {
-                    merged.insert(k, match ev {
-                        EntryValue::Value(v) => Some(v),
-                        EntryValue::Tombstone => None,
-                    });
+                    merged.insert(
+                        k,
+                        match ev {
+                            EntryValue::Value(v) => Some(v),
+                            EntryValue::Tombstone => None,
+                        },
+                    );
                 }
             }
         }
         {
             let active = self.active_memtable.read();
             for (k, ev) in active.scan_prefix(prefix) {
-                merged.insert(k, match ev {
-                    EntryValue::Value(v) => Some(v),
-                    EntryValue::Tombstone => None,
-                });
+                merged.insert(
+                    k,
+                    match ev {
+                        EntryValue::Value(v) => Some(v),
+                        EntryValue::Tombstone => None,
+                    },
+                );
             }
         }
 
-        Ok(merged
-            .into_iter()
-            .filter_map(|(k, v)| v.map(|v| (k, v)))
-            .collect())
+        self.decrypt_pairs(merged)
     }
 
     /// Ordered range scan: all live keys k with `start` <= k < `end`.
@@ -662,10 +756,13 @@ impl Engine {
                     if !in_range(&k) {
                         continue;
                     }
-                    merged.insert(k, match ev {
-                        EntryValue::Value(v) => Some(v),
-                        EntryValue::Tombstone => None,
-                    });
+                    merged.insert(
+                        k,
+                        match ev {
+                            EntryValue::Value(v) => Some(v),
+                            EntryValue::Tombstone => None,
+                        },
+                    );
                 }
             }
         }
@@ -675,17 +772,17 @@ impl Engine {
                 if !in_range(&k) {
                     continue;
                 }
-                merged.insert(k, match ev {
-                    EntryValue::Value(v) => Some(v),
-                    EntryValue::Tombstone => None,
-                });
+                merged.insert(
+                    k,
+                    match ev {
+                        EntryValue::Value(v) => Some(v),
+                        EntryValue::Tombstone => None,
+                    },
+                );
             }
         }
 
-        Ok(merged
-            .into_iter()
-            .filter_map(|(k, v)| v.map(|v| (k, v)))
-            .collect())
+        self.decrypt_pairs(merged)
     }
 
     /// Collect distinct keys of a segment with the given prefix.
@@ -759,7 +856,10 @@ impl Engine {
         }
         repaired.validate_for_open()?;
         let mut segments = self.segments.write();
-        if let Some(current) = segments.iter_mut().find(|current| current.path() == seg.path()) {
+        if let Some(current) = segments
+            .iter_mut()
+            .find(|current| current.path() == seg.path())
+        {
             *current = repaired.clone();
         }
         eprintln!(
@@ -793,21 +893,18 @@ impl Engine {
 
         // RS-protect the frozen stream (non-fatal on failure: frame CRCs and
         // the mirror still cover it).
-        if std::fs::metadata(&closed_path).map(|m| m.len() > 0).unwrap_or(false) {
-            if let Err(e) = WalParity::protect(
-                &closed_path,
-                self.config.erasure_k,
-                self.config.erasure_m,
-            ) {
+        if std::fs::metadata(&closed_path)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false)
+        {
+            if let Err(e) =
+                WalParity::protect(&closed_path, self.config.erasure_k, self.config.erasure_m)
+            {
                 eprintln!("[WAL] parity protection failed for {closed_name}: {e}");
             }
         }
         if let Some(mirror) = &self.mirror {
-            if let Err(e) = mirror.rotate_wal(
-                seq,
-                self.config.erasure_k,
-                self.config.erasure_m,
-            ) {
+            if let Err(e) = mirror.rotate_wal(seq, self.config.erasure_k, self.config.erasure_m) {
                 eprintln!("[WAL] Strand B rotation failed for seq {seq}: {e}");
             }
         }
@@ -852,9 +949,7 @@ impl Engine {
             &entries,
             self.config.erasure_k,
             self.config.erasure_m,
-            BlockSegmentReader::seed_for(
-                &self.config.dir_path.join(format!("{seg_id:06}.sst")),
-            ),
+            BlockSegmentReader::seed_for(&self.config.dir_path.join(format!("{seg_id:06}.sst"))),
         )?;
         if let Some(mirror) = &self.mirror {
             mirror.mirror_segment(&path)?;
@@ -941,7 +1036,9 @@ impl Engine {
             mirror.remove_closed_wals(&self.config.dir_path);
         }
         remove_closed_wals(&self.config.dir_path);
-        self.stats.flush_count.fetch_add(flushed as u64, Ordering::Relaxed);
+        self.stats
+            .flush_count
+            .fetch_add(flushed as u64, Ordering::Relaxed);
         Ok(())
     }
 
@@ -979,9 +1076,7 @@ impl Engine {
         // Tombstones with no older live data anywhere below can be dropped
         let entries: Vec<(Vec<u8>, EntryValue)> = merged
             .into_iter()
-            .filter_map(|(k, v)| {
-                v.map(|v| (k, EntryValue::Value(v)))
-            })
+            .filter_map(|(k, v)| v.map(|v| (k, EntryValue::Value(v))))
             .collect();
 
         let seg_id = self.next_segment_id.fetch_add(1, Ordering::SeqCst);
@@ -991,9 +1086,7 @@ impl Engine {
             &entries,
             self.config.erasure_k,
             self.config.erasure_m,
-            BlockSegmentReader::seed_for(
-                &self.config.dir_path.join(format!("{seg_id:06}.sst")),
-            ),
+            BlockSegmentReader::seed_for(&self.config.dir_path.join(format!("{seg_id:06}.sst"))),
         )?;
         if let Some(mirror) = &self.mirror {
             mirror.mirror_segment(&new_path)?;
@@ -1161,7 +1254,7 @@ impl Engine {
         }
         let scrub_config = self.config.scrub.as_ref();
         serde_json::json!({
-            "version": "3.0.0",
+            "version": env!("CARGO_PKG_VERSION"),
             "erasure": {
                 "k": self.config.erasure_k,
                 "m": self.config.erasure_m,

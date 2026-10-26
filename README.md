@@ -1,8 +1,48 @@
-# DNA-DB Core v3.1 «Paneldb» (SQL + Web Admin Release)
+# DNA-DB Core v3.2 «Paneldb Security» (production hardening)
 
 > This repository is bilingual: **English** (this file) · [Русский](README_RU.md)
 
 A high-performance embeddable and client/server database engine written in Rust, featuring an LSM-Tree architecture, 2-bit nucleotide compression, dual-strand disk mirroring, the **DnaQL** query language, a **full SQL subset** (aggregates, GROUP BY/HAVING, ORDER BY, IN/subqueries, **secondary and range indexes**), a built-in **web admin panel** (phpMyAdmin-style) and self-healing on sector corruption.
+
+## 0.2. Production security (v3.2)
+
+| Control | Implementation |
+|---|---|
+| Transport | **rustls TLS 1.2/1.3 on both listeners** (binary TCP protocol and HTTPS panel), HSTS on HTTPS, no plaintext fallback on the TLS port |
+| Certificates | `--tls-cert/--tls-key` PEM pair; a self-signed localhost pair is generated under `DATA/tls/` on first start (development only) |
+| Passwords | **Argon2id** PHC hashes in `DATA/users.json`, per-user salt, timing-equalised unknown users |
+| Users | bootstrap `admin` / `password`, then create/disable/delete users and reset/change passwords in the panel; roles `admin`, `operator`, `viewer`; the last active admin cannot be removed |
+| Sessions | 256-bit CSPRNG bearer tokens, 12 h TTL, revoked on password change/disable |
+| Brute force | persistent **per-IP and per-username lockout** (5 failures / 60 s), global failure throttle, serialised Argon2 (bounded memory) |
+| Encryption at rest | XChaCha20-Poly1305 AEAD per value before WAL/SST/mirror writes; key from `DNA_DB_ENCRYPTION_KEY`, `--encryption-key-file` or `DATA/.dna-db.key`; legacy plaintext rows remain readable |
+| Panel hardening | CSP with SHA-256 hash for the inline SPA script (no `unsafe-inline` for scripts), `X-Frame-Options: DENY`, `nosniff`, `no-referrer`, restrictive `Permissions-Policy` |
+| Pre-auth DoS | 64 KiB pre-auth frame cap (instead of 128 × 16 MiB allocation), 10 s pre-auth read timeout, 64 concurrent panel connections, 128 TCP connections |
+| Bind | loopback (`127.0.0.1`) by default; public exposure is an explicit `--bind` decision |
+
+```bash
+# production-ish start: TLS + encryption are on by default.
+# The first start creates admin/password — change it in the panel immediately.
+./target/release/dna-db-core serve --data-dir ./dna_data --port 9999 --admin-port 8080
+# https://127.0.0.1:8080/  (self-signed cert: pass DATA/tls/cert.pem to clients)
+
+# custom CA / public certificate:
+./target/release/dna-db-core serve --data-dir ./dna_data \
+  --tls-cert /etc/letsencrypt/live/db.example/fullchain.pem \
+  --tls-key  /etc/letsencrypt/live/db.example/privkey.pem \
+  --admin-pass 'change-me-now'
+
+# shell over TLS against a self-signed local server:
+./target/release/dna-db-core shell --tls-ca ./dna_data/tls/cert.pem
+
+# development-only escapes (never on an untrusted network):
+#   --no-tls   --no-encryption
+```
+
+> **Back up the encryption key separately from the data directory.** Without the
+> key the values are unrecoverable. Record keys and row counts remain visible
+> in WAL/SST indexes by design; the AEAD envelope protects application values,
+> not the LSM key space. See [SECURITY.md](SECURITY.md) for the threat model,
+> operational checklist and residual `cargo audit` warnings.
 
 ## 0.1. What's new in v3.1 — SQL and the web panel
 
@@ -15,14 +55,14 @@ A high-performance embeddable and client/server database engine written in Rust,
 | `LIMIT` / `OFFSET` | pagination | used by the web panel |
 | **Secondary indexes** | `CREATE INDEX idx ON t (col)` / `DROP INDEX` — stored in the schema, honoured by DML | index unit tests |
 | **IndexScan plans** | equality/`IN`/range on an indexed column → `IndexScan(...)` instead of `SeqScan` | plan unit tests |
-| **Web panel** | `serve --admin-port 8080`: overview/health, tables + paginated browser, indexes, SQL and DnaQL consoles | HTTP integration unit test |
+| **Web panel** | `serve --admin-port 8080`: overview/health, tables + paginated browser, indexes, SQL and DnaQL consoles, user administration | HTTPS/API integration + security probe |
 | **Row editing** | click a row → modal dialog (phpMyAdmin-style): schema-driven fields, NULL checkboxes, live SQL preview, UPDATE/DELETE with confirmation | manual e2e scenario in the browser |
 | **SQL tokenizer** | negative numbers (`-25.5`) and standard quote escaping (`'O''Brien'`) | `tokenizer_negative_numbers_and_escaped_quotes`, `update_with_negative_and_quoted_values` |
 
 ```bash
 # admin panel (credentials are the same as for the TCP server):
 ./target/release/dna-db-core serve --data-dir ./dna_data --admin-pass secret --admin-port 8080
-# then open http://127.0.0.1:8080/
+# then open https://127.0.0.1:8080/ (TLS is on by default)
 ```
 
 Panel screenshots: [docs/screenshots](docs/screenshots).
@@ -56,7 +96,7 @@ DNA → engineering analogy:
 Proofs (all executable):
 
 - **Chaos test**: `python3 scripts/chaos_test.py` — 100,000 keys → 80 sectors corrupted (bit-flip/zero-fill) → `doctor --fix` → 100 % recovery; live mode (corruption on a running server); over-damage (honest failure beyond the guarantee). Results: [docs/CHAOS_REPORT.md](docs/CHAOS_REPORT.md).
-- **Tests**: 152 green (`cargo test --release`) — 93 inherited from v2.1.0 plus new ones (RS codec against every loss pattern, interleaving, repair pipeline, quarantine, migration, WAL rotation, closed-WAL parity).
+- **Tests**: 174 green (`cargo test --release`) — 159 library + 15 integration; includes RS codec against every loss pattern, interleaving, repair pipeline, quarantine, migration, WAL rotation, closed-WAL parity and encryption integration.
 - **Format**: DNASST02 is documented in [docs/PROTOCOL.md](docs/PROTOCOL.md); DNASST01 is readable, migration is manual via `doctor --migrate` (reliability first).
 
 Self-healing quick start:
@@ -91,10 +131,10 @@ A high-performance embeddable and client/server database engine written in Rust,
 | Atomic transactions | batched WAL write (one fsync = one atomic interval) | `write_batch_is_atomic_on_recovery` |
 | DnaQL (Standard + Quick) | tokenizer → parser → executor over real storage | 8 unit tests + live smoke |
 | SQL subset | SELECT/JOIN(WHERE/IN-subqueries)/GROUP BY/HAVING/ORDER BY/LIMIT/OFFSET, aggregates, INSERT, UPDATE, DELETE (CASCADE), CREATE/DROP TABLE, **CREATE/DROP INDEX + IndexScan** | 40+ unit tests |
-| Web admin panel | HTTP/1.1 + SPA (no external dependencies): overview, tables, SQL/DnaQL consoles | `admin::tests::panel_requires_auth_and_serves_api` |
+| Web admin panel | HTTPS + SPA (no external dependencies): overview, tables, SQL/DnaQL consoles, user management | `admin::tests::panel_requires_auth_and_serves_api` + `scripts/security_probe.py` |
 | Bitap/Myers fuzzy search | correct Wu-Manber, **true** distance, Levenshtein + Hamming | 8000-case fuzz vs a reference DP |
 | Bio plugins | real Smith-Waterman, PAM scanner, ORF-finder, GC windows | unit tests |
-| TCP server | thread-per-connection, 16MB frame cap, salted SHA-256, IP lockout | 3 unit tests + smoke |
+| TCP server | thread-per-connection, TLS, 16 MiB frame cap (64 KiB pre-auth), Argon2id, persistent IP/username lockout | unit tests + `scripts/security_probe.py` |
 | CLI | `serve` / `bench` / `shell` | manual verification |
 | Metrics | real counters (ops, bytes, average latencies) | unit test |
 
@@ -117,12 +157,12 @@ cargo build --release
   --demo-data          # optional: demo tables chr_users/chr_orders/chr_patients/chr_variants
 ```
 A password is required (`--admin-pass` or the `DNA_DB_ADMIN_PASS` variable) — there is no default password.
-Once running, open the web panel: **http://127.0.0.1:8080/** (same login, `--admin-user`, default `admin`).
+Once running, open **https://127.0.0.1:8080/** (the generated certificate is self-signed; pass `DATA/tls/cert.pem` to clients or use a real certificate).
 `--admin-port 0` disables the panel; the panel listens on the same interface as `--bind` (loopback by default).
 
 ### Shell client
 ```bash
-./target/release/dna-db-core shell --port 9999
+./target/release/dna-db-core shell --port 9999 --tls-ca ./dna_data/tls/cert.pem
 dna-db> SELECT order_id, username, total_usd FROM chr_orders JOIN chr_users ON user_id = user_id WHERE total_usd > 400;
 dna-db> ANALYZE SEQUENCE 'ATGGCCTAA' |> GC_CONTENT() |> TRANSLATE();
 dna-db> .status
@@ -249,7 +289,7 @@ Full format description: [PROTOCOL.md](docs/PROTOCOL.md).
 ## 7. Tests and benchmarks
 
 ```bash
-cargo test --release                # 152 tests (139 lib + 13 integration), 0 warnings
+cargo test --release                # 174 tests (159 lib + 15 integration)
 python3 scripts/kill9_test.py       # kill -9 durability (requires a built release binary)
 python3 scripts/chaos_test.py       # sector corruption -> doctor --fix -> 100% recovery
 ./target/release/dna-db-core bench  # real measurements (see docs/BENCHMARKS.md)

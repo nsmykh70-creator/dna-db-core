@@ -9,6 +9,7 @@
 /shell_test_data
 /run-*
 *.log
+/security_results.json
 
 # python
 __pycache__/

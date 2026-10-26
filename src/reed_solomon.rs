@@ -56,7 +56,9 @@ impl ErasureCodec {
             return Err(ErasureError::InvalidShape("k and m must both be >= 1"));
         }
         if k + m > 256 {
-            return Err(ErasureError::InvalidShape("k + m must be <= 256 for GF(2^8)"));
+            return Err(ErasureError::InvalidShape(
+                "k + m must be <= 256 for GF(2^8)",
+            ));
         }
         let rs = ReedSolomon::new(k, m)
             .map_err(|e| ErasureError::Codec(format!("ReedSolomon::new({k}, {m}): {e}")))?;
@@ -74,11 +76,15 @@ impl ErasureCodec {
     /// Encode `k` equal-length data shards, returning `m` parity shards.
     pub fn encode(&self, data: &[Vec<u8>]) -> Result<Vec<Vec<u8>>, ErasureError> {
         if data.len() != self.k {
-            return Err(ErasureError::InvalidShape("encode expects exactly k data shards"));
+            return Err(ErasureError::InvalidShape(
+                "encode expects exactly k data shards",
+            ));
         }
         let shard_len = data[0].len();
         if data.iter().any(|d| d.len() != shard_len) {
-            return Err(ErasureError::InvalidShape("data shards must have equal length"));
+            return Err(ErasureError::InvalidShape(
+                "data shards must have equal length",
+            ));
         }
         // Crate 6.0 API: one (k+m)-slice, parity slots overwritten in place.
         let mut all: Vec<Vec<u8>> = Vec::with_capacity(self.k + self.m);
@@ -111,12 +117,10 @@ impl ErasureCodec {
             .next()
             .map(|s| s.len())
             .ok_or(ErasureError::InvalidShape("no shards present"))?;
-        if shards
-            .iter()
-            .flatten()
-            .any(|s| s.len() != shard_len)
-        {
-            return Err(ErasureError::InvalidShape("surviving shards disagree on length"));
+        if shards.iter().flatten().any(|s| s.len() != shard_len) {
+            return Err(ErasureError::InvalidShape(
+                "surviving shards disagree on length",
+            ));
         }
         self.rs
             .reconstruct(shards)
@@ -143,7 +147,9 @@ mod tests {
     }
 
     fn make_stripe(k: usize, shard_len: usize, seed: u64) -> Vec<Vec<u8>> {
-        (0..k).map(|i| pseudo_random(shard_len, seed + i as u64)).collect()
+        (0..k)
+            .map(|i| pseudo_random(shard_len, seed + i as u64))
+            .collect()
     }
 
     /// ACCEPTANCE (P2.1): encode → erase up to m shards → reconstruct →
@@ -156,8 +162,12 @@ mod tests {
             let parity = codec.encode(&data).unwrap();
             assert_eq!(parity.len(), m);
 
-            let slots: Vec<Option<Vec<u8>>> =
-                data.iter().cloned().map(Some).chain(parity.into_iter().map(Some)).collect();
+            let slots: Vec<Option<Vec<u8>>> = data
+                .iter()
+                .cloned()
+                .map(Some)
+                .chain(parity.into_iter().map(Some))
+                .collect();
 
             // Erase every possible combination of up to m shard positions.
             let total = k + m;
@@ -178,7 +188,10 @@ mod tests {
                         slot.as_deref(),
                         Some(expected.as_slice()),
                         "k={} m={} erased mask={:#b} shard {} mismatch",
-                        k, m, mask, i
+                        k,
+                        m,
+                        mask,
+                        i
                     );
                 }
             }
@@ -203,7 +216,10 @@ mod tests {
                 assert_eq!(present, 2);
                 assert_eq!(needed, 4);
             }
-            other => panic!("expected InsufficientShards, got {:?}", other.map(|_| ()).err()),
+            other => panic!(
+                "expected InsufficientShards, got {:?}",
+                other.map(|_| ()).err()
+            ),
         }
     }
 

@@ -96,8 +96,10 @@ impl Expr {
             Expr::Column(name) => row.get(name).cloned(),
             Expr::Not(e) => {
                 let v = e.eval(row)?;
-                Some(Value::Int(!(v.compare(&Value::Int(0)) != std::cmp::Ordering::Equal
-                    && !matches!(v, Value::Null)) as i64))
+                Some(Value::Int(
+                    !(v.compare(&Value::Int(0)) != std::cmp::Ordering::Equal
+                        && !matches!(v, Value::Null)) as i64,
+                ))
             }
             Expr::And(a, b) => {
                 let (a, b) = (a.eval(row)?, b.eval(row)?);
@@ -129,7 +131,9 @@ impl Expr {
                     return Some(Value::Null);
                 }
                 Some(Value::Int(
-                    values.iter().any(|c| c.compare(&v) == std::cmp::Ordering::Equal)
+                    values
+                        .iter()
+                        .any(|c| c.compare(&v) == std::cmp::Ordering::Equal)
                         as i64,
                 ))
             }

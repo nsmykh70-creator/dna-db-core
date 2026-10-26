@@ -18,8 +18,8 @@
 //! Correctness is property-tested below against a naive semi-global DP
 //! reference and brute-force Hamming windows (8000 randomized cases).
 
-use serde::{Deserialize, Serialize};
 use crate::dna::PackedDna;
+use serde::{Deserialize, Serialize};
 
 pub const MAX_BITAP_PATTERN: usize = 64;
 
@@ -59,7 +59,11 @@ fn build_peq(pattern: &str) -> [u64; 4] {
 }
 
 fn prefix_mask(m: usize) -> u64 {
-    if m >= 64 { u64::MAX } else { (1u64 << m) - 1 }
+    if m >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << m) - 1
+    }
 }
 
 /// Naive full DP edit distance (m <= 64, only run at MATCH positions).
@@ -127,9 +131,9 @@ impl BitapMatcher {
             for d in 1..=k {
                 let old_rd = r[d];
                 let mut nd = ((r[d] << 1) | 1) & cmask; // exact continuation
-                nd |= old_prev;                         // insertion (skip target char)
-                nd |= (old_prev << 1) | 1;              // substitution
-                nd |= r[d - 1] << 1;                    // deletion (skip pattern char)
+                nd |= old_prev; // insertion (skip target char)
+                nd |= (old_prev << 1) | 1; // substitution
+                nd |= r[d - 1] << 1; // deletion (skip pattern char)
                 r[d] = nd & pmask;
                 old_prev = old_rd;
             }
@@ -198,7 +202,11 @@ impl BitapMatcher {
     }
 
     /// Pure Hamming search (substitutions only). Window length == pattern length.
-    pub fn search_hamming(target: &PackedDna, pattern: &str, max_distance: usize) -> Vec<AlignmentMatch> {
+    pub fn search_hamming(
+        target: &PackedDna,
+        pattern: &str,
+        max_distance: usize,
+    ) -> Vec<AlignmentMatch> {
         let ascii = target.to_ascii();
         let ends = Self::hamming_ends(ascii.as_bytes(), pattern, max_distance);
         let m = pattern.len();
@@ -258,7 +266,11 @@ mod tests {
             prev = cur;
         }
         let d = prev[m];
-        if d <= k { Some(d) } else { None }
+        if d <= k {
+            Some(d)
+        } else {
+            None
+        }
     }
 
     fn naive_lev_test(a: &str, b: &str) -> usize {
@@ -312,7 +324,9 @@ mod tests {
             let n = 8 + (rng.next() % 40) as usize;
             let text = rand_seq(&mut rng, n);
             let m = 1 + (rng.next() % 8) as usize;
-            if m > n { continue; }
+            if m > n {
+                continue;
+            }
             let pattern = rand_seq(&mut rng, m);
             let k = (rng.next() % 4) as usize;
 
@@ -322,17 +336,34 @@ mod tests {
             for mt in &got {
                 let end = mt.offset_bp + mt.matched_sequence.len() - 1;
                 // window property: lev(pattern, window) == reported distance
-                assert_eq!(naive_lev_test(&pattern, &mt.matched_sequence), mt.mismatches,
-                    "window-lev text={} pattern={}", text, pattern);
-                got_by_end.entry(end)
-                    .and_modify(|e| { if mt.mismatches < *e { *e = mt.mismatches; } })
+                assert_eq!(
+                    naive_lev_test(&pattern, &mt.matched_sequence),
+                    mt.mismatches,
+                    "window-lev text={} pattern={}",
+                    text,
+                    pattern
+                );
+                got_by_end
+                    .entry(end)
+                    .and_modify(|e| {
+                        if mt.mismatches < *e {
+                            *e = mt.mismatches;
+                        }
+                    })
                     .or_insert(mt.mismatches);
             }
 
             for j in 0..n {
                 let want = ref_lev_ending(&text.as_bytes()[..=j], &pattern, k);
-                assert_eq!(got_by_end.get(&j).copied(), want,
-                    "text={} pattern={} k={} end={}", text, pattern, k, j);
+                assert_eq!(
+                    got_by_end.get(&j).copied(),
+                    want,
+                    "text={} pattern={} k={} end={}",
+                    text,
+                    pattern,
+                    k,
+                    j
+                );
                 checked += 1;
             }
         }
@@ -346,7 +377,9 @@ mod tests {
             let n = 8 + (rng.next() % 40) as usize;
             let text = rand_seq(&mut rng, n);
             let m = 1 + (rng.next() % 8) as usize;
-            if m > n { continue; }
+            if m > n {
+                continue;
+            }
             let pattern = rand_seq(&mut rng, m);
             let k = (rng.next() % 4) as usize;
 
@@ -356,12 +389,21 @@ mod tests {
                 got.iter().map(|x| (x.offset_bp, x.mismatches)).collect();
 
             for start in 0..=(n - m) {
-                let dist = text.as_bytes()[start..start + m].iter()
+                let dist = text.as_bytes()[start..start + m]
+                    .iter()
                     .zip(pattern.as_bytes())
-                    .filter(|(a, b)| a != b).count();
+                    .filter(|(a, b)| a != b)
+                    .count();
                 let want = if dist <= k { Some(dist) } else { None };
-                assert_eq!(got_set.get(&start).copied(), want,
-                    "text={} pattern={} k={} start={}", text, pattern, k, start);
+                assert_eq!(
+                    got_set.get(&start).copied(),
+                    want,
+                    "text={} pattern={} k={} start={}",
+                    text,
+                    pattern,
+                    k,
+                    start
+                );
             }
         }
     }

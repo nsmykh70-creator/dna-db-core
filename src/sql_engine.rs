@@ -16,16 +16,16 @@
 //!
 //! Execution plans are HONEST: they describe what actually ran.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use crate::complement_index::ComplementIndex;
 use crate::engine::Engine;
 use crate::expr::{ArithOp, CmpOp, Expr};
 use crate::relational::{
-    encode_index_value, encode_ordered_value, ChromosomeTable, ColumnType,
-    ForeignKeyConstraint, RowCodec, SecondaryIndexMeta, Value,
+    encode_index_value, encode_ordered_value, ChromosomeTable, ColumnType, ForeignKeyConstraint,
+    RowCodec, SecondaryIndexMeta, Value,
 };
-use crate::complement_index::ComplementIndex;
 use parking_lot::RwLock;
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 pub struct QueryRow {
     pub fields: BTreeMap<String, Value>,
@@ -82,21 +82,66 @@ fn stokenize(input: &str) -> Result<Vec<STok>, String> {
         let c = b[i];
         match c {
             ' ' | '\t' | '\r' | '\n' => i += 1,
-            ',' => { toks.push(STok::Comma); i += 1; }
-            ';' => { toks.push(STok::Semi); i += 1; }
-            '(' => { toks.push(STok::LParen); i += 1; }
-            ')' => { toks.push(STok::RParen); i += 1; }
-            '*' => { toks.push(STok::Star); i += 1; }
-            '+' => { toks.push(STok::Plus); i += 1; }
-            '/' => { toks.push(STok::Slash); i += 1; }
-            '.' => { toks.push(STok::Dot); i += 1; }
-            '=' => { toks.push(STok::Eq); i += 1; }
-            '!' if i + 1 < b.len() && b[i + 1] == '=' => { toks.push(STok::Ne); i += 2; }
-            '<' if i + 1 < b.len() && b[i + 1] == '=' => { toks.push(STok::Le); i += 2; }
-            '<' if i + 1 < b.len() && b[i + 1] == '>' => { toks.push(STok::Ne); i += 2; }
-            '<' => { toks.push(STok::Lt); i += 1; }
-            '>' if i + 1 < b.len() && b[i + 1] == '=' => { toks.push(STok::Ge); i += 2; }
-            '>' => { toks.push(STok::Gt); i += 1; }
+            ',' => {
+                toks.push(STok::Comma);
+                i += 1;
+            }
+            ';' => {
+                toks.push(STok::Semi);
+                i += 1;
+            }
+            '(' => {
+                toks.push(STok::LParen);
+                i += 1;
+            }
+            ')' => {
+                toks.push(STok::RParen);
+                i += 1;
+            }
+            '*' => {
+                toks.push(STok::Star);
+                i += 1;
+            }
+            '+' => {
+                toks.push(STok::Plus);
+                i += 1;
+            }
+            '/' => {
+                toks.push(STok::Slash);
+                i += 1;
+            }
+            '.' => {
+                toks.push(STok::Dot);
+                i += 1;
+            }
+            '=' => {
+                toks.push(STok::Eq);
+                i += 1;
+            }
+            '!' if i + 1 < b.len() && b[i + 1] == '=' => {
+                toks.push(STok::Ne);
+                i += 2;
+            }
+            '<' if i + 1 < b.len() && b[i + 1] == '=' => {
+                toks.push(STok::Le);
+                i += 2;
+            }
+            '<' if i + 1 < b.len() && b[i + 1] == '>' => {
+                toks.push(STok::Ne);
+                i += 2;
+            }
+            '<' => {
+                toks.push(STok::Lt);
+                i += 1;
+            }
+            '>' if i + 1 < b.len() && b[i + 1] == '=' => {
+                toks.push(STok::Ge);
+                i += 2;
+            }
+            '>' => {
+                toks.push(STok::Gt);
+                i += 1;
+            }
             '\'' | '"' => {
                 let quote = c;
                 let mut s = String::new();
@@ -128,10 +173,25 @@ fn stokenize(input: &str) -> Result<Vec<STok>, String> {
             '-' if i + 1 < b.len()
                 && b[i + 1].is_ascii_digit()
                 && (toks.is_empty()
-                    || matches!(toks.last(),
-                        Some(STok::Comma | STok::Semi | STok::LParen | STok::Eq | STok::Ne
-                            | STok::Lt | STok::Le | STok::Gt | STok::Ge | STok::Plus
-                            | STok::Minus | STok::Star | STok::Slash))) => {
+                    || matches!(
+                        toks.last(),
+                        Some(
+                            STok::Comma
+                                | STok::Semi
+                                | STok::LParen
+                                | STok::Eq
+                                | STok::Ne
+                                | STok::Lt
+                                | STok::Le
+                                | STok::Gt
+                                | STok::Ge
+                                | STok::Plus
+                                | STok::Minus
+                                | STok::Star
+                                | STok::Slash
+                        )
+                    )) =>
+            {
                 let mut num = String::new();
                 let mut is_float = false;
                 num.push('-');
@@ -152,7 +212,10 @@ fn stokenize(input: &str) -> Result<Vec<STok>, String> {
                     toks.push(STok::Int(num.parse().map_err(|_| "SQL: bad int")?));
                 }
             }
-            '-' => { toks.push(STok::Minus); i += 1; }
+            '-' => {
+                toks.push(STok::Minus);
+                i += 1;
+            }
             '0'..='9' => {
                 let mut num = String::new();
                 let mut is_float = false;
@@ -295,7 +358,7 @@ impl AggFunc {
 pub(crate) struct JoinSpec {
     pub(crate) join_type: JoinType,
     pub(crate) table: String,
-    pub(crate) left_col: String,  // qualified or bare (resolved later)
+    pub(crate) left_col: String, // qualified or bare (resolved later)
     pub(crate) right_col: String,
 }
 
@@ -332,7 +395,11 @@ impl SParser {
         false
     }
     fn expect_kw(&mut self, w: &str) -> Result<(), String> {
-        if self.kw(w) { Ok(()) } else { Err(format!("SQL: expected {}", w)) }
+        if self.kw(w) {
+            Ok(())
+        } else {
+            Err(format!("SQL: expected {}", w))
+        }
     }
     fn ident(&mut self) -> Result<String, String> {
         match self.next() {
@@ -356,8 +423,18 @@ impl SParser {
             let lower = s.to_ascii_lowercase();
             if !matches!(
                 lower.as_str(),
-                "join" | "inner" | "left" | "right" | "where" | "limit" | "offset"
-                    | "on" | "group" | "order" | "union" | "having"
+                "join"
+                    | "inner"
+                    | "left"
+                    | "right"
+                    | "where"
+                    | "limit"
+                    | "offset"
+                    | "on"
+                    | "group"
+                    | "order"
+                    | "union"
+                    | "having"
             ) {
                 self.next();
             }
@@ -383,18 +460,28 @@ impl SParser {
     }
 
     fn parse_stmt(&mut self) -> Result<Stmt, String> {
-        if self.kw("SELECT") { self.parse_select_tail() }
-        else if self.kw("INSERT") { self.parse_insert() }
-        else if self.kw("UPDATE") { self.parse_update() }
-        else if self.kw("DELETE") { self.parse_delete() }
-        else if self.kw("CREATE") { self.parse_create() }
-        else if self.kw("DROP") { self.parse_drop() }
-        else if self.kw("EXPLAIN") {
+        if self.kw("SELECT") {
+            self.parse_select_tail()
+        } else if self.kw("INSERT") {
+            self.parse_insert()
+        } else if self.kw("UPDATE") {
+            self.parse_update()
+        } else if self.kw("DELETE") {
+            self.parse_delete()
+        } else if self.kw("CREATE") {
+            self.parse_create()
+        } else if self.kw("DROP") {
+            self.parse_drop()
+        } else if self.kw("EXPLAIN") {
             self.next();
             let inner = self.parse_stmt()?;
             Ok(Stmt::Explain(Box::new(inner)))
+        } else {
+            Err(format!(
+                "SQL: unsupported statement starting at {:?}",
+                self.peek()
+            ))
         }
-        else { Err(format!("SQL: unsupported statement starting at {:?}", self.peek())) }
     }
 
     /// Body of a SELECT after the SELECT keyword has been consumed.
@@ -413,7 +500,11 @@ impl SParser {
         } else {
             loop {
                 projection.push(self.parse_select_item()?);
-                if matches!(self.peek(), STok::Comma) { self.next(); } else { break; }
+                if matches!(self.peek(), STok::Comma) {
+                    self.next();
+                } else {
+                    break;
+                }
             }
         }
         self.expect_kw("FROM")?;
@@ -452,21 +543,38 @@ impl SParser {
                 self.next();
                 right_col = self.ident()?;
             }
-            joins.push(JoinSpec { join_type, table, left_col: lc, right_col });
+            joins.push(JoinSpec {
+                join_type,
+                table,
+                left_col: lc,
+                right_col,
+            });
         }
-        let where_clause = if self.kw("WHERE") { Some(self.parse_expr()?) } else { None };
+        let where_clause = if self.kw("WHERE") {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
         let group_by = if self.kw("GROUP") {
             self.expect_kw("BY")?;
             let mut cols = Vec::new();
             loop {
                 cols.push(self.ident()?);
-                if matches!(self.peek(), STok::Comma) { self.next(); } else { break; }
+                if matches!(self.peek(), STok::Comma) {
+                    self.next();
+                } else {
+                    break;
+                }
             }
             cols
         } else {
             Vec::new()
         };
-        let having = if self.kw("HAVING") { Some(self.parse_expr()?) } else { None };
+        let having = if self.kw("HAVING") {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
         let order_by = if self.kw("ORDER") {
             self.expect_kw("BY")?;
             let mut keys = Vec::new();
@@ -497,7 +605,11 @@ impl SParser {
                     true
                 };
                 keys.push((key, asc));
-                if matches!(self.peek(), STok::Comma) { self.next(); } else { break; }
+                if matches!(self.peek(), STok::Comma) {
+                    self.next();
+                } else {
+                    break;
+                }
             }
             keys
         } else {
@@ -519,9 +631,19 @@ impl SParser {
         } else {
             0
         };
-        if matches!(self.peek(), STok::Semi) { self.next(); }
+        if matches!(self.peek(), STok::Semi) {
+            self.next();
+        }
         Ok(Stmt::Select {
-            projection, from, joins, where_clause, group_by, having, order_by, limit, offset,
+            projection,
+            from,
+            joins,
+            where_clause,
+            group_by,
+            having,
+            order_by,
+            limit,
+            offset,
         })
     }
 
@@ -549,7 +671,12 @@ impl SParser {
                 let canonical = render_agg(&s, arg.as_deref());
                 let alias = self.maybe_as_alias()?;
                 let rendered = alias.clone().unwrap_or_else(|| canonical.clone());
-                return Ok(SelectItem::Agg { func, arg, rendered, canonical });
+                return Ok(SelectItem::Agg {
+                    func,
+                    arg,
+                    rendered,
+                    canonical,
+                });
             }
         }
         let expr = self.parse_operand()?;
@@ -561,7 +688,10 @@ impl SParser {
             other => {
                 let alias = self.maybe_as_alias()?;
                 let rendered = alias.unwrap_or_else(|| other.describe());
-                Ok(SelectItem::Computed { expr: other, rendered })
+                Ok(SelectItem::Computed {
+                    expr: other,
+                    rendered,
+                })
             }
         }
     }
@@ -577,8 +707,21 @@ impl SParser {
             let lower = s.to_ascii_lowercase();
             if !matches!(
                 lower.as_str(),
-                "from" | "where" | "group" | "having" | "order" | "limit" | "offset"
-                    | "join" | "inner" | "left" | "on" | "and" | "or" | "asc" | "desc"
+                "from"
+                    | "where"
+                    | "group"
+                    | "having"
+                    | "order"
+                    | "limit"
+                    | "offset"
+                    | "join"
+                    | "inner"
+                    | "left"
+                    | "on"
+                    | "and"
+                    | "or"
+                    | "asc"
+                    | "desc"
                     | "union"
             ) {
                 return Ok(Some(self.ident()?));
@@ -608,13 +751,20 @@ impl SParser {
                 let col = self.ident()?;
                 match self.next() {
                     STok::Eq => {}
-                    t => return Err(format!("SQL: expected '=' after column '{}', got {:?}", col, t)),
+                    t => {
+                        return Err(format!(
+                            "SQL: expected '=' after column '{}', got {:?}",
+                            col, t
+                        ))
+                    }
                 }
                 let v = self.value()?;
                 rows[0].push((col, v));
             }
             self.expect(STok::RParen)?;
-            if matches!(self.peek(), STok::Semi) { self.next(); }
+            if matches!(self.peek(), STok::Semi) {
+                self.next();
+            }
             return Ok(Stmt::Insert { table, rows });
         }
 
@@ -636,7 +786,11 @@ impl SParser {
             let mut values = Vec::new();
             loop {
                 values.push(self.value()?);
-                if matches!(self.peek(), STok::Comma) { self.next(); } else { break; }
+                if matches!(self.peek(), STok::Comma) {
+                    self.next();
+                } else {
+                    break;
+                }
             }
             self.expect(STok::RParen)?;
             if values.len() != cols.len() {
@@ -647,9 +801,15 @@ impl SParser {
                 ));
             }
             rows.push(cols.iter().cloned().zip(values).collect::<Vec<_>>());
-            if matches!(self.peek(), STok::Comma) { self.next(); } else { break; }
+            if matches!(self.peek(), STok::Comma) {
+                self.next();
+            } else {
+                break;
+            }
         }
-        if matches!(self.peek(), STok::Semi) { self.next(); }
+        if matches!(self.peek(), STok::Semi) {
+            self.next();
+        }
         Ok(Stmt::Insert { table, rows })
     }
 
@@ -665,19 +825,42 @@ impl SParser {
             }
             let v = self.value()?;
             assignments.push((col, v));
-            if matches!(self.peek(), STok::Comma) { self.next(); } else { break; }
+            if matches!(self.peek(), STok::Comma) {
+                self.next();
+            } else {
+                break;
+            }
         }
-        let where_clause = if self.kw("WHERE") { Some(self.parse_expr()?) } else { None };
-        if matches!(self.peek(), STok::Semi) { self.next(); }
-        Ok(Stmt::Update { table, assignments, where_clause })
+        let where_clause = if self.kw("WHERE") {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        if matches!(self.peek(), STok::Semi) {
+            self.next();
+        }
+        Ok(Stmt::Update {
+            table,
+            assignments,
+            where_clause,
+        })
     }
 
     fn parse_delete(&mut self) -> Result<Stmt, String> {
         self.expect_kw("FROM")?;
         let table = self.ident()?;
-        let where_clause = if self.kw("WHERE") { Some(self.parse_expr()?) } else { None };
-        if matches!(self.peek(), STok::Semi) { self.next(); }
-        Ok(Stmt::Delete { table, where_clause })
+        let where_clause = if self.kw("WHERE") {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        if matches!(self.peek(), STok::Semi) {
+            self.next();
+        }
+        Ok(Stmt::Delete {
+            table,
+            where_clause,
+        })
     }
 
     fn parse_create(&mut self) -> Result<Stmt, String> {
@@ -719,7 +902,12 @@ impl SParser {
                 self.expect(STok::RParen)?;
                 let on_delete_cascade = if self.kw("ON") {
                     self.expect_kw("DELETE")?;
-                    if self.kw("CASCADE") { true } else { self.kw("RESTRICT"); false }
+                    if self.kw("CASCADE") {
+                        true
+                    } else {
+                        self.kw("RESTRICT");
+                        false
+                    }
                 } else {
                     false
                 };
@@ -747,12 +935,21 @@ impl SParser {
                 let _ = self.kw("NOT") && self.kw("NULL"); // accepted, not enforced in v2.1
                 t.add_column(col, ty);
             }
-            if matches!(self.peek(), STok::Comma) { self.next(); } else { break; }
+            if matches!(self.peek(), STok::Comma) {
+                self.next();
+            } else {
+                break;
+            }
         }
         self.expect(STok::RParen)?;
-        if matches!(self.peek(), STok::Semi) { self.next(); }
+        if matches!(self.peek(), STok::Semi) {
+            self.next();
+        }
         t.foreign_keys = fks;
-        Ok(Stmt::CreateTable { table: t, if_not_exists })
+        Ok(Stmt::CreateTable {
+            table: t,
+            if_not_exists,
+        })
     }
 
     /// CREATE [UNIQUE handled above] INDEX [IF NOT EXISTS] name ON table (col)
@@ -770,8 +967,16 @@ impl SParser {
         self.expect(STok::LParen)?;
         let column = self.ident()?;
         self.expect(STok::RParen)?;
-        if matches!(self.peek(), STok::Semi) { self.next(); }
-        Ok(Stmt::CreateIndex { name, table, column, unique, if_not_exists })
+        if matches!(self.peek(), STok::Semi) {
+            self.next();
+        }
+        Ok(Stmt::CreateIndex {
+            name,
+            table,
+            column,
+            unique,
+            if_not_exists,
+        })
     }
 
     fn parse_drop(&mut self) -> Result<Stmt, String> {
@@ -785,9 +990,19 @@ impl SParser {
             let name = self.ident()?;
             // Documented form: DROP INDEX <name> ON <table>. The bare form
             // without ON stays accepted (used by existing scripts/tests).
-            let table = if self.kw("ON") { Some(self.ident()?) } else { None };
-            if matches!(self.peek(), STok::Semi) { self.next(); }
-            return Ok(Stmt::DropIndex { name, if_exists, table });
+            let table = if self.kw("ON") {
+                Some(self.ident()?)
+            } else {
+                None
+            };
+            if matches!(self.peek(), STok::Semi) {
+                self.next();
+            }
+            return Ok(Stmt::DropIndex {
+                name,
+                if_exists,
+                table,
+            });
         }
         self.expect_kw("TABLE")?;
         let if_exists = if self.kw("IF") {
@@ -797,7 +1012,9 @@ impl SParser {
             false
         };
         let table = self.ident()?;
-        if matches!(self.peek(), STok::Semi) { self.next(); }
+        if matches!(self.peek(), STok::Semi) {
+            self.next();
+        }
         Ok(Stmt::DropTable { table, if_exists })
     }
 
@@ -835,7 +1052,11 @@ impl SParser {
         if let Some(op) = op {
             self.next();
             let right = self.parse_operand()?;
-            return Ok(Expr::Cmp { op, left: Box::new(left), right: Box::new(right) });
+            return Ok(Expr::Cmp {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            });
         }
         // `col IN (v1, v2, ...)` / `col IN (SELECT ...)`
         if self.kw("IN") {
@@ -894,7 +1115,11 @@ impl SParser {
             };
             self.next();
             let right = self.parse_multiplicative()?;
-            left = Expr::Arith { op, left: Box::new(left), right: Box::new(right) };
+            left = Expr::Arith {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
         }
         Ok(left)
     }
@@ -909,7 +1134,11 @@ impl SParser {
             };
             self.next();
             let right = self.parse_primary()?;
-            left = Expr::Arith { op, left: Box::new(left), right: Box::new(right) };
+            left = Expr::Arith {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
         }
         Ok(left)
     }
@@ -917,8 +1146,14 @@ impl SParser {
     /// call, parenthesised expression or unary minus.
     fn parse_primary(&mut self) -> Result<Expr, String> {
         match self.peek().clone() {
-            STok::Int(i) => { self.next(); Ok(Expr::Literal(Value::Int(i))) }
-            STok::Float(f) => { self.next(); Ok(Expr::Literal(Value::Float(f))) }
+            STok::Int(i) => {
+                self.next();
+                Ok(Expr::Literal(Value::Int(i)))
+            }
+            STok::Float(f) => {
+                self.next();
+                Ok(Expr::Literal(Value::Float(f)))
+            }
             // Same typing rule as INSERT values: pure-ACGT literals are DNA,
             // so WHERE comparisons match the stored (typed) representation.
             STok::Str(s) => {
@@ -928,9 +1163,7 @@ impl SParser {
             STok::Ident(s) => {
                 // aggregate reference (HAVING COUNT(*) > 2): resolves to the
                 // rendered aggregate column of the grouped result row.
-                if matches!(self.peek_at(1), STok::LParen)
-                    && AggFunc::from_name(&s).is_ok()
-                {
+                if matches!(self.peek_at(1), STok::LParen) && AggFunc::from_name(&s).is_ok() {
                     self.next();
                     self.next(); // (
                     let arg = if matches!(self.peek(), STok::Star) {
@@ -1063,7 +1296,9 @@ impl SqlEngine {
         let mut out = Vec::new();
         while p.peek() != &STok::Eof {
             let stmt = p.parse_stmt()?;
-            out.push(crate::sql_to_dnaql::transpile(&stmt, &|t| self.get_schema(t))?);
+            out.push(crate::sql_to_dnaql::transpile(&stmt, &|t| {
+                self.get_schema(t)
+            })?);
         }
         if out.is_empty() {
             return Err("SQL: nothing to convert (empty statement)".into());
@@ -1075,7 +1310,11 @@ impl SqlEngine {
         let start = std::time::Instant::now();
         // SHOW HEALTH — engine health snapshot (P5.2), handled before the
         // regular SQL grammar so it works everywhere SQL does.
-        if sql.trim_start().to_ascii_uppercase().starts_with("SHOW HEALTH") {
+        if sql
+            .trim_start()
+            .to_ascii_uppercase()
+            .starts_with("SHOW HEALTH")
+        {
             let health = self.engine.health();
             let rows = vec![{
                 let mut m = std::collections::BTreeMap::new();
@@ -1089,7 +1328,9 @@ impl SqlEngine {
                 execution_time_us: start.elapsed().as_micros() as u64,
                 message: Some(format!(
                     "v3.0 Repairosome — lesions: {} found / {} repaired / {} unrecoverable",
-                    health["lesions"]["found"], health["lesions"]["repaired"], health["lesions"]["unrecoverable"]
+                    health["lesions"]["found"],
+                    health["lesions"]["repaired"],
+                    health["lesions"]["unrecoverable"]
                 )),
             });
         }
@@ -1104,26 +1345,53 @@ impl SqlEngine {
         }
         let (columns, rows, plan, message) = match stmt {
             Stmt::Select {
-                projection, from, joins, where_clause, group_by, having, order_by, limit, offset,
+                projection,
+                from,
+                joins,
+                where_clause,
+                group_by,
+                having,
+                order_by,
+                limit,
+                offset,
             } => self.exec_select(
-                &projection, &from, &joins, where_clause, &group_by, having, &order_by,
-                limit, offset,
+                &projection,
+                &from,
+                &joins,
+                where_clause,
+                &group_by,
+                having,
+                &order_by,
+                limit,
+                offset,
             )?,
             Stmt::Insert { table, rows } => self.exec_insert(&table, rows)?,
-            Stmt::Update { table, assignments, where_clause } => {
-                self.exec_update(&table, &assignments, where_clause)?
-            }
-            Stmt::Delete { table, where_clause } => self.exec_delete(&table, where_clause)?,
-            Stmt::CreateTable { table, if_not_exists } => {
-                self.exec_create_table(table, if_not_exists)?
-            }
+            Stmt::Update {
+                table,
+                assignments,
+                where_clause,
+            } => self.exec_update(&table, &assignments, where_clause)?,
+            Stmt::Delete {
+                table,
+                where_clause,
+            } => self.exec_delete(&table, where_clause)?,
+            Stmt::CreateTable {
+                table,
+                if_not_exists,
+            } => self.exec_create_table(table, if_not_exists)?,
             Stmt::DropTable { table, if_exists } => self.exec_drop_table(&table, if_exists)?,
-            Stmt::CreateIndex { name, table, column, unique, if_not_exists } => {
-                self.exec_create_index(&name, &table, &column, unique, if_not_exists)?
-            }
-            Stmt::DropIndex { name, if_exists, table } => {
-                self.exec_drop_index(&name, if_exists, table.as_deref())?
-            }
+            Stmt::CreateIndex {
+                name,
+                table,
+                column,
+                unique,
+                if_not_exists,
+            } => self.exec_create_index(&name, &table, &column, unique, if_not_exists)?,
+            Stmt::DropIndex {
+                name,
+                if_exists,
+                table,
+            } => self.exec_drop_index(&name, if_exists, table.as_deref())?,
             Stmt::Explain(inner) => self.exec_explain(*inner)?,
         };
         Ok(QueryResult {
@@ -1143,14 +1411,37 @@ impl SqlEngine {
     fn exec_explain(
         &self,
         inner: Stmt,
-    ) -> Result<(Vec<String>, Vec<BTreeMap<String, Value>>, String, Option<String>), String> {
+    ) -> Result<
+        (
+            Vec<String>,
+            Vec<BTreeMap<String, Value>>,
+            String,
+            Option<String>,
+        ),
+        String,
+    > {
         match inner {
             Stmt::Select {
-                projection, from, joins, where_clause, group_by, having, order_by, limit, offset,
+                projection,
+                from,
+                joins,
+                where_clause,
+                group_by,
+                having,
+                order_by,
+                limit,
+                offset,
             } => {
                 let (_, rows, plan, _) = self.exec_select(
-                    &projection, &from, &joins, where_clause, &group_by, having, &order_by,
-                    limit, offset,
+                    &projection,
+                    &from,
+                    &joins,
+                    where_clause,
+                    &group_by,
+                    having,
+                    &order_by,
+                    limit,
+                    offset,
                 )?;
                 let n = rows.len();
                 Ok((
@@ -1183,7 +1474,11 @@ impl SqlEngine {
             Stmt::Insert { table, rows } => {
                 format!("Insert({}, {} row(s))", table, rows.len())
             }
-            Stmt::Update { table, assignments, where_clause } => {
+            Stmt::Update {
+                table,
+                assignments,
+                where_clause,
+            } => {
                 let set = assignments
                     .iter()
                     .map(|(k, v)| format!("{} = {}", k, v))
@@ -1195,7 +1490,10 @@ impl SqlEngine {
                     .unwrap_or_default();
                 format!("Update({} SET {}{})", table, set, w)
             }
-            Stmt::Delete { table, where_clause } => format!(
+            Stmt::Delete {
+                table,
+                where_clause,
+            } => format!(
                 "Delete({}{})",
                 table,
                 where_clause
@@ -1203,17 +1501,30 @@ impl SqlEngine {
                     .map(|e| format!(" WHERE {}", e.describe()))
                     .unwrap_or_default()
             ),
-            Stmt::CreateTable { table, if_not_exists } => format!(
+            Stmt::CreateTable {
+                table,
+                if_not_exists,
+            } => format!(
                 "CreateTable({}{})",
                 table.name,
-                if *if_not_exists { " [if-not-exists]" } else { "" }
+                if *if_not_exists {
+                    " [if-not-exists]"
+                } else {
+                    ""
+                }
             ),
             Stmt::DropTable { table, if_exists } => format!(
                 "DropTable({}{})",
                 table,
                 if *if_exists { " [if-exists]" } else { "" }
             ),
-            Stmt::CreateIndex { name, table, column, unique, .. } => format!(
+            Stmt::CreateIndex {
+                name,
+                table,
+                column,
+                unique,
+                ..
+            } => format!(
                 "CreateIndex({} ON {}({}){})",
                 name,
                 table,
@@ -1268,7 +1579,11 @@ impl SqlEngine {
         if row_key.ends_with(":schema") || row_key.starts_with("__idx:") {
             return Ok(None);
         }
-        match self.engine.get(row_key.as_bytes()).map_err(|e| e.to_string())? {
+        match self
+            .engine
+            .get(row_key.as_bytes())
+            .map_err(|e| e.to_string())?
+        {
             Some(payload) => {
                 let fields = RowCodec::decode(&payload)
                     .map_err(|e| format!("row {} unreadable: {}", row_key, e))?;
@@ -1299,7 +1614,11 @@ impl SqlEngine {
                 fn find(e: &Expr, pk_col: &str) -> Option<Value> {
                     match e {
                         Expr::And(a, b) => find(a, pk_col).or_else(|| find(b, pk_col)),
-                        Expr::Cmp { op: CmpOp::Eq, left, right } => {
+                        Expr::Cmp {
+                            op: CmpOp::Eq,
+                            left,
+                            right,
+                        } => {
                             let lit = match (left.as_ref(), right.as_ref()) {
                                 (Expr::Column(c), Expr::Literal(v)) if c == pk_col => Some(v),
                                 (Expr::Literal(v), Expr::Column(c)) if c == pk_col => Some(v),
@@ -1342,7 +1661,15 @@ impl SqlEngine {
         &self,
         table: ChromosomeTable,
         if_not_exists: bool,
-    ) -> Result<(Vec<String>, Vec<BTreeMap<String, Value>>, String, Option<String>), String> {
+    ) -> Result<
+        (
+            Vec<String>,
+            Vec<BTreeMap<String, Value>>,
+            String,
+            Option<String>,
+        ),
+        String,
+    > {
         {
             let schemas = self.schemas.read();
             if schemas.contains_key(&table.name) {
@@ -1367,12 +1694,19 @@ impl SqlEngine {
                 .write()
                 .register_column(&table.name, &fk.column);
         }
-        self.schemas.write().insert(table.name.clone(), table.clone());
+        self.schemas
+            .write()
+            .insert(table.name.clone(), table.clone());
 
         Ok((
             vec!["status".into()],
             vec![mk_row(&[("status", Value::Text("CREATED".into()))])],
-            format!("CreateTable({}) cols={} fks={}", table.name, table.columns.len(), table.foreign_keys.len()),
+            format!(
+                "CreateTable({}) cols={} fks={}",
+                table.name,
+                table.columns.len(),
+                table.foreign_keys.len()
+            ),
             None,
         ))
     }
@@ -1384,7 +1718,15 @@ impl SqlEngine {
         column: &str,
         unique: bool,
         if_not_exists: bool,
-    ) -> Result<(Vec<String>, Vec<BTreeMap<String, Value>>, String, Option<String>), String> {
+    ) -> Result<
+        (
+            Vec<String>,
+            Vec<BTreeMap<String, Value>>,
+            String,
+            Option<String>,
+        ),
+        String,
+    > {
         let mut table_schema = self
             .get_schema(table)
             .ok_or_else(|| format!("table '{}' does not exist", table))?;
@@ -1394,7 +1736,11 @@ impl SqlEngine {
                 name, column, table
             ));
         }
-        if table_schema.secondary_indexes.iter().any(|i| i.name == name) {
+        if table_schema
+            .secondary_indexes
+            .iter()
+            .any(|i| i.name == name)
+        {
             if if_not_exists {
                 return Ok((
                     vec!["status".into()],
@@ -1447,11 +1793,7 @@ impl SqlEngine {
             let mut key = base.clone();
             key.extend_from_slice(&escape_index_part(&encode_ordered_value(v)));
             key.extend_from_slice(row_key.as_bytes());
-            batch.push((
-                crate::wal::WalOp::Put,
-                key,
-                Some(row_key.into_bytes()),
-            ));
+            batch.push((crate::wal::WalOp::Put, key, Some(row_key.into_bytes())));
             indexed += 1;
         }
         if !batch.is_empty() {
@@ -1470,11 +1812,21 @@ impl SqlEngine {
         Ok((
             vec!["status".into()],
             vec![mk_row(&[("status", Value::Text("CREATED".into()))])],
-            format!("CreateIndex({}{} ON {}.{} rows={})", if unique { "UNIQUE " } else { "" }, name, table, column, indexed),
+            format!(
+                "CreateIndex({}{} ON {}.{} rows={})",
+                if unique { "UNIQUE " } else { "" },
+                name,
+                table,
+                column,
+                indexed
+            ),
             Some(format!(
                 "{}index '{}' created on {}.{} ({} entries)",
                 if unique { "UNIQUE " } else { "" },
-                name, table, column, indexed
+                name,
+                table,
+                column,
+                indexed
             )),
         ))
     }
@@ -1484,7 +1836,15 @@ impl SqlEngine {
         name: &str,
         if_exists: bool,
         table: Option<&str>,
-    ) -> Result<(Vec<String>, Vec<BTreeMap<String, Value>>, String, Option<String>), String> {
+    ) -> Result<
+        (
+            Vec<String>,
+            Vec<BTreeMap<String, Value>>,
+            String,
+            Option<String>,
+        ),
+        String,
+    > {
         // Locate the index: within the `ON <table>` table when qualified,
         // otherwise across all schemas (legacy bare `DROP INDEX name`).
         let target = {
@@ -1514,20 +1874,14 @@ impl SqlEngine {
                 ));
             }
             return Err(match table {
-                Some(want) => format!(
-                    "index '{}' does not exist on table '{}'",
-                    name, want
-                ),
+                Some(want) => format!("index '{}' does not exist on table '{}'", name, want),
                 None => format!("index '{}' does not exist", name),
             });
         };
 
         // Delete every entry of this column's index in one batch.
         let base = index_prefix(&table, &column);
-        let entries = self
-            .engine
-            .scan_prefix(&base)
-            .map_err(|e| e.to_string())?;
+        let entries = self.engine.scan_prefix(&base).map_err(|e| e.to_string())?;
         let batch: Vec<_> = entries
             .into_iter()
             .map(|(k, _)| (crate::wal::WalOp::Delete, k, None))
@@ -1542,16 +1896,20 @@ impl SqlEngine {
         let mut schema = self
             .get_schema(&table)
             .ok_or_else(|| format!("table '{}' vanished", table))?;
-        schema
-            .secondary_indexes
-            .retain(|i| i.name != name);
+        schema.secondary_indexes.retain(|i| i.name != name);
         self.persist_schema(&schema)?;
 
         Ok((
             vec!["status".into()],
             vec![mk_row(&[("status", Value::Text("DROPPED".into()))])],
-            format!("DropIndex({} on {}.{}) entries={}", name, table, column, removed),
-            Some(format!("index '{}' dropped ({} entries removed)", name, removed)),
+            format!(
+                "DropIndex({} on {}.{}) entries={}",
+                name, table, column, removed
+            ),
+            Some(format!(
+                "index '{}' dropped ({} entries removed)",
+                name, removed
+            )),
         ))
     }
 
@@ -1561,7 +1919,9 @@ impl SqlEngine {
         self.engine
             .put(format!("__schema:{}", table.name).as_bytes(), &payload)
             .map_err(|e| e.to_string())?;
-        self.schemas.write().insert(table.name.clone(), table.clone());
+        self.schemas
+            .write()
+            .insert(table.name.clone(), table.clone());
         Ok(())
     }
 
@@ -1579,7 +1939,9 @@ impl SqlEngine {
         old_key: Option<&str>,
     ) -> Result<(), String> {
         for idx in schema.secondary_indexes.iter().filter(|i| i.unique) {
-            let Some(v) = new.get(&idx.column) else { continue };
+            let Some(v) = new.get(&idx.column) else {
+                continue;
+            };
             if v.is_null() {
                 continue; // SQL: multiple NULLs never conflict
             }
@@ -1590,7 +1952,9 @@ impl SqlEngine {
                 .scan_prefix(&prefix)
                 .map_err(|e| e.to_string())?;
             for (_, payload) in entries {
-                let Ok(holder) = String::from_utf8(payload) else { continue };
+                let Ok(holder) = String::from_utf8(payload) else {
+                    continue;
+                };
                 if holder == row_key {
                     continue; // this row's own (unchanged) entry
                 }
@@ -1620,26 +1984,22 @@ impl SqlEngine {
         for idx in &schema.secondary_indexes {
             let col = &idx.column;
             let old_entry = old.and_then(|(table, row)| {
-                row.get(col)
-                    .filter(|v| !v.is_null())
-                    .and_then(|v| {
-                        let row_key = Self::row_key(table, &Self::pk_of(schema, row).ok()?);
-                        let mut key = index_prefix(table, col);
-                        key.extend_from_slice(&escape_index_part(&encode_ordered_value(v)));
-                        key.extend_from_slice(row_key.as_bytes());
-                        Some((key, row_key))
-                    })
+                row.get(col).filter(|v| !v.is_null()).and_then(|v| {
+                    let row_key = Self::row_key(table, &Self::pk_of(schema, row).ok()?);
+                    let mut key = index_prefix(table, col);
+                    key.extend_from_slice(&escape_index_part(&encode_ordered_value(v)));
+                    key.extend_from_slice(row_key.as_bytes());
+                    Some((key, row_key))
+                })
             });
             let new_entry = new.and_then(|(table, row)| {
-                row.get(col)
-                    .filter(|v| !v.is_null())
-                    .and_then(|v| {
-                        let row_key = Self::row_key(table, &Self::pk_of(schema, row).ok()?);
-                        let mut key = index_prefix(table, col);
-                        key.extend_from_slice(&escape_index_part(&encode_ordered_value(v)));
-                        key.extend_from_slice(row_key.as_bytes());
-                        Some((key, row_key))
-                    })
+                row.get(col).filter(|v| !v.is_null()).and_then(|v| {
+                    let row_key = Self::row_key(table, &Self::pk_of(schema, row).ok()?);
+                    let mut key = index_prefix(table, col);
+                    key.extend_from_slice(&escape_index_part(&encode_ordered_value(v)));
+                    key.extend_from_slice(row_key.as_bytes());
+                    Some((key, row_key))
+                })
             });
             match (old_entry, new_entry) {
                 (Some((old_key, _)), Some((new_key, _))) if old_key == new_key => {}
@@ -1664,7 +2024,15 @@ impl SqlEngine {
         &self,
         table: &str,
         if_exists: bool,
-    ) -> Result<(Vec<String>, Vec<BTreeMap<String, Value>>, String, Option<String>), String> {
+    ) -> Result<
+        (
+            Vec<String>,
+            Vec<BTreeMap<String, Value>>,
+            String,
+            Option<String>,
+        ),
+        String,
+    > {
         {
             let schemas = self.schemas.read();
             if !schemas.contains_key(table) {
@@ -1694,30 +2062,19 @@ impl SqlEngine {
                 .map(|key| (crate::wal::WalOp::Delete, key.into_bytes(), None))
                 .collect();
             for row in &rows {
-                batch.extend(Self::index_delta_batch(
-                    &schema,
-                    Some((table, row)),
-                    None,
-                ));
+                batch.extend(Self::index_delta_batch(&schema, Some((table, row)), None));
             }
-            self.engine
-                .write_batch(&batch)
-                .map_err(|e| e.to_string())?;
+            self.engine.write_batch(&batch).map_err(|e| e.to_string())?;
         }
         // Sweep any leftover index entries (e.g. rows added out-of-band).
         let base = index_table_prefix(table);
-        let leftovers = self
-            .engine
-            .scan_prefix(&base)
-            .map_err(|e| e.to_string())?;
+        let leftovers = self.engine.scan_prefix(&base).map_err(|e| e.to_string())?;
         if !leftovers.is_empty() {
             let sweep: Vec<_> = leftovers
                 .into_iter()
                 .map(|(k, _)| (crate::wal::WalOp::Delete, k, None))
                 .collect();
-            self.engine
-                .write_batch(&sweep)
-                .map_err(|e| e.to_string())?;
+            self.engine.write_batch(&sweep).map_err(|e| e.to_string())?;
         }
         self.engine
             .delete(format!("__schema:{}", table).as_bytes())
@@ -1735,7 +2092,15 @@ impl SqlEngine {
         &self,
         table: &str,
         rows: Vec<Vec<(String, Value)>>,
-    ) -> Result<(Vec<String>, Vec<BTreeMap<String, Value>>, String, Option<String>), String> {
+    ) -> Result<
+        (
+            Vec<String>,
+            Vec<BTreeMap<String, Value>>,
+            String,
+            Option<String>,
+        ),
+        String,
+    > {
         let schema = self
             .get_schema(table)
             .ok_or_else(|| format!("table '{}' not registered (CREATE TABLE first)", table))?;
@@ -1788,7 +2153,9 @@ impl SqlEngine {
             // of this same statement (via stmt_unique) and against rows that
             // already exist in the engine (via index scan).
             for idx in schema.secondary_indexes.iter().filter(|i| i.unique) {
-                let Some(v) = map.get(&idx.column) else { continue };
+                let Some(v) = map.get(&idx.column) else {
+                    continue;
+                };
                 if v.is_null() {
                     continue;
                 }
@@ -1816,16 +2183,18 @@ impl SqlEngine {
                 stmt_unique.insert((idx.column.clone(), enc), key.clone());
             }
             let payload = RowCodec::encode(
-                &map.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>(),
+                &map.iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect::<Vec<_>>(),
             );
             // Secondary-index entries ride the same WAL batch (atomic with
             // the row: a crash can never leave a dangling index entry).
-            batch.extend(Self::index_delta_batch(
-                &schema,
-                None,
-                Some((table, &map)),
+            batch.extend(Self::index_delta_batch(&schema, None, Some((table, &map))));
+            batch.push((
+                crate::wal::WalOp::Put,
+                key.clone().into_bytes(),
+                Some(payload),
             ));
-            batch.push((crate::wal::WalOp::Put, key.clone().into_bytes(), Some(payload)));
             inserted_keys.push((key, map, pk));
         }
 
@@ -1867,7 +2236,15 @@ impl SqlEngine {
         table: &str,
         assignments: &[(String, Value)],
         where_clause: Option<Expr>,
-    ) -> Result<(Vec<String>, Vec<BTreeMap<String, Value>>, String, Option<String>), String> {
+    ) -> Result<
+        (
+            Vec<String>,
+            Vec<BTreeMap<String, Value>>,
+            String,
+            Option<String>,
+        ),
+        String,
+    > {
         let schema = self
             .get_schema(table)
             .ok_or_else(|| format!("table '{}' not registered", table))?;
@@ -1920,7 +2297,10 @@ impl SqlEngine {
         let mut new_keys = std::collections::HashSet::new();
         for (old_key, _, new_key, new_row) in &changes {
             if !new_keys.insert(new_key.clone()) {
-                return Err(format!("UPDATE would create duplicate primary key: {}", new_key));
+                return Err(format!(
+                    "UPDATE would create duplicate primary key: {}",
+                    new_key
+                ));
             }
             if !affected_old_keys.contains(new_key)
                 && self
@@ -1929,17 +2309,14 @@ impl SqlEngine {
                     .map_err(|error| error.to_string())?
                     .is_some()
             {
-                return Err(format!("UPDATE conflicts with existing primary key: {}", new_key));
+                return Err(format!(
+                    "UPDATE conflicts with existing primary key: {}",
+                    new_key
+                ));
             }
 
             // UNIQUE secondary-index constraints (target row excluded).
-            self.check_unique_violations(
-                table,
-                &schema,
-                new_key,
-                new_row,
-                Some(old_key.as_str()),
-            )?;
+            self.check_unique_violations(table, &schema, new_key, new_row, Some(old_key.as_str()))?;
 
             for fk in &schema.foreign_keys {
                 if let Some(value) = new_row.get(&fk.column) {
@@ -2029,7 +2406,10 @@ impl SqlEngine {
             Some(lits) => format!(
                 "PointGet({} IN ({}))",
                 table,
-                lits.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ")
+                lits.iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
             None => format!("SeqScan({})", table),
         };
@@ -2049,7 +2429,15 @@ impl SqlEngine {
         &self,
         table: &str,
         where_clause: Option<Expr>,
-    ) -> Result<(Vec<String>, Vec<BTreeMap<String, Value>>, String, Option<String>), String> {
+    ) -> Result<
+        (
+            Vec<String>,
+            Vec<BTreeMap<String, Value>>,
+            String,
+            Option<String>,
+        ),
+        String,
+    > {
         let schema = self
             .get_schema(table)
             .ok_or_else(|| format!("table '{}' not registered", table))?;
@@ -2139,7 +2527,10 @@ impl SqlEngine {
             Some(lits) => format!(
                 "PointGet({} IN ({}))",
                 table,
-                lits.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ")
+                lits.iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
             None => format!("SeqScan({})", table),
         };
@@ -2183,8 +2574,15 @@ impl SqlEngine {
                 ("deleted", Value::Int(deleted as i64)),
                 ("cascaded", Value::Int(cascaded as i64)),
             ])],
-            format!("{} -> Delete{} ", scan_op,
-                if referencing.is_empty() { String::new() } else { " + FK cascade scan".to_string() }),
+            format!(
+                "{} -> Delete{} ",
+                scan_op,
+                if referencing.is_empty() {
+                    String::new()
+                } else {
+                    " + FK cascade scan".to_string()
+                }
+            ),
             Some(format!("{} deleted, {} cascaded", deleted, cascaded)),
         ))
     }
@@ -2200,7 +2598,15 @@ impl SqlEngine {
         order_by: &[(String, bool)],
         limit: Option<usize>,
         offset: usize,
-    ) -> Result<(Vec<String>, Vec<BTreeMap<String, Value>>, String, Option<String>), String> {
+    ) -> Result<
+        (
+            Vec<String>,
+            Vec<BTreeMap<String, Value>>,
+            String,
+            Option<String>,
+        ),
+        String,
+    > {
         // Materialise IN-subqueries before any planning.
         let where_clause = self.materialize_subqueries(where_clause)?;
         // FROM — candidates via point lookup / secondary index / seq scan.
@@ -2216,8 +2622,15 @@ impl SqlEngine {
             };
             plan.push_str(&format!(
                 " -> {}HashJoin({}.{}, {}.{})",
-                if j.join_type == JoinType::Left { "Left" } else { "Inner" },
-                from, j.left_col, j.table, j.right_col
+                if j.join_type == JoinType::Left {
+                    "Left"
+                } else {
+                    "Inner"
+                },
+                from,
+                j.left_col,
+                j.table,
+                j.right_col
             ));
             current = next;
         }
@@ -2233,16 +2646,18 @@ impl SqlEngine {
         let has_agg = !group_by.is_empty() || !agg_items.is_empty() || having.is_some();
         if has_agg {
             current = self.aggregate_rows(
-                current, group_by, &agg_items, having.as_ref(), from,
+                current,
+                group_by,
+                &agg_items,
+                having.as_ref(),
+                from,
                 &mut plan,
             )?;
         }
 
         // A computed projection item may be referenced from ORDER BY by its
         // output alias — materialise such items into the rows before sorting.
-        if !projection.is_empty()
-            && !projection.iter().any(|p| matches!(p, SelectItem::Star))
-        {
+        if !projection.is_empty() && !projection.iter().any(|p| matches!(p, SelectItem::Star)) {
             for item in projection {
                 if let SelectItem::Computed { expr, rendered } = item {
                     if order_by.iter().any(|(k, _)| k == rendered) {
@@ -2284,8 +2699,8 @@ impl SqlEngine {
         // Projection (plain queries only; grouped rows already carry exactly
         // the group columns + aggregate results).
         if !has_agg {
-            let star = projection.is_empty()
-                || projection.iter().any(|p| matches!(p, SelectItem::Star));
+            let star =
+                projection.is_empty() || projection.iter().any(|p| matches!(p, SelectItem::Star));
             if !star {
                 let mut columns: Vec<(String, String)> = Vec::new();
                 let mut computed: Vec<(String, Expr)> = Vec::new();
@@ -2319,10 +2734,7 @@ impl SqlEngine {
                     }
                     for c in refs {
                         if !schema.columns.contains_key(&c) {
-                            return Err(format!(
-                                "SQL: unknown column '{}' in projection",
-                                c
-                            ));
+                            return Err(format!("SQL: unknown column '{}' in projection", c));
                         }
                     }
                 }
@@ -2350,8 +2762,8 @@ impl SqlEngine {
         // aggregates (aliases). HAVING-only aggregates are internal and get
         // trimmed here, after ORDER BY has had its chance to reference them.
         if has_agg {
-            let star = projection.is_empty()
-                || projection.iter().any(|p| matches!(p, SelectItem::Star));
+            let star =
+                projection.is_empty() || projection.iter().any(|p| matches!(p, SelectItem::Star));
             if !star {
                 let mut keep: Vec<String> = group_by.to_vec();
                 for item in projection {
@@ -2419,7 +2831,9 @@ impl SqlEngine {
     ) -> Result<(Vec<BTreeMap<String, Value>>, String), String> {
         let schema = self.get_schema(from);
         if let Some(schema) = &schema {
-            if let Some(lits) = where_clause.and_then(|e| Self::pk_eq_literals(e, &schema.primary_locus_column)) {
+            if let Some(lits) =
+                where_clause.and_then(|e| Self::pk_eq_literals(e, &schema.primary_locus_column))
+            {
                 let mut out = Vec::with_capacity(lits.len());
                 for lit in &lits {
                     if let Some(row) = self.read_row_point(from, lit)? {
@@ -2432,7 +2846,10 @@ impl SqlEngine {
                     format!(
                         "PointGet({} IN ({}))",
                         from,
-                        lits.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ")
+                        lits.iter()
+                            .map(|v| v.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     )
                 };
                 return Ok((out, plan));
@@ -2541,7 +2958,10 @@ impl SqlEngine {
                         .iter()
                         .filter_map(|r| r.get(&col).cloned())
                         .collect();
-                    Ok(Expr::InList { column: column.clone(), values })
+                    Ok(Expr::InList {
+                        column: column.clone(),
+                        values,
+                    })
                 }
                 Expr::InList { .. } | Expr::Literal(_) | Expr::Column(_) => Ok(e.clone()),
                 Expr::Not(inner) => Ok(Expr::Not(Box::new(walk(sql, inner)?))),
@@ -2590,7 +3010,10 @@ impl SqlEngine {
         plan.push_str(&format!(
             " -> Aggregate(group_by={:?}, aggs={:?})",
             group_by,
-            agg_items.iter().map(|(n, _, _, _)| n.clone()).collect::<Vec<_>>()
+            agg_items
+                .iter()
+                .map(|(n, _, _, _)| n.clone())
+                .collect::<Vec<_>>()
         ));
 
         // Group accumulator state.
@@ -2674,15 +3097,18 @@ impl SqlEngine {
 
         // No GROUP BY over an empty set still yields one row (COUNT = 0).
         if groups.is_empty() && group_by.is_empty() {
-            groups.insert(Vec::new(), GroupState {
-                sample: BTreeMap::new(),
-                counts: vec![0; n_agg],
-                non_null: vec![0; n_agg],
-                sums: vec![0.0; n_agg],
-                saw_float: vec![false; n_agg],
-                mins: vec![None; n_agg],
-                maxs: vec![None; n_agg],
-            });
+            groups.insert(
+                Vec::new(),
+                GroupState {
+                    sample: BTreeMap::new(),
+                    counts: vec![0; n_agg],
+                    non_null: vec![0; n_agg],
+                    sums: vec![0.0; n_agg],
+                    saw_float: vec![false; n_agg],
+                    mins: vec![None; n_agg],
+                    maxs: vec![None; n_agg],
+                },
+            );
         }
 
         let mut out = Vec::with_capacity(groups.len());
@@ -2757,7 +3183,11 @@ impl std::fmt::Display for IndexAccess {
             IndexAccess::Eq(values) => write!(
                 f,
                 "IN ({})",
-                values.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ")
+                values
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
             IndexAccess::Range { lo, hi } => {
                 let mut parts = Vec::new();
@@ -2839,7 +3269,11 @@ fn index_access_for(
     // Pass 1: equality / IN-list on an indexed column.
     for c in &conjuncts {
         match c {
-            Expr::Cmp { op: CmpOp::Eq, left, right } => {
+            Expr::Cmp {
+                op: CmpOp::Eq,
+                left,
+                right,
+            } => {
                 if let (Some(col), Some(v)) = (as_column(left), as_literal(right)) {
                     if schema.secondary_index_on(&col).is_some() && !v.is_null() {
                         return Some((col, IndexAccess::Eq(vec![v])));
@@ -2866,7 +3300,9 @@ fn index_access_for(
     // Pass 2: range bounds on an indexed column (tightest wins per side).
     let mut best: Option<(String, Option<(Value, bool)>, Option<(Value, bool)>)> = None;
     for c in &conjuncts {
-        let Expr::Cmp { op, left, right } = c else { continue };
+        let Expr::Cmp { op, left, right } = c else {
+            continue;
+        };
         let (col, value, col_on_left) = match (as_column(left), as_literal(right)) {
             (Some(col), Some(v)) => (col, v, true),
             _ => match (as_literal(left), as_column(right)) {
@@ -2912,7 +3348,8 @@ fn index_access_for(
                 Some((cur, cur_incl)) => {
                     bound.0.compare(cur) == std::cmp::Ordering::Greater
                         || (bound.0.compare(cur) == std::cmp::Ordering::Equal
-                            && !bound.1 && *cur_incl)
+                            && !bound.1
+                            && *cur_incl)
                 }
             };
             if replace {
@@ -2924,7 +3361,8 @@ fn index_access_for(
                 Some((cur, cur_incl)) => {
                     bound.0.compare(cur) == std::cmp::Ordering::Less
                         || (bound.0.compare(cur) == std::cmp::Ordering::Equal
-                            && !bound.1 && *cur_incl)
+                            && !bound.1
+                            && *cur_incl)
                 }
             };
             if replace {
@@ -2963,7 +3401,13 @@ fn collect_agg_items(
         }
     };
     for item in projection {
-        if let SelectItem::Agg { func, arg, rendered, canonical } = item {
+        if let SelectItem::Agg {
+            func,
+            arg,
+            rendered,
+            canonical,
+        } = item
+        {
             push(canonical.clone(), rendered.clone(), *func, arg.clone());
         }
     }
@@ -2996,7 +3440,10 @@ fn parse_rendered_agg(name: &str) -> Option<(AggFunc, Option<String>)> {
 }
 
 fn mk_row(fields: &[(&str, Value)]) -> BTreeMap<String, Value> {
-    fields.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+    fields
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.clone()))
+        .collect()
 }
 
 /// Literal typing rule shared by INSERT values and WHERE operands:
@@ -3004,7 +3451,8 @@ fn mk_row(fields: &[(&str, Value)]) -> BTreeMap<String, Value> {
 /// else stays `Value::Text`.
 fn typed_string_literal(s: &str) -> Value {
     if !s.is_empty()
-        && s.chars().all(|c| matches!(c, 'A' | 'C' | 'G' | 'T' | 'a' | 'c' | 'g' | 't'))
+        && s.chars()
+            .all(|c| matches!(c, 'A' | 'C' | 'G' | 'T' | 'a' | 'c' | 'g' | 't'))
     {
         Value::Dna(s.to_uppercase())
     } else {
@@ -3033,10 +3481,20 @@ fn expr_to_sql(e: &Expr) -> String {
         Expr::IsNull(inner) => format!("{} IS NULL", expr_to_sql(inner)),
         Expr::IsNotNull(inner) => format!("{} IS NOT NULL", expr_to_sql(inner)),
         Expr::Arith { op, left, right } => {
-            format!("{} {} {}", expr_to_sql(left), op.as_str(), expr_to_sql(right))
+            format!(
+                "{} {} {}",
+                expr_to_sql(left),
+                op.as_str(),
+                expr_to_sql(right)
+            )
         }
         Expr::Cmp { op, left, right } => {
-            format!("{} {} {}", expr_to_sql(left), op.as_str(), expr_to_sql(right))
+            format!(
+                "{} {} {}",
+                expr_to_sql(left),
+                op.as_str(),
+                expr_to_sql(right)
+            )
         }
         Expr::InList { column, values } => format!(
             "{} IN ({})",
@@ -3057,14 +3515,24 @@ fn expr_to_sql(e: &Expr) -> String {
 /// Render a parsed SELECT back to SQL text (for IN-subquery materialisation).
 fn render_select_sql(stmt: &Stmt) -> String {
     let Stmt::Select {
-        projection, from, joins, where_clause, group_by, having, order_by, limit, offset,
+        projection,
+        from,
+        joins,
+        where_clause,
+        group_by,
+        having,
+        order_by,
+        limit,
+        offset,
     } = stmt
     else {
         return "<non-select>".into();
     };
-    let proj = if projection.is_empty() || projection.iter().any(|p| matches!(p, SelectItem::Star)) {
+    let proj = if projection.is_empty() || projection.iter().any(|p| matches!(p, SelectItem::Star))
+    {
         "*".to_string()
-    } else {            projection
+    } else {
+        projection
             .iter()
             .map(|item| match item {
                 SelectItem::Star => "*".to_string(),
@@ -3108,7 +3576,11 @@ fn render_select_sql(stmt: &Stmt) -> String {
         out.push_str(&format!(" HAVING {}", expr_to_sql(h)));
     }
     for (key, asc) in order_by {
-        out.push_str(&format!(" ORDER BY {} {}", key, if *asc { "ASC" } else { "DESC" }));
+        out.push_str(&format!(
+            " ORDER BY {} {}",
+            key,
+            if *asc { "ASC" } else { "DESC" }
+        ));
     }
     if let Some(n) = limit {
         out.push_str(&format!(" LIMIT {}", n));
@@ -3207,7 +3679,10 @@ mod tests {
         let d = std::env::temp_dir().join(format!(
             "dna_sql_{}_{}",
             name,
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
         ));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
@@ -3220,7 +3695,7 @@ mod tests {
             memtable_capacity: 4 * 1024 * 1024,
             sync_mode: SyncMode::Strict,
             mirror_disk_path: None,
-        ..Default::default()
+            ..Default::default()
         })
         .unwrap();
         let sql = SqlEngine::new(engine.clone());
@@ -3232,13 +3707,24 @@ mod tests {
     #[test]
     fn create_insert_select() {
         let (_e, sql) = setup();
-        sql.execute("INSERT INTO chr_users (user_id = 12, username = 'dr_watson', balance = 1500.50)").unwrap();
-        sql.execute("INSERT INTO chr_users (user_id = 14, username = 'prof_crick', balance = 890.00)").unwrap();
+        sql.execute(
+            "INSERT INTO chr_users (user_id = 12, username = 'dr_watson', balance = 1500.50)",
+        )
+        .unwrap();
+        sql.execute(
+            "INSERT INTO chr_users (user_id = 14, username = 'prof_crick', balance = 890.00)",
+        )
+        .unwrap();
         sql.execute("INSERT INTO chr_orders (order_id = 1042, user_id = 12, total_usd = 350.00, status = 'PENDING')").unwrap();
 
-        let res = sql.execute("SELECT user_id, username FROM chr_users WHERE user_id = 12").unwrap();
+        let res = sql
+            .execute("SELECT user_id, username FROM chr_users WHERE user_id = 12")
+            .unwrap();
         assert_eq!(res.rows.len(), 1);
-        assert_eq!(res.rows[0].get("username"), Some(&Value::Text("dr_watson".into())));
+        assert_eq!(
+            res.rows[0].get("username"),
+            Some(&Value::Text("dr_watson".into()))
+        );
         assert!(res.execution_plan.contains("Filter"));
     }
 
@@ -3285,8 +3771,7 @@ mod tests {
             .unwrap();
         assert_eq!(res.rows.len(), 2);
         assert!(
-            res.execution_plan.contains("PointGet")
-                && res.execution_plan.contains("IN (3, 7)"),
+            res.execution_plan.contains("PointGet") && res.execution_plan.contains("IN (3, 7)"),
             "plan: {}",
             res.execution_plan
         );
@@ -3323,10 +3808,8 @@ mod tests {
     #[test]
     fn point_get_with_text_pk_and_joins() {
         let (_e, sql) = setup();
-        sql.execute(
-            "CREATE TABLE chr_genes (gene_id TEXT, name TEXT, PRIMARY KEY (gene_id))",
-        )
-        .unwrap();
+        sql.execute("CREATE TABLE chr_genes (gene_id TEXT, name TEXT, PRIMARY KEY (gene_id))")
+            .unwrap();
         sql.execute("INSERT INTO chr_genes (gene_id = 'BRCA1', name = 'repair')")
             .unwrap();
         sql.execute("INSERT INTO chr_genes (gene_id = 'TP53', name = 'apoptosis')")
@@ -3345,10 +3828,14 @@ mod tests {
         // pk point get as the left side of a JOIN stays correct
         sql.execute("INSERT INTO chr_users (user_id = 12, username = 'a', balance = 1.0)")
             .unwrap();
-        sql.execute("INSERT INTO chr_orders (order_id = 1, user_id = 12, total_usd = 5.0, status = 'OK')")
-            .unwrap();
-        sql.execute("INSERT INTO chr_orders (order_id = 2, user_id = 12, total_usd = 7.0, status = 'OK')")
-            .unwrap();
+        sql.execute(
+            "INSERT INTO chr_orders (order_id = 1, user_id = 12, total_usd = 5.0, status = 'OK')",
+        )
+        .unwrap();
+        sql.execute(
+            "INSERT INTO chr_orders (order_id = 2, user_id = 12, total_usd = 7.0, status = 'OK')",
+        )
+        .unwrap();
         let res = sql
             .execute(
                 "SELECT order_id, total_usd FROM chr_orders JOIN chr_users ON user_id = user_id WHERE order_id = 2",
@@ -3357,8 +3844,7 @@ mod tests {
         assert_eq!(res.rows.len(), 1, "rows: {:?}", res.rows);
         assert_eq!(res.rows[0].get("total_usd"), Some(&Value::Float(7.0)));
         assert!(
-            res.execution_plan.contains("PointGet")
-                && res.execution_plan.contains("HashJoin"),
+            res.execution_plan.contains("PointGet") && res.execution_plan.contains("HashJoin"),
             "plan: {}",
             res.execution_plan
         );
@@ -3380,14 +3866,15 @@ mod tests {
             .unwrap();
         assert_eq!(res.rows[0].get("affected_rows"), Some(&Value::Int(1)));
         assert!(
-            res.execution_plan.contains("PointGet")
-                && !res.execution_plan.contains("SeqScan"),
+            res.execution_plan.contains("PointGet") && !res.execution_plan.contains("SeqScan"),
             "plan: {}",
             res.execution_plan
         );
         let raw = e.get(b"chr_users:25").unwrap().unwrap();
         let fields = RowCodec::decode(&raw).unwrap();
-        assert!(fields.iter().any(|(k, v)| k == "balance" && *v == Value::Float(999.0)));
+        assert!(fields
+            .iter()
+            .any(|(k, v)| k == "balance" && *v == Value::Float(999.0)));
 
         // extra predicate: point get fetches, WHERE still filters
         let res = sql
@@ -3419,11 +3906,15 @@ mod tests {
         // negative int / float literals
         let toks = stokenize("UPDATE t SET a = -1, b = -2.5").unwrap();
         assert!(toks.iter().any(|t| matches!(t, STok::Int(i) if *i == -1)));
-        assert!(toks.iter().any(|t| matches!(t, STok::Float(f) if (*f - -2.5).abs() < f64::EPSILON)));
+        assert!(toks
+            .iter()
+            .any(|t| matches!(t, STok::Float(f) if (*f - -2.5).abs() < f64::EPSILON)));
 
         // doubled single quote inside a string is a literal quote
         let toks = stokenize("UPDATE t SET name = 'O''Brien'").unwrap();
-        assert!(toks.iter().any(|t| matches!(t, STok::Str(s) if s == "O'Brien")));
+        assert!(toks
+            .iter()
+            .any(|t| matches!(t, STok::Str(s) if s == "O'Brien")));
     }
 
     #[test]
@@ -3433,23 +3924,32 @@ mod tests {
             .unwrap();
 
         let res = sql
-            .execute("UPDATE chr_users SET balance = -25.5, username = 'O''Brien' WHERE user_id = 7")
+            .execute(
+                "UPDATE chr_users SET balance = -25.5, username = 'O''Brien' WHERE user_id = 7",
+            )
             .unwrap();
         assert_eq!(res.rows[0].get("affected_rows"), Some(&Value::Int(1)));
 
         let raw = e.get(b"chr_users:7").unwrap().unwrap();
         let fields = RowCodec::decode(&raw).unwrap();
-        assert!(fields.iter().any(|(k, v)| k == "balance" && *v == Value::Float(-25.5)));
-        assert!(fields.iter().any(|(k, v)| k == "username" && *v == Value::Text("O'Brien".into())));
+        assert!(fields
+            .iter()
+            .any(|(k, v)| k == "balance" && *v == Value::Float(-25.5)));
+        assert!(fields
+            .iter()
+            .any(|(k, v)| k == "username" && *v == Value::Text("O'Brien".into())));
     }
 
     #[test]
     fn unique_index_rejects_duplicate_insert() {
         let (_e, sql) = setup();
-        sql.execute("INSERT INTO chr_users (user_id = 1, username = 'alice', balance = 10.0)").unwrap();
-        sql.execute("INSERT INTO chr_users (user_id = 2, username = 'bob', balance = 20.0)").unwrap();
+        sql.execute("INSERT INTO chr_users (user_id = 1, username = 'alice', balance = 10.0)")
+            .unwrap();
+        sql.execute("INSERT INTO chr_users (user_id = 2, username = 'bob', balance = 20.0)")
+            .unwrap();
 
-        sql.execute("CREATE UNIQUE INDEX uq_users_username ON chr_users (username)").unwrap();
+        sql.execute("CREATE UNIQUE INDEX uq_users_username ON chr_users (username)")
+            .unwrap();
 
         // duplicate value rejected
         let err = sql
@@ -3457,11 +3957,14 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("UNIQUE constraint failed"), "err: {err}");
         // nothing was written
-        let res = sql.execute("SELECT user_id FROM chr_users WHERE user_id = 3").unwrap();
+        let res = sql
+            .execute("SELECT user_id FROM chr_users WHERE user_id = 3")
+            .unwrap();
         assert!(res.rows.is_empty());
 
         // distinct value accepted
-        sql.execute("INSERT INTO chr_users (user_id = 4, username = 'carol', balance = 40.0)").unwrap();
+        sql.execute("INSERT INTO chr_users (user_id = 4, username = 'carol', balance = 40.0)")
+            .unwrap();
 
         // multi-row INSERT with an in-statement duplicate rejected
         let err = sql
@@ -3476,16 +3979,21 @@ mod tests {
             "INSERT INTO chr_users (user_id, username, balance) VALUES (7, 'eve', 1.0), (8, 'frank', 2.0)",
         )
         .unwrap();
-        let res = sql.execute("SELECT user_id FROM chr_users WHERE username = 'eve'").unwrap();
+        let res = sql
+            .execute("SELECT user_id FROM chr_users WHERE username = 'eve'")
+            .unwrap();
         assert_eq!(res.rows.len(), 1);
     }
 
     #[test]
     fn unique_index_rejects_duplicate_update_and_allows_nulls() {
         let (_e, sql) = setup();
-        sql.execute("INSERT INTO chr_users (user_id = 1, username = 'alice', balance = 10.0)").unwrap();
-        sql.execute("INSERT INTO chr_users (user_id = 2, username = 'bob', balance = 20.0)").unwrap();
-        sql.execute("CREATE UNIQUE INDEX uq_users_username ON chr_users (username)").unwrap();
+        sql.execute("INSERT INTO chr_users (user_id = 1, username = 'alice', balance = 10.0)")
+            .unwrap();
+        sql.execute("INSERT INTO chr_users (user_id = 2, username = 'bob', balance = 20.0)")
+            .unwrap();
+        sql.execute("CREATE UNIQUE INDEX uq_users_username ON chr_users (username)")
+            .unwrap();
 
         // updating one row onto another's unique value is rejected
         let err = sql
@@ -3494,16 +4002,23 @@ mod tests {
         assert!(err.contains("UNIQUE constraint failed"), "err: {err}");
 
         // moving to a free value works
-        sql.execute("UPDATE chr_users SET username = 'robert' WHERE user_id = 2").unwrap();
+        sql.execute("UPDATE chr_users SET username = 'robert' WHERE user_id = 2")
+            .unwrap();
 
         // NULL is not a value: multiple NULL usernames never conflict
-        sql.execute("CREATE TABLE chr_notes (id INT, owner TEXT, note TEXT, PRIMARY KEY (id))").unwrap();
-        sql.execute("INSERT INTO chr_notes (id = 1, owner = NULL, note = 'a')").unwrap();
-        sql.execute("INSERT INTO chr_notes (id = 2, owner = NULL, note = 'b')").unwrap();
-        sql.execute("CREATE UNIQUE INDEX uq_notes_owner ON chr_notes (owner)").unwrap();
-        sql.execute("INSERT INTO chr_notes (id = 3, owner = NULL, note = 'c')").unwrap();
+        sql.execute("CREATE TABLE chr_notes (id INT, owner TEXT, note TEXT, PRIMARY KEY (id))")
+            .unwrap();
+        sql.execute("INSERT INTO chr_notes (id = 1, owner = NULL, note = 'a')")
+            .unwrap();
+        sql.execute("INSERT INTO chr_notes (id = 2, owner = NULL, note = 'b')")
+            .unwrap();
+        sql.execute("CREATE UNIQUE INDEX uq_notes_owner ON chr_notes (owner)")
+            .unwrap();
+        sql.execute("INSERT INTO chr_notes (id = 3, owner = NULL, note = 'c')")
+            .unwrap();
         // but a real duplicate still fails
-        sql.execute("INSERT INTO chr_notes (id = 4, owner = 'zed', note = 'd')").unwrap();
+        sql.execute("INSERT INTO chr_notes (id = 4, owner = 'zed', note = 'd')")
+            .unwrap();
         let err = sql
             .execute("INSERT INTO chr_notes (id = 5, owner = 'zed', note = 'e')")
             .unwrap_err();
@@ -3513,8 +4028,10 @@ mod tests {
     #[test]
     fn unique_index_creation_fails_on_existing_duplicates() {
         let (_e, sql) = setup();
-        sql.execute("INSERT INTO chr_users (user_id = 1, username = 'dup', balance = 1.0)").unwrap();
-        sql.execute("INSERT INTO chr_users (user_id = 2, username = 'dup', balance = 2.0)").unwrap();
+        sql.execute("INSERT INTO chr_users (user_id = 1, username = 'dup', balance = 1.0)")
+            .unwrap();
+        sql.execute("INSERT INTO chr_users (user_id = 2, username = 'dup', balance = 2.0)")
+            .unwrap();
 
         let err = sql
             .execute("CREATE UNIQUE INDEX uq_users_username ON chr_users (username)")
@@ -3525,7 +4042,8 @@ mod tests {
         assert!(schema.secondary_index_on("username").is_none());
 
         // plain CREATE INDEX on the same data still succeeds
-        sql.execute("CREATE INDEX idx_users_username ON chr_users (username)").unwrap();
+        sql.execute("CREATE INDEX idx_users_username ON chr_users (username)")
+            .unwrap();
         let schema = sql.get_schema("chr_users").unwrap();
         let idx = schema.secondary_index_on("username").unwrap();
         assert!(!idx.unique);
@@ -3534,8 +4052,14 @@ mod tests {
     #[test]
     fn hash_join_select() {
         let (_e, sql) = setup();
-        sql.execute("INSERT INTO chr_users (user_id = 12, username = 'dr_watson', balance = 1500.50)").unwrap();
-        sql.execute("INSERT INTO chr_users (user_id = 14, username = 'prof_crick', balance = 890.00)").unwrap();
+        sql.execute(
+            "INSERT INTO chr_users (user_id = 12, username = 'dr_watson', balance = 1500.50)",
+        )
+        .unwrap();
+        sql.execute(
+            "INSERT INTO chr_users (user_id = 14, username = 'prof_crick', balance = 890.00)",
+        )
+        .unwrap();
         sql.execute("INSERT INTO chr_orders (order_id = 1042, user_id = 12, total_usd = 350.00, status = 'OK')").unwrap();
         sql.execute("INSERT INTO chr_orders (order_id = 1089, user_id = 14, total_usd = 740.00, status = 'OK')").unwrap();
 
@@ -3558,18 +4082,30 @@ mod tests {
     #[test]
     fn update_and_delete_with_cascade() {
         let (e, sql) = setup();
-        sql.execute("INSERT INTO chr_users (user_id = 12, username = 'dr_watson', balance = 100.0)").unwrap();
-        sql.execute("INSERT INTO chr_orders (order_id = 1, user_id = 12, total_usd = 50.0, status = 'X')").unwrap();
+        sql.execute(
+            "INSERT INTO chr_users (user_id = 12, username = 'dr_watson', balance = 100.0)",
+        )
+        .unwrap();
+        sql.execute(
+            "INSERT INTO chr_orders (order_id = 1, user_id = 12, total_usd = 50.0, status = 'X')",
+        )
+        .unwrap();
 
-        let res = sql.execute("UPDATE chr_users SET balance = 200.00 WHERE user_id = 12").unwrap();
+        let res = sql
+            .execute("UPDATE chr_users SET balance = 200.00 WHERE user_id = 12")
+            .unwrap();
         assert_eq!(res.rows[0].get("affected_rows"), Some(&Value::Int(1)));
 
         let raw = e.get(b"chr_users:12").unwrap().unwrap();
         let fields = RowCodec::decode(&raw).unwrap();
-        assert!(fields.iter().any(|(k, v)| k == "balance" && *v == Value::Float(200.0)));
+        assert!(fields
+            .iter()
+            .any(|(k, v)| k == "balance" && *v == Value::Float(200.0)));
 
         // DELETE with cascade removes user + orders
-        let res = sql.execute("DELETE FROM chr_users WHERE user_id = 12").unwrap();
+        let res = sql
+            .execute("DELETE FROM chr_users WHERE user_id = 12")
+            .unwrap();
         assert_eq!(res.rows[0].get("deleted"), Some(&Value::Int(1)));
         assert_eq!(res.rows[0].get("cascaded"), Some(&Value::Int(1)));
         assert!(e.get(b"chr_users:12").unwrap().is_none());
@@ -3614,27 +4150,36 @@ mod tests {
             .unwrap();
         sql.execute("INSERT INTO chr_users (user_id = 14, username = 'b', balance = 2.0)")
             .unwrap();
-        sql.execute("INSERT INTO chr_orders (order_id = 5, user_id = 12, total_usd = 9.0, status = 'S')")
-            .unwrap();
+        sql.execute(
+            "INSERT INTO chr_orders (order_id = 5, user_id = 12, total_usd = 9.0, status = 'S')",
+        )
+        .unwrap();
         sql.execute("UPDATE chr_orders SET user_id = 14 WHERE order_id = 5")
             .unwrap();
 
         {
             let mut index = sql.complement_index.write();
-            assert!(index.lookup_all("chr_orders", "user_id", &Value::Int(12)).is_empty());
+            assert!(index
+                .lookup_all("chr_orders", "user_id", &Value::Int(12))
+                .is_empty());
             assert_eq!(
                 index.lookup_all("chr_orders", "user_id", &Value::Int(14)),
                 vec!["chr_orders:5".to_string()]
             );
         }
-        sql.execute("DELETE FROM chr_orders WHERE order_id = 5").unwrap();
+        sql.execute("DELETE FROM chr_orders WHERE order_id = 5")
+            .unwrap();
         {
             let mut index = sql.complement_index.write();
-            assert!(index.lookup_all("chr_orders", "user_id", &Value::Int(14)).is_empty());
+            assert!(index
+                .lookup_all("chr_orders", "user_id", &Value::Int(14))
+                .is_empty());
         }
 
-        sql.execute("INSERT INTO chr_orders (order_id = 6, user_id = 12, total_usd = 3.0, status = 'S')")
-            .unwrap();
+        sql.execute(
+            "INSERT INTO chr_orders (order_id = 6, user_id = 12, total_usd = 3.0, status = 'S')",
+        )
+        .unwrap();
         let reloaded = SqlEngine::new(engine);
         let mut index = reloaded.complement_index.write();
         assert_eq!(
@@ -3652,12 +4197,15 @@ mod tests {
                 memtable_capacity: 1024 * 1024,
                 sync_mode: SyncMode::Strict,
                 mirror_disk_path: None,
-            ..Default::default()
+                ..Default::default()
             })
             .unwrap();
             let sql = SqlEngine::new(engine.clone());
             sql.execute("CREATE TABLE chr_users (user_id INT, username TEXT, balance FLOAT, PRIMARY KEY (user_id))").unwrap();
-            sql.execute("INSERT INTO chr_users (user_id = 7, username = 'rosalind_f', balance = 999.99)").unwrap();
+            sql.execute(
+                "INSERT INTO chr_users (user_id = 7, username = 'rosalind_f', balance = 999.99)",
+            )
+            .unwrap();
         }
         // Reopen: schema + rows must reload
         let engine = Engine::open(EngineConfig {
@@ -3665,38 +4213,61 @@ mod tests {
             memtable_capacity: 1024 * 1024,
             sync_mode: SyncMode::Strict,
             mirror_disk_path: None,
-        ..Default::default()
+            ..Default::default()
         })
         .unwrap();
         let sql = SqlEngine::new(engine);
         assert_eq!(sql.list_tables(), vec!["chr_users".to_string()]);
-        let res = sql.execute("SELECT username, balance FROM chr_users WHERE user_id = 7").unwrap();
+        let res = sql
+            .execute("SELECT username, balance FROM chr_users WHERE user_id = 7")
+            .unwrap();
         assert_eq!(res.rows.len(), 1);
-        assert_eq!(res.rows[0].get("username"), Some(&Value::Text("rosalind_f".into())));
+        assert_eq!(
+            res.rows[0].get("username"),
+            Some(&Value::Text("rosalind_f".into()))
+        );
     }
 
     #[test]
     fn left_join_keeps_unmatched() {
         let (_e, sql) = setup();
-        sql.execute("INSERT INTO chr_users (user_id = 12, username = 'dr_watson', balance = 100.0)").unwrap();
-        sql.execute("INSERT INTO chr_users (user_id = 14, username = 'prof_crick', balance = 200.0)").unwrap();
-        sql.execute("INSERT INTO chr_orders (order_id = 1, user_id = 12, total_usd = 10.0, status = 'A')").unwrap();
+        sql.execute(
+            "INSERT INTO chr_users (user_id = 12, username = 'dr_watson', balance = 100.0)",
+        )
+        .unwrap();
+        sql.execute(
+            "INSERT INTO chr_users (user_id = 14, username = 'prof_crick', balance = 200.0)",
+        )
+        .unwrap();
+        sql.execute(
+            "INSERT INTO chr_orders (order_id = 1, user_id = 12, total_usd = 10.0, status = 'A')",
+        )
+        .unwrap();
 
         let res = sql.execute(
             "SELECT username, order_id FROM chr_users LEFT JOIN chr_orders ON user_id = user_id"
         ).unwrap();
         assert_eq!(res.rows.len(), 2); // both users present
-        let crick = res.rows.iter().find(|r| r.get("username") == Some(&Value::Text("prof_crick".into()))).unwrap();
+        let crick = res
+            .rows
+            .iter()
+            .find(|r| r.get("username") == Some(&Value::Text("prof_crick".into())))
+            .unwrap();
         assert_eq!(crick.get("order_id"), Some(&Value::Null));
     }
 
     #[test]
     fn limit_and_multi_insert() {
         let (_e, sql) = setup();
-        sql.execute("INSERT INTO chr_users (user_id = 12, username = 'a', balance = 1.0)").unwrap();
-        sql.execute("INSERT INTO chr_users (user_id = 13, username = 'b', balance = 2.0)").unwrap();
-        sql.execute("INSERT INTO chr_users (user_id = 14, username = 'c', balance = 3.0)").unwrap();
-        let res = sql.execute("SELECT username FROM chr_users LIMIT 2").unwrap();
+        sql.execute("INSERT INTO chr_users (user_id = 12, username = 'a', balance = 1.0)")
+            .unwrap();
+        sql.execute("INSERT INTO chr_users (user_id = 13, username = 'b', balance = 2.0)")
+            .unwrap();
+        sql.execute("INSERT INTO chr_users (user_id = 14, username = 'c', balance = 3.0)")
+            .unwrap();
+        let res = sql
+            .execute("SELECT username FROM chr_users LIMIT 2")
+            .unwrap();
         assert_eq!(res.rows.len(), 2);
         assert!(res.execution_plan.contains("Limit(2)"));
     }
@@ -3715,10 +4286,16 @@ mod tests {
     #[test]
     fn complement_index_maintained() {
         let (_e, sql) = setup();
-        sql.execute("INSERT INTO chr_users (user_id = 12, username = 'a', balance = 1.0)").unwrap();
-        sql.execute("INSERT INTO chr_orders (order_id = 5, user_id = 12, total_usd = 9.0, status = 'S')").unwrap();
+        sql.execute("INSERT INTO chr_users (user_id = 12, username = 'a', balance = 1.0)")
+            .unwrap();
+        sql.execute(
+            "INSERT INTO chr_orders (order_id = 5, user_id = 12, total_usd = 9.0, status = 'S')",
+        )
+        .unwrap();
         // O(1) navigation via index
-        let key = sql.complement_index.write()
+        let key = sql
+            .complement_index
+            .write()
             .lookup("chr_orders", "user_id", &Value::Int(12))
             .map(|s| s.to_string());
         assert_eq!(key, Some("chr_orders:5".to_string()));
@@ -3736,7 +4313,8 @@ mod tests {
             ))
             .unwrap();
         }
-        sql.execute("CREATE INDEX idx_users_name ON chr_users (username)").unwrap();
+        sql.execute("CREATE INDEX idx_users_name ON chr_users (username)")
+            .unwrap();
 
         // Equality on an indexed column -> IndexScan, not SeqScan.
         let res = sql
@@ -3749,7 +4327,11 @@ mod tests {
             "plan: {}",
             res.execution_plan
         );
-        assert!(!res.execution_plan.contains("SeqScan"), "plan: {}", res.execution_plan);
+        assert!(
+            !res.execution_plan.contains("SeqScan"),
+            "plan: {}",
+            res.execution_plan
+        );
 
         // The index catalog persists inside the schema row.
         let schema = sql.get_schema("chr_users").unwrap();
@@ -3766,14 +4348,18 @@ mod tests {
             ))
             .unwrap();
         }
-        sql.execute("CREATE INDEX idx_bal ON chr_users (balance)").unwrap();
+        sql.execute("CREATE INDEX idx_bal ON chr_users (balance)")
+            .unwrap();
 
         let res = sql
             .execute("SELECT user_id FROM chr_users WHERE balance >= 10 AND balance < 20")
             .unwrap();
         assert_eq!(res.rows.len(), 10, "rows: {:?}", res.rows);
         for r in &res.rows {
-            let uid = match r.get("user_id") { Some(Value::Int(i)) => *i, _ => -1 };
+            let uid = match r.get("user_id") {
+                Some(Value::Int(i)) => *i,
+                _ => -1,
+            };
             assert!((10..20).contains(&uid), "uid {uid} out of range");
         }
         assert!(
@@ -3798,7 +4384,8 @@ mod tests {
     #[test]
     fn index_maintained_on_update_and_delete() {
         let (engine, sql) = setup();
-        sql.execute("CREATE INDEX idx_name ON chr_users (username)").unwrap();
+        sql.execute("CREATE INDEX idx_name ON chr_users (username)")
+            .unwrap();
         sql.execute("INSERT INTO chr_users (user_id = 1, username = 'alpha', balance = 1.0)")
             .unwrap();
         sql.execute("INSERT INTO chr_users (user_id = 2, username = 'beta', balance = 2.0)")
@@ -3817,21 +4404,27 @@ mod tests {
         assert_eq!(res.rows.len(), 1);
 
         // DELETE removes entries.
-        sql.execute("DELETE FROM chr_users WHERE user_id = 2").unwrap();
+        sql.execute("DELETE FROM chr_users WHERE user_id = 2")
+            .unwrap();
         let res = sql
             .execute("SELECT user_id FROM chr_users WHERE username = 'beta'")
             .unwrap();
         assert!(res.rows.is_empty());
         // The physical index key for 'gamma' must exist (payload = row key).
-        let entries = engine
-            .scan_prefix(b"__idx:chr_users:username:")
-            .unwrap();
+        let entries = engine.scan_prefix(b"__idx:chr_users:username:").unwrap();
         assert_eq!(entries.len(), 1, "entries: {:?}", entries.len());
-        assert_eq!(String::from_utf8(entries[0].1.clone()).unwrap(), "chr_users:1");
+        assert_eq!(
+            String::from_utf8(entries[0].1.clone()).unwrap(),
+            "chr_users:1"
+        );
 
         // DROP INDEX removes the catalog entry and all entries.
         sql.execute("DROP INDEX idx_name").unwrap();
-        assert!(sql.get_schema("chr_users").unwrap().secondary_indexes.is_empty());
+        assert!(sql
+            .get_schema("chr_users")
+            .unwrap()
+            .secondary_indexes
+            .is_empty());
         let res = sql
             .execute("SELECT user_id FROM chr_users WHERE username = 'gamma'")
             .unwrap();
@@ -3852,9 +4445,11 @@ mod tests {
             })
             .unwrap();
             let sql = SqlEngine::new(engine.clone());
-            sql.execute("CREATE TABLE chr_t (id INT, tag TEXT, PRIMARY KEY (id))").unwrap();
+            sql.execute("CREATE TABLE chr_t (id INT, tag TEXT, PRIMARY KEY (id))")
+                .unwrap();
             sql.execute("CREATE INDEX idx_tag ON chr_t (tag)").unwrap();
-            sql.execute("INSERT INTO chr_t (id = 1, tag = 'x')").unwrap();
+            sql.execute("INSERT INTO chr_t (id = 1, tag = 'x')")
+                .unwrap();
         }
         let engine = Engine::open(EngineConfig {
             dir_path: dir,
@@ -3866,10 +4461,18 @@ mod tests {
         .unwrap();
         let sql = SqlEngine::new(engine);
         // Schema (and index catalog) reloaded from disk.
-        assert!(sql.get_schema("chr_t").unwrap().secondary_index_on("tag").is_some());
+        assert!(sql
+            .get_schema("chr_t")
+            .unwrap()
+            .secondary_index_on("tag")
+            .is_some());
         let res = sql.execute("SELECT id FROM chr_t WHERE tag = 'x'").unwrap();
         assert_eq!(res.rows.len(), 1);
-        assert!(res.execution_plan.contains("IndexScan"), "plan: {}", res.execution_plan);
+        assert!(
+            res.execution_plan.contains("IndexScan"),
+            "plan: {}",
+            res.execution_plan
+        );
     }
 
     #[test]
@@ -3949,7 +4552,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(res.rows.len(), 1);
-        assert!(res.execution_plan.contains("IN (3)"), "plan: {}", res.execution_plan);
+        assert!(
+            res.execution_plan.contains("IN (3)"),
+            "plan: {}",
+            res.execution_plan
+        );
 
         // NULL semantics: NULL column never matches an IN list.
         let res = sql
@@ -3990,7 +4597,11 @@ mod tests {
         assert_eq!(r.get("a"), Some(&Value::Float(30.5)));
         assert_eq!(r.get("lo"), Some(&Value::Float(10.5)));
         assert_eq!(r.get("hi"), Some(&Value::Float(50.5)));
-        assert!(res.execution_plan.contains("Aggregate"), "plan: {}", res.execution_plan);
+        assert!(
+            res.execution_plan.contains("Aggregate"),
+            "plan: {}",
+            res.execution_plan
+        );
 
         // COUNT over an empty filtered set is 0, not an error.
         let res = sql
@@ -4032,9 +4643,7 @@ mod tests {
 
         // HAVING filters groups by aggregate value.
         let res = sql
-            .execute(
-                "SELECT status, COUNT(*) FROM chr_orders GROUP BY status HAVING COUNT(*) > 2",
-            )
+            .execute("SELECT status, COUNT(*) FROM chr_orders GROUP BY status HAVING COUNT(*) > 2")
             .unwrap();
         assert_eq!(res.rows.len(), 1);
         assert_eq!(res.rows[0].get("status"), Some(&Value::Text("FAIL".into())));
@@ -4049,17 +4658,13 @@ mod tests {
         assert_eq!(res.rows.len(), 2);
         // HAVING on SUM
         let res = sql
-            .execute(
-                "SELECT status FROM chr_orders GROUP BY status HAVING SUM(total_usd) > 100",
-            )
+            .execute("SELECT status FROM chr_orders GROUP BY status HAVING SUM(total_usd) > 100")
             .unwrap();
         assert_eq!(res.rows.len(), 1);
         assert_eq!(res.rows[0].get("status"), Some(&Value::Text("FAIL".into())));
         // SUM of whole-int columns stays Int (typed arithmetic, no float drift).
         let res = sql
-            .execute(
-                "SELECT SUM(order_id) AS total_ids FROM chr_orders",
-            )
+            .execute("SELECT SUM(order_id) AS total_ids FROM chr_orders")
             .unwrap();
         assert_eq!(res.rows[0].get("total_ids"), Some(&Value::Int(15)));
     }
@@ -4067,15 +4672,21 @@ mod tests {
     #[test]
     fn null_values_stay_out_of_the_index() {
         let (_e, sql) = setup();
-        sql.execute("CREATE TABLE chr_n (id INT, tag TEXT, PRIMARY KEY (id))").unwrap();
-        sql.execute("CREATE INDEX idx_n_tag ON chr_n (tag)").unwrap();
-        sql.execute("INSERT INTO chr_n (id = 1, tag = NULL)").unwrap();
-        sql.execute("INSERT INTO chr_n (id = 2, tag = 't')").unwrap();
+        sql.execute("CREATE TABLE chr_n (id INT, tag TEXT, PRIMARY KEY (id))")
+            .unwrap();
+        sql.execute("CREATE INDEX idx_n_tag ON chr_n (tag)")
+            .unwrap();
+        sql.execute("INSERT INTO chr_n (id = 1, tag = NULL)")
+            .unwrap();
+        sql.execute("INSERT INTO chr_n (id = 2, tag = 't')")
+            .unwrap();
 
         let res = sql.execute("SELECT id FROM chr_n WHERE tag = 't'").unwrap();
         assert_eq!(res.rows.len(), 1);
         // NULL tag row: IS NULL still found (index only accelerates, never changes results).
-        let res = sql.execute("SELECT id FROM chr_n WHERE tag IS NULL").unwrap();
+        let res = sql
+            .execute("SELECT id FROM chr_n WHERE tag IS NULL")
+            .unwrap();
         assert_eq!(res.rows.len(), 1);
     }
 }

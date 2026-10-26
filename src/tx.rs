@@ -21,12 +21,12 @@
 //! - "2PC" in the marketing sense is gone: this is a single-node atomic
 //!   commit protocol. True 2PC across nodes = ROADMAP.
 
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use crate::engine::Engine;
 use crate::relational::Value;
 use crate::wal::WalOp;
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxIsolationLevel {
@@ -50,7 +50,10 @@ pub enum TxStatus {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Mutation {
     /// Replace the whole row payload at this key.
-    PutRow { key: Vec<u8>, fields: BTreeMap<String, Value> },
+    PutRow {
+        key: Vec<u8>,
+        fields: BTreeMap<String, Value>,
+    },
     /// Delete the key (cascade handled at the relational layer).
     Delete { key: Vec<u8> },
 }
@@ -84,10 +87,7 @@ impl TransactionSession {
                 _ => {}
             }
         }
-        let raw = self
-            .engine
-            .get(kb)
-            .map_err(|e| format!("storage: {}", e))?;
+        let raw = self.engine.get(kb).map_err(|e| format!("storage: {}", e))?;
         self.baseline
             .entry(kb.to_vec())
             .or_insert_with(|| raw.clone());
@@ -182,8 +182,8 @@ impl TransactionCoordinator {
 
         // Serializable: hold the commit lock across validate + write so no
         // rival commit can slip between the baseline check and our batch.
-        let _serial_guard = (session.isolation == TxIsolationLevel::Serializable)
-            .then(|| self.commit_lock.lock());
+        let _serial_guard =
+            (session.isolation == TxIsolationLevel::Serializable).then(|| self.commit_lock.lock());
         if session.isolation == TxIsolationLevel::Serializable {
             for (key, base) in &session.baseline {
                 let cur = self
@@ -208,7 +208,10 @@ impl TransactionCoordinator {
             match m {
                 Mutation::PutRow { key, fields } => {
                     let payload = crate::relational::RowCodec::encode(
-                        &fields.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>(),
+                        &fields
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect::<Vec<_>>(),
                     );
                     ops.push((WalOp::Put, key.clone(), Some(payload)));
                 }

@@ -119,15 +119,27 @@ impl RepairHook for ValidationRepair {
 /// Logical (stripe, shard-index) → physical slot inside a region.
 #[inline]
 pub fn phys_slot(stripe: usize, idx: usize, stripes: usize, seed: u64) -> usize {
-    let rot = if stripes == 0 { 0 } else { (seed as usize) % stripes };
-    let s_rot = if stripes == 0 { 0 } else { (stripe + rot) % stripes };
+    let rot = if stripes == 0 {
+        0
+    } else {
+        (seed as usize) % stripes
+    };
+    let s_rot = if stripes == 0 {
+        0
+    } else {
+        (stripe + rot) % stripes
+    };
     idx * stripes + s_rot
 }
 
 /// Physical slot → (stripe, shard-index). Inverse of [`phys_slot`].
 #[inline]
 pub fn slot_to_stripe(slot: usize, stripes: usize, seed: u64) -> (usize, usize) {
-    let rot = if stripes == 0 { 0 } else { (seed as usize) % stripes };
+    let rot = if stripes == 0 {
+        0
+    } else {
+        (seed as usize) % stripes
+    };
     let idx = slot / stripes.max(1);
     let s_rot = slot % stripes.max(1);
     let stripe = (s_rot + stripes - rot) % stripes.max(1);
@@ -147,17 +159,30 @@ pub fn record_len(klen: usize, vlen: usize) -> usize {
 /// The caller reads the key/value payload separately (records span blocks).
 pub fn parse_header(buf: &[u8]) -> io::Result<(u32, usize, usize, bool)> {
     if buf.len() < 13 {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "record header truncated"));
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "record header truncated",
+        ));
     }
     let crc = u32::from_le_bytes(buf[0..4].try_into().unwrap());
     let klen = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
     let vlen = u32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize;
     let tomb = buf[12] == 1;
     if buf[12] > 1 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid tombstone tag"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid tombstone tag",
+        ));
     }
-    if klen.checked_add(vlen).filter(|n| *n <= MAX_SEGMENT_RECORD).is_none() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "record size out of range"));
+    if klen
+        .checked_add(vlen)
+        .filter(|n| *n <= MAX_SEGMENT_RECORD)
+        .is_none()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "record size out of range",
+        ));
     }
     Ok((crc, klen, vlen, tomb))
 }
@@ -261,7 +286,11 @@ impl BlockSegmentWriter {
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
             for idx in 0..(k + m) {
                 let slot = phys_slot(s, idx, data_stripes, interleave_seed);
-                data_out[slot] = if idx < k { data_blocks[idx].clone() } else { parity[idx - k].clone() };
+                data_out[slot] = if idx < k {
+                    data_blocks[idx].clone()
+                } else {
+                    parity[idx - k].clone()
+                };
             }
         }
         drop(data);
@@ -284,7 +313,11 @@ impl BlockSegmentWriter {
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
             for idx in 0..(k + m) {
                 let slot = phys_slot(s, idx, index_stripes, interleave_seed);
-                index_out[slot] = if idx < k { data_blocks[idx].clone() } else { parity[idx - k].clone() };
+                index_out[slot] = if idx < k {
+                    data_blocks[idx].clone()
+                } else {
+                    parity[idx - k].clone()
+                };
             }
         }
         drop(index);
@@ -307,9 +340,8 @@ impl BlockSegmentWriter {
         let table_b_crc = table_a_crc; // copies are identical
 
         // ---- superblock ---------------------------------------------------
-        let table_offset = (SUPERBLOCK_SIZE
-            + data_out.len() * BLOCK_SIZE
-            + index_out.len() * BLOCK_SIZE) as u64;
+        let table_offset =
+            (SUPERBLOCK_SIZE + data_out.len() * BLOCK_SIZE + index_out.len() * BLOCK_SIZE) as u64;
         let mut superblock = vec![0u8; SUPERBLOCK_SIZE];
         superblock[0..8].copy_from_slice(BLOCK_MAGIC);
         superblock[8] = erasure_k as u8;
@@ -499,7 +531,10 @@ impl BlockSegmentReader {
         };
         let len = file.metadata()?.len();
         if len < (SUPERBLOCK_SIZE + FOOTER_SIZE) as u64 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "segment too small"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "segment too small",
+            ));
         }
 
         // ---- footer (last 64 B) -------------------------------------------
@@ -525,14 +560,11 @@ impl BlockSegmentReader {
         };
         // New footers carry their own CRC32. Old footers stored the superblock
         // CRC in the same field; accept those when the superblock proves it.
-        let legacy_footer_ok = footer_magic_ok
-            && sb_crc_ok
-            && footer[0..4] == sb[68..72];
+        let legacy_footer_ok = footer_magic_ok && sb_crc_ok && footer[0..4] == sb[68..72];
         // If the superblock itself is unavailable, an old footer cannot be
         // verified; accept its magic for backward compatibility (same as the
         // pre-fix behaviour), while new footers are verified above.
-        let footer_ok =
-            footer_magic_ok && (footer_crc_ok || legacy_footer_ok || !sb_crc_ok);
+        let footer_ok = footer_magic_ok && (footer_crc_ok || legacy_footer_ok || !sb_crc_ok);
         if !sb_magic_ok && !footer_ok {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -541,7 +573,16 @@ impl BlockSegmentReader {
         }
 
         // Geometry source: superblock first, footer as fallback.
-        let (k, m, data_stripes, index_stripes, record_count, data_bytes, index_bytes, table_offset);
+        let (
+            k,
+            m,
+            data_stripes,
+            index_stripes,
+            record_count,
+            data_bytes,
+            index_bytes,
+            table_offset,
+        );
         let (table_a_crc, table_b_crc);
         if sb_crc_ok {
             k = sb[8] as usize;
@@ -566,10 +607,16 @@ impl BlockSegmentReader {
             table_a_crc = u32::from_le_bytes(footer[12..16].try_into().unwrap());
             table_b_crc = u32::from_le_bytes(footer[16..20].try_into().unwrap());
         } else {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "superblock CRC mismatch"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "superblock CRC mismatch",
+            ));
         }
         if k == 0 || m == 0 || k + m > 256 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid erasure geometry"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid erasure geometry",
+            ));
         }
 
         // ---- geometry sanity against file size --------------------------------
@@ -581,7 +628,10 @@ impl BlockSegmentReader {
             || data_bytes > data_stripes * k * BLOCK_SIZE
             || index_bytes > index_stripes * k * BLOCK_SIZE
         {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "segment geometry inconsistent"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "segment geometry inconsistent",
+            ));
         }
 
         // ---- CRC table: two copies, checksum-arbitrated -----------------------
@@ -692,7 +742,9 @@ impl BlockSegmentReader {
                     e
                 );
                 reader.rebuild_index_from_records()?;
-                reader.index_rebuilt.store(true, std::sync::atomic::Ordering::Relaxed);
+                reader
+                    .index_rebuilt
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
             }
         }
         Ok(reader)
@@ -749,9 +801,10 @@ impl BlockSegmentReader {
         let mut buf = vec![0u8; BLOCK_SIZE];
         let pos = self.region_base(index_region) as u64 + slot as u64 * BLOCK_SIZE as u64;
         let crc_index = self.crc_slot(index_region, slot);
-        let expected = *self.crc_table.get(crc_index).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "crc slot out of range")
-        })?;
+        let expected = *self
+            .crc_table
+            .get(crc_index)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "crc slot out of range"))?;
         let mut ok = true;
         {
             let mut f = self.file.write();
@@ -801,14 +854,20 @@ impl BlockSegmentReader {
 
     /// Read one physical block and verify its CRC. On mismatch, run the
     /// lesion/repair pipeline for the owning stripe, then retry.
-    fn read_physical_verified(&self, index_region: bool, slot: usize, buf: &mut [u8]) -> io::Result<()> {
+    fn read_physical_verified(
+        &self,
+        index_region: bool,
+        slot: usize,
+        buf: &mut [u8],
+    ) -> io::Result<()> {
         debug_assert_eq!(buf.len(), BLOCK_SIZE);
         let base = self.region_base(index_region) as u64;
         let pos = base + slot as u64 * BLOCK_SIZE as u64;
         let crc_index = self.crc_slot(index_region, slot);
-        let expected = *self.crc_table.get(crc_index).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "crc slot out of range")
-        })?;
+        let expected = *self
+            .crc_table
+            .get(crc_index)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "crc slot out of range"))?;
 
         {
             let mut f = self.file.write();
@@ -822,7 +881,11 @@ impl BlockSegmentReader {
         }
 
         // ---- lesion detected ----
-        let stripes = if index_region { self.index_stripes } else { self.data_stripes };
+        let stripes = if index_region {
+            self.index_stripes
+        } else {
+            self.data_stripes
+        };
         let (stripe, _) = slot_to_stripe(slot, stripes, self.interleave_seed);
         self.repair_stripe(index_region, stripe)?;
         // Retry the read after repair; content must match the table now.
@@ -849,7 +912,11 @@ impl BlockSegmentReader {
     /// rewrite them in place. Returns the list of repaired shard indexes.
     /// Fails with a localised error when > m shards are gone.
     fn repair_stripe(&self, index_region: bool, stripe: usize) -> io::Result<Vec<usize>> {
-        let stripes = if index_region { self.index_stripes } else { self.data_stripes };
+        let stripes = if index_region {
+            self.index_stripes
+        } else {
+            self.data_stripes
+        };
         let _k = self.k;
         let total = self.k + self.m;
         let base = self.region_base(index_region) as u64;
@@ -886,9 +953,7 @@ impl BlockSegmentReader {
             slots.push(slot);
         }
 
-        let damaged_idx: Vec<usize> = (0..total)
-            .filter(|i| shards[*i].is_none())
-            .collect();
+        let damaged_idx: Vec<usize> = (0..total).filter(|i| shards[*i].is_none()).collect();
         if damaged_idx.is_empty() {
             return Ok(Vec::new()); // transient glitch (e.g. hook fixed it meanwhile)
         }
@@ -942,8 +1007,10 @@ impl BlockSegmentReader {
                         return Err(self.unrecoverable_error(index_region, stripe, &damaged_idx));
                     }
                 }
-                self.repairs_done
-                    .fetch_add(damaged_idx.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                self.repairs_done.fetch_add(
+                    damaged_idx.len() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 hook.on_repaired(&self.path, stripe, &damaged_idx, bytes_repaired);
                 Ok(damaged_idx)
             }
@@ -968,7 +1035,12 @@ impl BlockSegmentReader {
         }
     }
 
-    fn unrecoverable_error(&self, index_region: bool, stripe: usize, shards: &[usize]) -> io::Error {
+    fn unrecoverable_error(
+        &self,
+        index_region: bool,
+        stripe: usize,
+        shards: &[usize],
+    ) -> io::Error {
         let region = if index_region { "index" } else { "data" };
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -986,8 +1058,17 @@ impl BlockSegmentReader {
     // ---------------- logical reads --------------------------------------
 
     /// Read a logical block of a region through the verified path.
-    fn read_logical_block(&self, index_region: bool, logical: usize, buf: &mut [u8]) -> io::Result<()> {
-        let stripes = if index_region { self.index_stripes } else { self.data_stripes };
+    fn read_logical_block(
+        &self,
+        index_region: bool,
+        logical: usize,
+        buf: &mut [u8],
+    ) -> io::Result<()> {
+        let stripes = if index_region {
+            self.index_stripes
+        } else {
+            self.data_stripes
+        };
         let stripe = logical / self.k;
         let idx = logical % self.k;
         let slot = phys_slot(stripe, idx, stripes, self.interleave_seed);
@@ -996,7 +1077,13 @@ impl BlockSegmentReader {
 
     /// Assemble `len` bytes starting at a logical byte offset within a
     /// region, crossing block boundaries with per-block verification.
-    pub fn read_span(&self, index_region: bool, start: usize, len: usize, out: &mut Vec<u8>) -> io::Result<()> {
+    pub fn read_span(
+        &self,
+        index_region: bool,
+        start: usize,
+        len: usize,
+        out: &mut Vec<u8>,
+    ) -> io::Result<()> {
         let total_logical = if index_region {
             self.index_stripes * self.k
         } else {
@@ -1004,7 +1091,10 @@ impl BlockSegmentReader {
         };
         let region_bytes = total_logical * BLOCK_SIZE;
         if start + len > region_bytes {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "span beyond region"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "span beyond region",
+            ));
         }
         out.reserve(len);
         let mut pos = start;
@@ -1031,7 +1121,8 @@ impl BlockSegmentReader {
         let mut raw = Vec::with_capacity(self.index_bytes);
         self.read_span(true, 0, self.index_bytes, &mut raw)?;
         let mut pos = 0usize;
-        let mut entries = Vec::with_capacity(self.record_count.min(MAX_BLOCK_INDEX_ENTRIES as u64) as usize);
+        let mut entries =
+            Vec::with_capacity(self.record_count.min(MAX_BLOCK_INDEX_ENTRIES as u64) as usize);
         let mut prev: Option<Vec<u8>> = None;
         while pos < raw.len() {
             if raw.len() - pos < 4 {
@@ -1040,12 +1131,22 @@ impl BlockSegmentReader {
             let klen = u32::from_le_bytes(raw[pos..pos + 4].try_into().unwrap()) as usize;
             pos += 4;
             if raw.len() - pos < klen + 6 {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "block index truncated"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "block index truncated",
+                ));
             }
             let key = raw[pos..pos + klen].to_vec();
             pos += klen;
-            if prev.as_ref().map(|p| p.as_slice() >= key.as_slice()).unwrap_or(false) {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "block index not sorted"));
+            if prev
+                .as_ref()
+                .map(|p| p.as_slice() >= key.as_slice())
+                .unwrap_or(false)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "block index not sorted",
+                ));
             }
             prev = Some(key.clone());
             let block = u32::from_le_bytes(raw[pos..pos + 4].try_into().unwrap());
@@ -1115,7 +1216,10 @@ impl BlockSegmentReader {
     /// Returns (key, lookup, record_total_len).
     fn read_record_at(&self, pos: usize) -> io::Result<(Vec<u8>, BlockLookup, usize)> {
         if pos >= self.data_bytes {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "record offset beyond data"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "record offset beyond data",
+            ));
         }
         // Header (13 bytes, may span blocks)
         let mut head = Vec::with_capacity(13);
@@ -1138,7 +1242,11 @@ impl BlockSegmentReader {
         let total = 13 + klen + vlen;
         Ok((
             key,
-            if tomb { BlockLookup::Tombstone } else { BlockLookup::Found(val) },
+            if tomb {
+                BlockLookup::Tombstone
+            } else {
+                BlockLookup::Found(val)
+            },
             total,
         ))
     }
@@ -1214,7 +1322,11 @@ impl BlockSegmentReader {
         // Every physical block of both regions.
         let mut buf = vec![0u8; BLOCK_SIZE];
         for region in [false, true] {
-            let stripes = if region { self.index_stripes } else { self.data_stripes };
+            let stripes = if region {
+                self.index_stripes
+            } else {
+                self.data_stripes
+            };
             for slot in 0..stripes * (self.k + self.m) {
                 self.read_physical_verified(region, slot, &mut buf)?;
             }
@@ -1332,7 +1444,11 @@ impl BlockSegmentReader {
         let mut affected = 0usize;
         let mut unrecoverable = 0usize;
         for region in [false, true] {
-            let stripes = if region { self.index_stripes } else { self.data_stripes };
+            let stripes = if region {
+                self.index_stripes
+            } else {
+                self.data_stripes
+            };
             for stripe in 0..stripes {
                 let mut bad = 0usize;
                 for idx in 0..(self.k + self.m) {
@@ -1404,7 +1520,11 @@ mod tests {
             let (s, _) = slot_to_stripe(p, stripes, seed);
             stripe_hits[s] += 1;
         }
-        assert!(stripe_hits.iter().all(|&h| h <= 1), "hits: {:?}", stripe_hits);
+        assert!(
+            stripe_hits.iter().all(|&h| h <= 1),
+            "hits: {:?}",
+            stripe_hits
+        );
         // And parity slots are interleaved: shard idx k..k+m are parity, and
         // they live in the same physical neighbourhood as data shards.
         let _ = (k, m);
@@ -1419,7 +1539,11 @@ mod tests {
                 for idx in 0..6 {
                     let p = phys_slot(s, idx, stripes, seed);
                     assert!(p < total);
-                    assert!(!seen[p], "duplicate slot p={} (stripes={} seed={})", p, stripes, seed);
+                    assert!(
+                        !seen[p],
+                        "duplicate slot p={} (stripes={} seed={})",
+                        p, stripes, seed
+                    );
                     seen[p] = true;
                 }
             }
@@ -1438,14 +1562,17 @@ mod tests {
         entries.push((b"chr1:big".to_vec(), EntryValue::Value(vec![7u8; 100_000]))); // spans blocks+stripes
         entries.push((b"chr1:zzz".to_vec(), EntryValue::Tombstone));
         entries.sort_by(|a, b| a.0.cmp(&b.0));
-        let path = BlockSegmentWriter::write_segment(&dir, 1, &entries, 4, 2, seed_for_id(&dir, 1)).unwrap();
+        let path = BlockSegmentWriter::write_segment(&dir, 1, &entries, 4, 2, seed_for_id(&dir, 1))
+            .unwrap();
 
         let r = BlockSegmentReader::open(&path).unwrap();
         assert_eq!(r.record_count(), entries.len() as u64);
         for (key, value) in &entries {
             let got = r.get(key).unwrap().expect("key must be found");
             match value {
-                EntryValue::Value(v) => assert_eq!(got, BlockLookup::Found(v.clone()), "key {:?}", key),
+                EntryValue::Value(v) => {
+                    assert_eq!(got, BlockLookup::Found(v.clone()), "key {:?}", key)
+                }
                 EntryValue::Tombstone => assert_eq!(got, BlockLookup::Tombstone),
             }
         }
@@ -1494,15 +1621,8 @@ mod tests {
     fn detects_and_repairs_bit_flip() {
         let dir = tempdir("repair");
         let entries = make_entries(2000, 64);
-        let path = BlockSegmentWriter::write_segment(
-            &dir,
-            1,
-            &entries,
-            4,
-            2,
-            seed_for_id(&dir, 1),
-        )
-        .unwrap();
+        let path = BlockSegmentWriter::write_segment(&dir, 1, &entries, 4, 2, seed_for_id(&dir, 1))
+            .unwrap();
 
         // Damage 2 data-region DATA-shard blocks (bit-flip), far apart.
         // (Parity shards are only read during repair/scrub — damaging one
@@ -1563,7 +1683,8 @@ mod tests {
     fn damage_without_hook_is_an_error() {
         let dir = tempdir("nohook");
         let entries = make_entries(500, 64);
-        let path = BlockSegmentWriter::write_segment(&dir, 1, &entries, 4, 2, seed_for_id(&dir, 1)).unwrap();
+        let path = BlockSegmentWriter::write_segment(&dir, 1, &entries, 4, 2, seed_for_id(&dir, 1))
+            .unwrap();
         damage_slots(&path, &[5], DamageMode::BitFlip);
 
         let r = BlockSegmentReader::open(&path).unwrap();
@@ -1585,7 +1706,8 @@ mod tests {
     fn over_damage_reports_localised_unrecoverable() {
         let dir = tempdir("over");
         let entries = make_entries(4000, 64);
-        let path = BlockSegmentWriter::write_segment(&dir, 1, &entries, 4, 2, seed_for_id(&dir, 1)).unwrap();
+        let path = BlockSegmentWriter::write_segment(&dir, 1, &entries, 4, 2, seed_for_id(&dir, 1))
+            .unwrap();
 
         // Damage 3 shards of ONE stripe (m=2 → unrecoverable).
         let (_, stripes, seed) = data_slots(&path);
@@ -1612,7 +1734,8 @@ mod tests {
     fn zero_fill_damage_repaired() {
         let dir = tempdir("zero");
         let entries = make_entries(1500, 64);
-        let path = BlockSegmentWriter::write_segment(&dir, 1, &entries, 4, 2, seed_for_id(&dir, 1)).unwrap();
+        let path = BlockSegmentWriter::write_segment(&dir, 1, &entries, 4, 2, seed_for_id(&dir, 1))
+            .unwrap();
         let (total_slots, _, _) = data_slots(&path);
         // Zero-fill two data blocks (dead-sector simulation), far apart.
         damage_slots(&path, &[9, total_slots - 3], DamageMode::ZeroFill);
@@ -1632,15 +1755,8 @@ mod tests {
     fn index_region_damage_is_repairable_too() {
         let dir = tempdir("idx");
         let entries = make_entries(3000, 64);
-        let path = BlockSegmentWriter::write_segment(
-            &dir,
-            1,
-            &entries,
-            4,
-            2,
-            seed_for_id(&dir, 1),
-        )
-        .unwrap();
+        let path = BlockSegmentWriter::write_segment(&dir, 1, &entries, 4, 2, seed_for_id(&dir, 1))
+            .unwrap();
 
         // Open first (index loaded into memory), install the hook, THEN
         // damage 2 blocks inside the RS-protected index region. Data reads
@@ -1672,15 +1788,8 @@ mod tests {
     fn index_region_overdamage_falls_back_to_rebuild_on_restart() {
         let dir = tempdir("idxover");
         let entries = make_entries(3000, 64);
-        let path = BlockSegmentWriter::write_segment(
-            &dir,
-            1,
-            &entries,
-            4,
-            2,
-            seed_for_id(&dir, 1),
-        )
-        .unwrap();
+        let path = BlockSegmentWriter::write_segment(&dir, 1, &entries, 4, 2, seed_for_id(&dir, 1))
+            .unwrap();
 
         // Damage 3 index-region shards of ONE stripe (beyond parity): the
         // index region is unrecoverable by parity, but the index is derived
@@ -1709,7 +1818,8 @@ mod tests {
     fn crc_table_copy_b_fallback() {
         let dir = tempdir("tableb");
         let entries = make_entries(800, 64);
-        let path = BlockSegmentWriter::write_segment(&dir, 1, &entries, 4, 2, seed_for_id(&dir, 1)).unwrap();
+        let path = BlockSegmentWriter::write_segment(&dir, 1, &entries, 4, 2, seed_for_id(&dir, 1))
+            .unwrap();
         let (_, stripes, seed) = data_slots(&path);
         let _ = (stripes, seed);
 
@@ -1743,7 +1853,8 @@ mod tests {
     fn superblock_loss_survives_via_footer() {
         let dir = tempdir("sbfallback");
         let entries = make_entries(600, 64);
-        let path = BlockSegmentWriter::write_segment(&dir, 1, &entries, 4, 2, seed_for_id(&dir, 1)).unwrap();
+        let path = BlockSegmentWriter::write_segment(&dir, 1, &entries, 4, 2, seed_for_id(&dir, 1))
+            .unwrap();
 
         // Corrupt the superblock payload (keep magic so the wrapper can still
         // identify the format family; geometry must come from the footer).
@@ -1769,6 +1880,4 @@ mod tests {
         std::fs::write(&bad, b"DNASST01something").unwrap();
         assert!(BlockSegmentReader::open(&bad).is_err());
     }
-
-    
 }

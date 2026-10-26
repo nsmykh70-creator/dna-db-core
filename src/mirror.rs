@@ -8,12 +8,12 @@
 //! Hot-swap resync: copies all primary files (WAL + segments + bloom
 //! sidecars and active-set manifest onto the replacement disk and reopens B's WAL.
 
+use crate::segment::SegmentFile;
+use crate::wal::{SyncMode, WalEntry, WalOp, WalParity, WalReader, WalWriter};
+use parking_lot::{Mutex, RwLock};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use parking_lot::{Mutex, RwLock};
-use crate::segment::SegmentFile;
-use crate::wal::{SyncMode, WalEntry, WalOp, WalParity, WalReader, WalWriter};
 
 const MANIFEST_FILE: &str = "segments.manifest";
 const MANIFEST_MAGIC: &[u8; 8] = b"DNAMAN01";
@@ -88,8 +88,7 @@ impl DualStrandMirror {
             secondary_status: RwLock::new(StrandStatus::Healthy),
             secondary_wal: RwLock::new(Some(wal)),
             backup_wal_damaged: AtomicBool::new(
-                (has_backup_data && !backup_wal_existed)
-                    || backup_len_after < backup_len_before,
+                (has_backup_data && !backup_wal_existed) || backup_len_after < backup_len_before,
             ),
             manifest_epoch: AtomicU64::new(0),
             manifest_lock: Mutex::new(()),
@@ -144,23 +143,22 @@ impl DualStrandMirror {
         self.backup_wal_damaged.load(Ordering::Acquire)
     }
 
-    pub fn mirror_write(&self, op: WalOp, key: &[u8], val: Option<&[u8]>) -> Result<(), &'static str> {
+    pub fn mirror_write(
+        &self,
+        op: WalOp,
+        key: &[u8],
+        val: Option<&[u8]>,
+    ) -> Result<(), &'static str> {
         self.mirror_batch(&[(&op, key, val)])
             .map_err(|_| "Strand Beta write failed; writes are blocked until resync")
     }
 
     /// Replicate one ordered WAL frame to Strand B.
-    pub fn mirror_batch(
-        &self,
-        ops: &[(&WalOp, &[u8], Option<&[u8]>)],
-    ) -> io::Result<()> {
+    pub fn mirror_batch(&self, ops: &[(&WalOp, &[u8], Option<&[u8]>)]) -> io::Result<()> {
         self.ensure_writable()?;
         let mut guard = self.secondary_wal.write();
         let Some(wal) = guard.as_mut() else {
-            let error = io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "Strand B WAL is unavailable",
-            );
+            let error = io::Error::new(io::ErrorKind::BrokenPipe, "Strand B WAL is unavailable");
             self.mark_degraded(&error);
             return Err(error);
         };
@@ -255,9 +253,7 @@ impl DualStrandMirror {
                 (false, false) => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!(
-                            "active segment {file_name} is damaged or missing on both strands"
-                        ),
+                        format!("active segment {file_name} is damaged or missing on both strands"),
                     ));
                 }
             }
@@ -312,13 +308,12 @@ impl DualStrandMirror {
         let _wal_guard = self.secondary_wal.read();
         let secondary_dir = self.secondary_dir.read().clone();
         validate_segment(primary_segment)?;
-        let result = copy_segment_pair(primary_segment, &secondary_dir).and_then(|_| {
-            validate_segment(&secondary_dir.join(
-            primary_segment.file_name().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "segment path has no filename")
-            })?,
-            ))
-        });
+        let result =
+            copy_segment_pair(primary_segment, &secondary_dir).and_then(|_| {
+                validate_segment(&secondary_dir.join(primary_segment.file_name().ok_or_else(
+                    || io::Error::new(io::ErrorKind::InvalidInput, "segment path has no filename"),
+                )?))
+            });
         if let Err(error) = result {
             self.mark_degraded(&error);
             return Err(error);
@@ -370,7 +365,10 @@ impl DualStrandMirror {
         let _ = &secondary_dir;
         // Strand B's closed WAL needs the same erasure protection as A's; a
         // missing B parity sidecar made B-only recovery fall back to copying A.
-        if std::fs::metadata(&closed).map(|m| m.len() > 0).unwrap_or(false) {
+        if std::fs::metadata(&closed)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false)
+        {
             if let Err(e) = WalParity::protect(&closed, k, m) {
                 eprintln!(
                     "[MIRROR] Strand B WAL parity protection failed for {:?}: {e}",
@@ -589,10 +587,7 @@ impl DualStrandMirror {
         self.ensure_writable()?;
         let mut guard = self.secondary_wal.write();
         let Some(wal) = guard.as_mut() else {
-            let error = io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "Strand B WAL is unavailable",
-            );
+            let error = io::Error::new(io::ErrorKind::BrokenPipe, "Strand B WAL is unavailable");
             self.mark_degraded(&error);
             return Err(error);
         };
@@ -654,11 +649,21 @@ impl DualStrandMirror {
                     // recovery of a crash that happened before checkpoint.
                     copy_atomic(&source, &new_disk_path.join(&name))?;
                     primary_files.insert(name_str.to_string());
-                } else if source.extension().is_some_and(|extension| extension == "sst") {
+                } else if source
+                    .extension()
+                    .is_some_and(|extension| extension == "sst")
+                {
                     validate_segment(&source)?;
                     copy_segment_pair(&source, new_disk_path)?;
                     primary_files.insert(name_str.to_string());
-                    primary_files.insert(source.with_extension("bloom").file_name().unwrap().to_string_lossy().to_string());
+                    primary_files.insert(
+                        source
+                            .with_extension("bloom")
+                            .file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .to_string(),
+                    );
                 }
             }
 
@@ -913,7 +918,10 @@ fn formats_differ(a: &Path, b: &Path) -> bool {
 
 fn copy_atomic(source: &Path, destination: &Path) -> io::Result<()> {
     let file_name = destination.file_name().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "destination path has no filename")
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "destination path has no filename",
+        )
     })?;
     let temp = destination.with_file_name(format!("{}.tmp", file_name.to_string_lossy()));
     let result = (|| {
@@ -965,7 +973,11 @@ fn sync_bloom(source_segment: &Path, destination_segment: &Path) -> io::Result<(
         copy_atomic(&source, &destination)?;
     } else if !source.exists() && destination.exists() {
         std::fs::remove_file(destination)?;
-        sync_directory(destination_segment.parent().unwrap_or_else(|| Path::new(".")))?;
+        sync_directory(
+            destination_segment
+                .parent()
+                .unwrap_or_else(|| Path::new(".")),
+        )?;
     }
     Ok(())
 }
@@ -981,15 +993,16 @@ fn wal_copy_valid_len(path: &Path) -> Option<u64> {
     if meta.len() == 0 {
         return None;
     }
-    let tmp = path.parent()?.join(format!(
-        "{}.probe.tmp",
-        path.file_name()?.to_string_lossy()
-    ));
+    let tmp = path
+        .parent()?
+        .join(format!("{}.probe.tmp", path.file_name()?.to_string_lossy()));
     if std::fs::copy(path, &tmp).is_err() {
         return None;
     }
     let before = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
-    let recovered = WalReader::recover(&tmp).map(|entries| entries.len()).unwrap_or(0);
+    let recovered = WalReader::recover(&tmp)
+        .map(|entries| entries.len())
+        .unwrap_or(0);
     let after = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
     let _ = std::fs::remove_file(&tmp);
     if recovered > 0 && after == before {
@@ -1074,11 +1087,8 @@ mod tests {
 
         // Seed the PRIMARY with real files (as an engine would have)
         {
-            let mut pw = crate::wal::WalWriter::open(
-                primary.join("active.wal"),
-                SyncMode::Strict,
-            )
-            .unwrap();
+            let mut pw =
+                crate::wal::WalWriter::open(primary.join("active.wal"), SyncMode::Strict).unwrap();
             pw.append(WalOp::Put, b"alpha1", Some(b"value1")).unwrap();
             pw.append(WalOp::Put, b"alpha2", Some(b"value2")).unwrap();
             pw.append(WalOp::Put, b"alpha3", Some(b"value3")).unwrap();

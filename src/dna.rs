@@ -109,7 +109,10 @@ impl PackedDna {
         // Handle partial last byte (padding): re-pack via ASCII path is simplest & safe.
         // For len % 4 == 0 the fast path above is exact.
         if self.len % 4 == 0 {
-            Self { len: self.len, data }
+            Self {
+                len: self.len,
+                data,
+            }
         } else {
             // Fall back to exact reconstruction for partial trailing byte
             let ascii = self.to_ascii();
@@ -226,7 +229,11 @@ impl PackedDna {
         }
         let ascii = self.to_ascii();
         let bytes = ascii.as_bytes();
-        let mask = if k == 32 { u64::MAX } else { (1u64 << (k * 2)) - 1 };
+        let mask = if k == 32 {
+            u64::MAX
+        } else {
+            (1u64 << (k * 2)) - 1
+        };
         let mut results = Vec::with_capacity(self.len - k + 1);
 
         let mut hash = 0u64;
@@ -262,7 +269,15 @@ mod tests {
 
     #[test]
     fn roundtrip() {
-        for seq in ["A", "AC", "ACG", "ACGT", "ACGTACGTACGTACGTA", "TTTT", "AAAA"] {
+        for seq in [
+            "A",
+            "AC",
+            "ACG",
+            "ACGT",
+            "ACGTACGTACGTACGTA",
+            "TTTT",
+            "AAAA",
+        ] {
             let p = PackedDna::from_ascii(seq).unwrap();
             assert_eq!(p.len, seq.len());
             assert_eq!(p.to_ascii(), seq);
@@ -302,7 +317,10 @@ mod tests {
 
         // Double reverse complement = identity
         let s = "TTGACAGTCAGTCATGCAAG";
-        let r = PackedDna::from_ascii(s).unwrap().reverse_complement().reverse_complement();
+        let r = PackedDna::from_ascii(s)
+            .unwrap()
+            .reverse_complement()
+            .reverse_complement();
         assert_eq!(r.to_ascii(), s);
     }
 

@@ -6,8 +6,8 @@
 //! NOT a table scan. The index is maintained by the relational layer on
 //! INSERT/UPDATE/DELETE and rebuilt on open from table contents.
 
-use std::collections::{HashMap, HashSet};
 use crate::relational::{encode_index_value, Value};
+use std::collections::{HashMap, HashSet};
 
 #[derive(Default)]
 pub struct ComplementIndex {
@@ -23,7 +23,9 @@ impl ComplementIndex {
     }
 
     pub fn register_column(&mut self, table: &str, column: &str) {
-        self.index.entry((table.to_string(), column.to_string())).or_default();
+        self.index
+            .entry((table.to_string(), column.to_string()))
+            .or_default();
     }
 
     /// Index one row's FK value -> its locus key.
@@ -134,8 +136,18 @@ mod tests {
     fn text_and_dna_values() {
         let mut idx = ComplementIndex::new();
         idx.register_column("chr_variants", "name");
-        idx.upsert("chr_variants", "name", "chr_variants:7", &Value::Text("BRCA1".into()));
-        idx.upsert("chr_variants", "name", "chr_variants:8", &Value::Dna("ACGT".into()));
+        idx.upsert(
+            "chr_variants",
+            "name",
+            "chr_variants:7",
+            &Value::Text("BRCA1".into()),
+        );
+        idx.upsert(
+            "chr_variants",
+            "name",
+            "chr_variants:8",
+            &Value::Dna("ACGT".into()),
+        );
         assert_eq!(
             idx.lookup("chr_variants", "name", &Value::Text("BRCA1".into())),
             Some("chr_variants:7")

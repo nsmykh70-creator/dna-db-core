@@ -17,10 +17,10 @@
 //! Recovery scans records, verifies CRC32, stops at the first torn/corrupt
 //! record and truncates the file to the last valid offset (auto-repair).
 
+use crc32fast::Hasher;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use crc32fast::Hasher;
 
 pub const OP_PUT: u8 = 1;
 pub const OP_DELETE: u8 = 2;
@@ -342,20 +342,27 @@ impl WalParity {
         let k = raw[8] as usize;
         let m = raw[9] as usize;
         let blocks_u64 = u64::from_le_bytes(raw[12..20].try_into().unwrap());
-        let blocks = usize::try_from(blocks_u64)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "WAL parity block count too large"))?;
+        let blocks = usize::try_from(blocks_u64).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "WAL parity block count too large",
+            )
+        })?;
         let table_crc = u32::from_le_bytes(raw[20..24].try_into().unwrap());
         let parity_crc = u32::from_le_bytes(raw[24..28].try_into().unwrap());
         if k == 0 || m == 0 || blocks == 0 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "bad WAL parity geometry"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bad WAL parity geometry",
+            ));
         }
         let table_end = 4096usize
-            .checked_add(
-                blocks
-                    .checked_mul(4)
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "WAL parity table overflow"))?,
-            )
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "WAL parity table overflow"))?;
+            .checked_add(blocks.checked_mul(4).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "WAL parity table overflow")
+            })?)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "WAL parity table overflow")
+            })?;
         if table_end > raw.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -366,7 +373,10 @@ impl WalParity {
         let mut th = Hasher::new();
         th.update(table_raw);
         if th.finalize() != table_crc {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "WAL parity CRC table damaged"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "WAL parity CRC table damaged",
+            ));
         }
         let crc_table: Vec<u32> = table_raw
             .chunks_exact(4)
@@ -378,12 +388,17 @@ impl WalParity {
         let parity_bytes = stripes
             .checked_mul(m)
             .and_then(|n| n.checked_mul(block))
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "WAL parity size overflow"))?;
-        let parity_end = table_end
-            .checked_add(parity_bytes)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "WAL parity size overflow"))?;
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "WAL parity size overflow")
+            })?;
+        let parity_end = table_end.checked_add(parity_bytes).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "WAL parity size overflow")
+        })?;
         if parity_end > raw.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "WAL parity region truncated"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "WAL parity region truncated",
+            ));
         }
         let parity_region = &raw[table_end..parity_end];
         // New sidecars carry a CRC over the parity region. A damaged parity
@@ -401,9 +416,9 @@ impl WalParity {
 
         let wal = OpenOptions::new().read(true).write(true).open(wal_path)?;
         let wal_len = wal.metadata()?.len() as usize;
-        let protected_len = blocks
-            .checked_mul(block)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "WAL protected size overflow"))?;
+        let protected_len = blocks.checked_mul(block).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "WAL protected size overflow")
+        })?;
 
         let codec = ErasureCodec::new(k, m)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
@@ -413,7 +428,10 @@ impl WalParity {
             let mut buf = vec![0u8; block];
             let file_len = wal.metadata()?.len() as usize;
             if b * block >= file_len {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "block beyond WAL"));
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "block beyond WAL",
+                ));
             }
             // The final block of a healthy WAL is usually partial (the file
             // ends mid-block). `protect` CRCs blocks zero-padded to the full
@@ -469,7 +487,10 @@ impl WalParity {
             // reconstruction that matches the CRC table recorded at protect().
             for &b in &damaged_data {
                 let shard = shards[b - s * k].as_ref().ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "WAL reconstruction missing a shard")
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "WAL reconstruction missing a shard",
+                    )
                 })?;
                 let mut h = Hasher::new();
                 h.update(shard);
@@ -706,7 +727,7 @@ mod tests {
 
         let entries = WalReader::recover(&path).unwrap();
         assert_eq!(entries.len(), 2); // garbage ignored
-        // File truncated to valid length
+                                      // File truncated to valid length
         let len = std::fs::metadata(&path).unwrap().len();
         assert_eq!(len, 2 * (4 + 9 + 5 + 2) as u64);
     }
@@ -717,7 +738,8 @@ mod tests {
         let path = dir.join("active.wal");
         {
             let mut wal = WalWriter::open(&path, SyncMode::Strict).unwrap();
-            wal.append(WalOp::Put, b"key_ok", Some(b"value_ok")).unwrap();
+            wal.append(WalOp::Put, b"key_ok", Some(b"value_ok"))
+                .unwrap();
         }
         // Cut the file in half (torn write in the middle of record 2 that never completed)
         let raw = std::fs::read(&path).unwrap();

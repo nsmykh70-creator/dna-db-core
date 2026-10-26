@@ -27,8 +27,6 @@
 //! Execution reads/writes the REAL Engine storage:
 //!   rows: '<table>:<pk>' -> RowCodec payloads (field 'sequence' = Value::Dna)
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
 use crate::dna::PackedDna;
 use crate::engine::Engine;
 use crate::expr::{self, ArithOp, CmpOp, Expr};
@@ -36,6 +34,8 @@ use crate::relational::{RowCodec, Value};
 use crate::simd_bitap::BitapMatcher;
 use crate::sql_engine::SqlEngine;
 use crate::tx::TransactionCoordinator;
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DistanceMode {
@@ -99,7 +99,10 @@ pub enum PipelineStage {
     Filter(Expr),
     Emit(Vec<String>),
     /// `|> SORT column [ASC|DESC]` — order the rows (was SQL-only before).
-    Sort { column: String, asc: bool },
+    Sort {
+        column: String,
+        asc: bool,
+    },
     /// `|> LIMIT n` — keep the first n rows after the previous stage.
     Limit(usize),
 }
@@ -107,11 +110,25 @@ pub enum PipelineStage {
 #[derive(Debug, Clone)]
 pub enum TxStmt {
     /// chr:locus.field = literal | += literal | -= literal
-    Mutate { table: String, locus: i64, field: String, op: AssignOp, value: Value },
+    Mutate {
+        table: String,
+        locus: i64,
+        field: String,
+        op: AssignOp,
+        value: Value,
+    },
     /// chr:locus += { k: v, ... }
-    Append { table: String, locus: i64, fields: Vec<(String, Value)> },
+    Append {
+        table: String,
+        locus: i64,
+        fields: Vec<(String, Value)>,
+    },
     /// DROP LOCUS chr:locus [CASCADE]
-    DropLocus { table: String, locus: i64, cascade: bool },
+    DropLocus {
+        table: String,
+        locus: i64,
+        cascade: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,31 +161,31 @@ enum Tok {
     Int(i64),
     Float(f64),
     Str(String),
-    Question,   // ?
-    Tilde,      // ~
-    Arrow,      // ->
-    Pipe,       // |>
-    FatArrow,   // =>
-    PlusEq,     // +=
-    MinusEq,    // -=
-    Eq,         // =
-    Ne,         // != or <>
-    Le,         // <=
-    Ge,         // >=
-    Lt,         // <
-    Gt,         // >
-    Colon,      // :
-    Semicolon,  // ;
-    Comma,      // ,
-    Dot,        // .
+    Question,  // ?
+    Tilde,     // ~
+    Arrow,     // ->
+    Pipe,      // |>
+    FatArrow,  // =>
+    PlusEq,    // +=
+    MinusEq,   // -=
+    Eq,        // =
+    Ne,        // != or <>
+    Le,        // <=
+    Ge,        // >=
+    Lt,        // <
+    Gt,        // >
+    Colon,     // :
+    Semicolon, // ;
+    Comma,     // ,
+    Dot,       // .
     LParen,
     RParen,
     LBrace,
     RBrace,
     Star,
-    Plus,      // +
-    Minus,     // -
-    Slash,     // /
+    Plus,  // +
+    Minus, // -
+    Slash, // /
     Eof,
 }
 
@@ -216,23 +233,74 @@ fn tokenize(input: &str) -> Result<Vec<Tok>, String> {
                 toks.push(Tok::Ne);
                 i += 2;
             }
-            '?' => { toks.push(Tok::Question); i += 1; }
-            '~' => { toks.push(Tok::Tilde); i += 1; }
-            '*' => { toks.push(Tok::Star); i += 1; }
-            '+' => { toks.push(Tok::Plus); i += 1; }
-            '-' => { toks.push(Tok::Minus); i += 1; }
-            '/' => { toks.push(Tok::Slash); i += 1; }
-            '=' => { toks.push(Tok::Eq); i += 1; }
-            '<' => { toks.push(Tok::Lt); i += 1; }
-            '>' => { toks.push(Tok::Gt); i += 1; }
-            ':' => { toks.push(Tok::Colon); i += 1; }
-            ';' => { toks.push(Tok::Semicolon); i += 1; }
-            ',' => { toks.push(Tok::Comma); i += 1; }
-            '.' => { toks.push(Tok::Dot); i += 1; }
-            '(' => { toks.push(Tok::LParen); i += 1; }
-            ')' => { toks.push(Tok::RParen); i += 1; }
-            '{' => { toks.push(Tok::LBrace); i += 1; }
-            '}' => { toks.push(Tok::RBrace); i += 1; }
+            '?' => {
+                toks.push(Tok::Question);
+                i += 1;
+            }
+            '~' => {
+                toks.push(Tok::Tilde);
+                i += 1;
+            }
+            '*' => {
+                toks.push(Tok::Star);
+                i += 1;
+            }
+            '+' => {
+                toks.push(Tok::Plus);
+                i += 1;
+            }
+            '-' => {
+                toks.push(Tok::Minus);
+                i += 1;
+            }
+            '/' => {
+                toks.push(Tok::Slash);
+                i += 1;
+            }
+            '=' => {
+                toks.push(Tok::Eq);
+                i += 1;
+            }
+            '<' => {
+                toks.push(Tok::Lt);
+                i += 1;
+            }
+            '>' => {
+                toks.push(Tok::Gt);
+                i += 1;
+            }
+            ':' => {
+                toks.push(Tok::Colon);
+                i += 1;
+            }
+            ';' => {
+                toks.push(Tok::Semicolon);
+                i += 1;
+            }
+            ',' => {
+                toks.push(Tok::Comma);
+                i += 1;
+            }
+            '.' => {
+                toks.push(Tok::Dot);
+                i += 1;
+            }
+            '(' => {
+                toks.push(Tok::LParen);
+                i += 1;
+            }
+            ')' => {
+                toks.push(Tok::RParen);
+                i += 1;
+            }
+            '{' => {
+                toks.push(Tok::LBrace);
+                i += 1;
+            }
+            '}' => {
+                toks.push(Tok::RBrace);
+                i += 1;
+            }
             '\'' | '"' => {
                 let quote = c;
                 let mut s = String::new();
@@ -255,8 +323,9 @@ fn tokenize(input: &str) -> Result<Vec<Tok>, String> {
             '0'..='9' => {
                 let mut num = String::new();
                 let mut is_float = false;
-                while i < b.len() && (b[i].is_ascii_digit() || (b[i] == '.'
-                    && i + 1 < b.len() && b[i + 1].is_ascii_digit()))
+                while i < b.len()
+                    && (b[i].is_ascii_digit()
+                        || (b[i] == '.' && i + 1 < b.len() && b[i + 1].is_ascii_digit()))
                 {
                     if b[i] == '.' {
                         if is_float {
@@ -493,7 +562,11 @@ impl Parser {
         if definitions.is_empty() {
             return Err("DnaQL: CREATE CHROMOSOME needs at least one column".into());
         }
-        Ok(DnaQlAst::CreateChromosome { table, definitions, if_not_exists })
+        Ok(DnaQlAst::CreateChromosome {
+            table,
+            definitions,
+            if_not_exists,
+        })
     }
 
     /// DROP CHROMOSOME <name> [IF EXISTS];
@@ -542,7 +615,10 @@ impl Parser {
                 col = self.ident()?;
                 self.expect(Tok::RParen)?;
             }
-            link = Some(LinkSpec { chromosome: chr2, column: col });
+            link = Some(LinkSpec {
+                chromosome: chr2,
+                column: col,
+            });
         }
 
         let mut projection = Vec::new();
@@ -597,7 +673,10 @@ impl Parser {
             self.expect(Tok::LParen)?;
             let col = self.ident()?;
             self.expect(Tok::RParen)?;
-            link = Some(LinkSpec { chromosome: chr2, column: col });
+            link = Some(LinkSpec {
+                chromosome: chr2,
+                column: col,
+            });
         }
 
         let mut projection = Vec::new();
@@ -644,7 +723,10 @@ impl Parser {
             self.next();
             if self.kw("LINK") {
                 let chr2 = self.ident()?;
-                let mut spec = LinkSpec { chromosome: chr2, column: "user_id".to_string() };
+                let mut spec = LinkSpec {
+                    chromosome: chr2,
+                    column: "user_id".to_string(),
+                };
                 if self.kw("VIA") {
                     self.expect_kw("COMPLEMENT")?;
                     self.expect(Tok::LParen)?;
@@ -737,7 +819,11 @@ impl Parser {
             self.expect(Tok::Colon)?;
             let locus = self.int()?;
             let cascade = self.kw("CASCADE");
-            return Ok(TxStmt::DropLocus { table, locus, cascade });
+            return Ok(TxStmt::DropLocus {
+                table,
+                locus,
+                cascade,
+            });
         }
         let table = self.ident()?;
 
@@ -761,15 +847,17 @@ impl Parser {
             }
             let locus = fields
                 .iter()
-                .find(|(k, v)| {
-                    (k == "id" || k.ends_with("_id")) && matches!(v, Value::Int(_))
-                })
+                .find(|(k, v)| (k == "id" || k.ends_with("_id")) && matches!(v, Value::Int(_)))
                 .and_then(|(_, v)| match v {
                     Value::Int(i) => Some(*i),
                     _ => None,
                 })
                 .ok_or("DnaQL: append without explicit locus needs an integer '<...>_id' field")?;
-            return Ok(TxStmt::Append { table, locus, fields });
+            return Ok(TxStmt::Append {
+                table,
+                locus,
+                fields,
+            });
         }
 
         self.expect(Tok::Colon)?;
@@ -793,8 +881,12 @@ impl Parser {
                     self.next();
                 }
             }
-            return Ok(TxStmt::Append { table, locus, fields });
- }
+            return Ok(TxStmt::Append {
+                table,
+                locus,
+                fields,
+            });
+        }
 
         // field path: .field
         self.expect(Tok::Dot)?;
@@ -806,7 +898,13 @@ impl Parser {
             t => return Err(format!("DnaQL: expected '=', '+=' or '-=', got {:?}", t)),
         };
         let value = self.parse_value()?;
-        Ok(TxStmt::Mutate { table, locus, field, op, value })
+        Ok(TxStmt::Mutate {
+            table,
+            locus,
+            field,
+            op,
+            value,
+        })
     }
 
     fn parse_value(&mut self) -> Result<Value, String> {
@@ -824,7 +922,8 @@ impl Parser {
             Tok::Str(s) => {
                 // DNA sequences: all-ACGT strings become Value::Dna
                 if !s.is_empty()
-                    && s.chars().all(|c| matches!(c, 'A' | 'C' | 'G' | 'T' | 'a' | 'c' | 'g' | 't'))
+                    && s.chars()
+                        .all(|c| matches!(c, 'A' | 'C' | 'G' | 'T' | 'a' | 'c' | 'g' | 't'))
                 {
                     Ok(Value::Dna(s.to_uppercase()))
                 } else {
@@ -860,7 +959,11 @@ impl Parser {
         if matches!(self.peek(), Tok::Semicolon) {
             self.next();
         }
-        Ok(DnaQlAst::BioAnalysis { sequence, locus, functions })
+        Ok(DnaQlAst::BioAnalysis {
+            sequence,
+            locus,
+            functions,
+        })
     }
 
     // ---- expressions (WHERE) ----
@@ -900,7 +1003,11 @@ impl Parser {
         if let Some(op) = op {
             self.next();
             let right = self.parse_operand()?;
-            return Ok(Expr::Cmp { op, left: Box::new(left), right: Box::new(right) });
+            return Ok(Expr::Cmp {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            });
         }
         if self.kw("IS") {
             if self.kw("NOT") {
@@ -949,7 +1056,11 @@ impl Parser {
             };
             self.next();
             let right = self.parse_multiplicative()?;
-            left = Expr::Arith { op, left: Box::new(left), right: Box::new(right) };
+            left = Expr::Arith {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
         }
         Ok(left)
     }
@@ -965,7 +1076,11 @@ impl Parser {
             };
             self.next();
             let right = self.parse_unary()?;
-            left = Expr::Arith { op, left: Box::new(left), right: Box::new(right) };
+            left = Expr::Arith {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
         }
         Ok(left)
     }
@@ -997,7 +1112,8 @@ impl Parser {
             Tok::Str(s) => {
                 self.next();
                 if !s.is_empty()
-                    && s.chars().all(|c| matches!(c, 'A' | 'C' | 'G' | 'T' | 'a' | 'c' | 'g' | 't'))
+                    && s.chars()
+                        .all(|c| matches!(c, 'A' | 'C' | 'G' | 'T' | 'a' | 'c' | 'g' | 't'))
                 {
                     Ok(Expr::Literal(Value::Dna(s.to_uppercase())))
                 } else {
@@ -1071,24 +1187,36 @@ impl DnaQlEngine {
         let start = std::time::Instant::now();
         let ast = self.parse(query)?;
         let result = match &ast {
-            DnaQlAst::PatternSearch { chromosome, pattern, mode, max_distance, link, projection } => {
-                self.exec_pattern_search(chromosome, pattern, mode.clone(), *max_distance, link.clone(), projection.clone())?
-            }
-            DnaQlAst::PipelineQuery { source, stages } => {
-                self.exec_pipeline(source, stages)?
-            }
-            DnaQlAst::Tx { statements } => {
-                self.exec_tx(statements)?
-            }
-            DnaQlAst::BioAnalysis { sequence, locus, functions } => {
-                self.exec_bio(sequence.clone(), locus.clone(), functions)?
-            }
+            DnaQlAst::PatternSearch {
+                chromosome,
+                pattern,
+                mode,
+                max_distance,
+                link,
+                projection,
+            } => self.exec_pattern_search(
+                chromosome,
+                pattern,
+                mode.clone(),
+                *max_distance,
+                link.clone(),
+                projection.clone(),
+            )?,
+            DnaQlAst::PipelineQuery { source, stages } => self.exec_pipeline(source, stages)?,
+            DnaQlAst::Tx { statements } => self.exec_tx(statements)?,
+            DnaQlAst::BioAnalysis {
+                sequence,
+                locus,
+                functions,
+            } => self.exec_bio(sequence.clone(), locus.clone(), functions)?,
             DnaQlAst::HealthCheck { chromosome, fix } => {
                 self.exec_health_check(chromosome, *fix)?
             }
-            DnaQlAst::CreateChromosome { table, definitions, if_not_exists } => {
-                self.exec_create_chromosome(table, definitions, *if_not_exists)?
-            }
+            DnaQlAst::CreateChromosome {
+                table,
+                definitions,
+                if_not_exists,
+            } => self.exec_create_chromosome(table, definitions, *if_not_exists)?,
             DnaQlAst::DropChromosome { table, if_exists } => {
                 self.exec_drop_chromosome(table, *if_exists)?
             }
@@ -1117,19 +1245,25 @@ impl DnaQlEngine {
                 pattern.len()
             ));
         }
-        PackedDna::from_ascii(pattern)
-            .map_err(|e| format!("DnaQL: invalid pattern: {}", e))?;
+        PackedDna::from_ascii(pattern).map_err(|e| format!("DnaQL: invalid pattern: {}", e))?;
 
         let prefix = format!("{}:", chromosome);
-        let raw_rows = self.engine.scan_prefix(prefix.as_bytes())
+        let raw_rows = self
+            .engine
+            .scan_prefix(prefix.as_bytes())
             .map_err(|e| format!("DnaQL storage error: {}", e))?;
 
         let mut out = Vec::new();
         let mut scanned = 0usize;
         for (key, payload) in raw_rows {
             scanned += 1;
-            let fields = RowCodec::decode(&payload)
-                .map_err(|e| format!("DnaQL: row {} unreadable: {}", String::from_utf8_lossy(&key), e))?;
+            let fields = RowCodec::decode(&payload).map_err(|e| {
+                format!(
+                    "DnaQL: row {} unreadable: {}",
+                    String::from_utf8_lossy(&key),
+                    e
+                )
+            })?;
             let row_map: BTreeMap<String, Value> = fields.into_iter().collect();
 
             let seq_str = match row_map.get("sequence") {
@@ -1141,15 +1275,23 @@ impl DnaQlEngine {
 
             let matches = match mode {
                 DistanceMode::Levenshtein => BitapMatcher::search(&packed, pattern, max_distance),
-                DistanceMode::Hamming => BitapMatcher::search_hamming(&packed, pattern, max_distance),
+                DistanceMode::Hamming => {
+                    BitapMatcher::search_hamming(&packed, pattern, max_distance)
+                }
             };
 
             for m in matches {
                 let mut result_row = BTreeMap::new();
-                result_row.insert("locus".to_string(), Value::Text(String::from_utf8_lossy(&key).to_string()));
+                result_row.insert(
+                    "locus".to_string(),
+                    Value::Text(String::from_utf8_lossy(&key).to_string()),
+                );
                 result_row.insert("offset_bp".to_string(), Value::Int(m.offset_bp as i64));
                 result_row.insert("mismatches".to_string(), Value::Int(m.mismatches as i64));
-                result_row.insert("matched_seq".to_string(), Value::Dna(m.matched_sequence.clone()));
+                result_row.insert(
+                    "matched_seq".to_string(),
+                    Value::Dna(m.matched_sequence.clone()),
+                );
                 // merge source row fields (locus_id, variant_name, ...)
                 for (k, v) in &row_map {
                     result_row.entry(k.clone()).or_insert_with(|| v.clone());
@@ -1159,7 +1301,9 @@ impl DnaQlEngine {
                 if let Some(spec) = &link {
                     let fk_val = row_map.get(&spec.column).cloned().unwrap_or(Value::Null);
                     let target_key = format!("{}:{}", spec.chromosome, fk_val);
-                    if let Some(target_bytes) = self.engine.get(target_key.as_bytes())
+                    if let Some(target_bytes) = self
+                        .engine
+                        .get(target_key.as_bytes())
                         .map_err(|e| format!("DnaQL storage error: {}", e))?
                     {
                         let target_fields = RowCodec::decode(&target_bytes)
@@ -1201,7 +1345,10 @@ impl DnaQlEngine {
         let note = format!(
             "real scan: {} loci, bitap {} k={}, {} matches",
             scanned,
-            match mode { DistanceMode::Hamming => "Hamming", DistanceMode::Levenshtein => "Levenshtein" },
+            match mode {
+                DistanceMode::Hamming => "Hamming",
+                DistanceMode::Levenshtein => "Levenshtein",
+            },
             max_distance,
             out.len()
         );
@@ -1238,12 +1385,7 @@ impl DnaQlEngine {
             clauses.push(format!("PRIMARY KEY ({})", first));
         }
         let nie = if if_not_exists { "IF NOT EXISTS " } else { "" };
-        let sql = format!(
-            "CREATE TABLE {}{} ({})",
-            nie,
-            table,
-            clauses.join(", ")
-        );
+        let sql = format!("CREATE TABLE {}{} ({})", nie, table, clauses.join(", "));
         let res = self
             .sql
             .execute(&sql)
@@ -1282,15 +1424,20 @@ impl DnaQlEngine {
         stages: &[PipelineStage],
     ) -> Result<(Vec<DnaQlRow>, String), String> {
         let prefix = format!("{}:", source);
-        let raw_rows = self.engine.scan_prefix(prefix.as_bytes())
+        let raw_rows = self
+            .engine
+            .scan_prefix(prefix.as_bytes())
             .map_err(|e| format!("DnaQL storage error: {}", e))?;
 
         let mut rows: Vec<DnaQlRow> = Vec::new();
         for (key, payload) in raw_rows {
-            let fields = RowCodec::decode(&payload)
-                .map_err(|e| format!("DnaQL: row unreadable: {}", e))?;
+            let fields =
+                RowCodec::decode(&payload).map_err(|e| format!("DnaQL: row unreadable: {}", e))?;
             let mut row_map: BTreeMap<String, Value> = fields.into_iter().collect();
-            row_map.insert("locus".to_string(), Value::Text(String::from_utf8_lossy(&key).to_string()));
+            row_map.insert(
+                "locus".to_string(),
+                Value::Text(String::from_utf8_lossy(&key).to_string()),
+            );
             rows.push(DnaQlRow { fields: row_map });
         }
 
@@ -1303,7 +1450,9 @@ impl DnaQlEngine {
                     for row in rows.iter_mut() {
                         let fk_val = row.fields.get(&spec.column).cloned().unwrap_or(Value::Null);
                         let target_key = format!("{}:{}", spec.chromosome, fk_val);
-                        if let Some(target_bytes) = self.engine.get(target_key.as_bytes())
+                        if let Some(target_bytes) = self
+                            .engine
+                            .get(target_key.as_bytes())
                             .map_err(|e| format!("DnaQL storage error: {}", e))?
                         {
                             let target_fields = RowCodec::decode(&target_bytes)
@@ -1344,7 +1493,11 @@ impl DnaQlEngine {
                         let va = a.fields.get(column).cloned().unwrap_or(Value::Null);
                         let vb = b.fields.get(column).cloned().unwrap_or(Value::Null);
                         let ord = va.compare(&vb);
-                        if *asc { ord } else { ord.reverse() }
+                        if *asc {
+                            ord
+                        } else {
+                            ord.reverse()
+                        }
                     });
                 }
                 PipelineStage::Limit(n) => {
@@ -1358,10 +1511,7 @@ impl DnaQlEngine {
         Ok((rows, note))
     }
 
-    fn exec_tx(
-        &self,
-        statements: &[TxStmt],
-    ) -> Result<(Vec<DnaQlRow>, String), String> {
+    fn exec_tx(&self, statements: &[TxStmt]) -> Result<(Vec<DnaQlRow>, String), String> {
         // 1. Buffer mutations into a transaction session. Reads go THROUGH
         // the session (read-your-writes: a statement sees earlier statements'
         // buffered effects) and record Serializable validation baselines.
@@ -1369,7 +1519,13 @@ impl DnaQlEngine {
 
         for stmt in statements {
             match stmt {
-                TxStmt::Mutate { table, locus, field, op, value } => {
+                TxStmt::Mutate {
+                    table,
+                    locus,
+                    field,
+                    op,
+                    value,
+                } => {
                     let key = format!("{}:{}", table, locus);
                     let existing = session.read_row(&key)?;
                     let mut row = existing.unwrap_or_default();
@@ -1378,7 +1534,11 @@ impl DnaQlEngine {
                     row.insert(field.clone(), new_val);
                     session.put_row(key.into_bytes(), row);
                 }
-                TxStmt::Append { table, locus, fields } => {
+                TxStmt::Append {
+                    table,
+                    locus,
+                    fields,
+                } => {
                     let key = format!("{}:{}", table, locus);
                     let existing = session.read_row(&key)?;
                     let mut row = existing.unwrap_or_default();
@@ -1387,7 +1547,11 @@ impl DnaQlEngine {
                     }
                     session.put_row(key.into_bytes(), row);
                 }
-                TxStmt::DropLocus { table, locus, cascade: _ } => {
+                TxStmt::DropLocus {
+                    table,
+                    locus,
+                    cascade: _,
+                } => {
                     let key = format!("{}:{}", table, locus);
                     session.delete(key.into_bytes());
                 }
@@ -1410,7 +1574,10 @@ impl DnaQlEngine {
                 }
                 TxStmt::DropLocus { table, locus, .. } => {
                     let mut f = BTreeMap::new();
-                    f.insert("dropped".to_string(), Value::Text(format!("{}:{}", table, locus)));
+                    f.insert(
+                        "dropped".to_string(),
+                        Value::Text(format!("{}:{}", table, locus)),
+                    );
                     out.push(DnaQlRow { fields: f });
                 }
             }
@@ -1418,12 +1585,20 @@ impl DnaQlEngine {
 
         Ok((
             out,
-            format!("real TX: {} statements committed atomically at LSN {}", statements.len(), lsn),
+            format!(
+                "real TX: {} statements committed atomically at LSN {}",
+                statements.len(),
+                lsn
+            ),
         ))
     }
 
     fn read_row(&self, key: &str) -> Result<Option<BTreeMap<String, Value>>, String> {
-        match self.engine.get(key.as_bytes()).map_err(|e| format!("storage: {}", e))? {
+        match self
+            .engine
+            .get(key.as_bytes())
+            .map_err(|e| format!("storage: {}", e))?
+        {
             Some(bytes) => {
                 let fields = RowCodec::decode(&bytes)
                     .map_err(|e| format!("row {} unreadable: {}", key, e))?;
@@ -1510,7 +1685,8 @@ impl DnaQlEngine {
             (Some(s), _) => s,
             (None, Some((table, id))) => {
                 let key = format!("{}:{}", table, id);
-                let row = self.read_row(&key)?
+                let row = self
+                    .read_row(&key)?
                     .ok_or_else(|| format!("DnaQL: locus {} not found", key))?;
                 match row.get("sequence") {
                     Some(Value::Dna(s)) | Some(Value::Text(s)) => s.clone(),
@@ -1581,18 +1757,31 @@ fn apply_assign(old: &Value, op: AssignOp, v: &Value) -> Result<Value, String> {
 
 fn ast_summary(ast: &DnaQlAst) -> String {
     match ast {
-        DnaQlAst::PatternSearch { chromosome, pattern, mode, max_distance, link, .. } => {
+        DnaQlAst::PatternSearch {
+            chromosome,
+            pattern,
+            mode,
+            max_distance,
+            link,
+            ..
+        } => {
             format!(
                 "PatternSearch {{ chr: '{}', pattern: '{}', mode: {:?}, k: {}, link: {} }}",
                 chromosome,
                 pattern,
                 mode,
                 max_distance,
-                link.as_ref().map(|l| format!("{}({})", l.chromosome, l.column)).unwrap_or_else(|| "none".into())
+                link.as_ref()
+                    .map(|l| format!("{}({})", l.chromosome, l.column))
+                    .unwrap_or_else(|| "none".into())
             )
         }
         DnaQlAst::PipelineQuery { source, stages } => {
-            format!("PipelineQuery {{ source: '{}', stages: {} }}", source, stages.len())
+            format!(
+                "PipelineQuery {{ source: '{}', stages: {} }}",
+                source,
+                stages.len()
+            )
         }
         DnaQlAst::Tx { statements } => {
             format!("Tx {{ statements: {} }}", statements.len())
@@ -1601,12 +1790,13 @@ fn ast_summary(ast: &DnaQlAst) -> String {
             format!("BioAnalysis {{ functions: {:?} }}", functions)
         }
         DnaQlAst::HealthCheck { chromosome, fix } => {
-            format!(
-                "HealthCheck {{ chr: '{}', fix: {} }}",
-                chromosome, fix
-            )
+            format!("HealthCheck {{ chr: '{}', fix: {} }}", chromosome, fix)
         }
-        DnaQlAst::CreateChromosome { table, definitions, if_not_exists } => {
+        DnaQlAst::CreateChromosome {
+            table,
+            definitions,
+            if_not_exists,
+        } => {
             format!(
                 "CreateChromosome {{ table: '{}', definitions: {}, if_not_exists: {} }}",
                 table,
@@ -1635,7 +1825,10 @@ mod tests {
         let d = std::env::temp_dir().join(format!(
             "dna_ql_{}_{}",
             name,
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
         ));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
@@ -1655,8 +1848,16 @@ mod tests {
         // chr_variants: loci with sequences
         let variants = vec![
             (1, "BRCA1_exon2", "ATGCGATCGATCGACCATGCGATCGATCATGCGATCAATC"),
-            (2, "TP53_promoter", "GGCCTTAAGGCCTTAACCGGATGCATCGAATTCGAGCTAG"),
-            (3, "CYP2D6_poly", "TTAACCGGATCGGATCCGTAAGCTTCGGATCCAAGCTTACG"),
+            (
+                2,
+                "TP53_promoter",
+                "GGCCTTAAGGCCTTAACCGGATGCATCGAATTCGAGCTAG",
+            ),
+            (
+                3,
+                "CYP2D6_poly",
+                "TTAACCGGATCGGATCCGTAAGCTTCGGATCCAAGCTTACG",
+            ),
         ];
         for (id, name, seq) in variants {
             let mut row = BTreeMap::new();
@@ -1666,7 +1867,9 @@ mod tests {
             row.insert("patient_id".to_string(), Value::Int(id * 10));
             let key = format!("chr_variants:{}", id);
             let payload = RowCodec::encode(
-                &row.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>(),
+                &row.iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect::<Vec<_>>(),
             );
             engine.put(key.as_bytes(), &payload).unwrap();
         }
@@ -1678,7 +1881,9 @@ mod tests {
             row.insert("name".to_string(), Value::Text(format!("patient_{}", i)));
             let key = format!("chr_patients:{}", i);
             let payload = RowCodec::encode(
-                &row.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>(),
+                &row.iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect::<Vec<_>>(),
             );
             engine.put(key.as_bytes(), &payload).unwrap();
         }
@@ -1693,7 +1898,11 @@ mod tests {
         let (_e, ql) = setup();
         // exact match: GATCGATC appears in variant 1 sequence
         let res = ql.execute("chr_variants ? 'GATCGATC' ~0").unwrap();
-        assert!(res.rows.len() >= 1, "expected matches, got {:?}", res.ast_summary);
+        assert!(
+            res.rows.len() >= 1,
+            "expected matches, got {:?}",
+            res.ast_summary
+        );
         assert!(res.engine_note.contains("real scan"));
 
         // with 1 mismatch, should find MORE or equal
@@ -1717,7 +1926,11 @@ mod tests {
         assert!(!res.rows.is_empty());
         // linked patient name present
         let has_link = res.rows.iter().any(|r| r.fields.contains_key("name"));
-        assert!(has_link, "link fields missing: {:?}", res.rows[0].fields.keys().collect::<Vec<_>>());
+        assert!(
+            has_link,
+            "link fields missing: {:?}",
+            res.rows[0].fields.keys().collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1748,7 +1961,11 @@ mod tests {
                    chr_orders += { order_id: 9021, user_id: 14, total_usd: 350.00 }; \
                  }";
         let res = ql.execute(q).unwrap();
-        assert!(res.engine_note.contains("atomically"), "{}", res.engine_note);
+        assert!(
+            res.engine_note.contains("atomically"),
+            "{}",
+            res.engine_note
+        );
 
         // balance updated
         let raw = e.get(b"chr_accounts:14").unwrap().unwrap();
@@ -1759,7 +1976,9 @@ mod tests {
         // order created
         let raw2 = e.get(b"chr_orders:9021").unwrap().unwrap();
         let fields2 = RowCodec::decode(&raw2).unwrap();
-        assert!(fields2.iter().any(|(k, v)| k == "order_id" && *v == Value::Int(9021)));
+        assert!(fields2
+            .iter()
+            .any(|(k, v)| k == "order_id" && *v == Value::Int(9021)));
     }
 
     #[test]
@@ -1769,9 +1988,15 @@ mod tests {
         let res = ql.execute(q).unwrap();
         assert_eq!(res.rows.len(), 3);
         let gc = &res.rows[0];
-        assert_eq!(gc.fields.get("result"), Some(&Value::Text("44.44%".to_string())));
+        assert_eq!(
+            gc.fields.get("result"),
+            Some(&Value::Text("44.44%".to_string()))
+        );
         let tr = &res.rows[2];
-        assert_eq!(tr.fields.get("result"), Some(&Value::Text("MA".to_string())));
+        assert_eq!(
+            tr.fields.get("result"),
+            Some(&Value::Text("MA".to_string()))
+        );
     }
 
     #[test]

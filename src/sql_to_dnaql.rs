@@ -58,8 +58,7 @@ pub(crate) fn transpile(
             }
             if !group_by.is_empty() || having.is_some() {
                 return Err(
-                    "SQL→DnaQL: GROUP BY / HAVING (aggregates) are not expressible in DnaQL"
-                        .into(),
+                    "SQL→DnaQL: GROUP BY / HAVING (aggregates) are not expressible in DnaQL".into(),
                 );
             }
             if *offset > 0 {
@@ -132,7 +131,12 @@ pub(crate) fn transpile(
                     .iter()
                     .map(|(k, v)| Ok(format!("{}: {}", k, literal(v)?)))
                     .collect::<Result<Vec<_>, String>>()?;
-                stmts.push(format!("{}:{} += {{ {} }}", table, locus, fields.join(", ")));
+                stmts.push(format!(
+                    "{}:{} += {{ {} }}",
+                    table,
+                    locus,
+                    fields.join(", ")
+                ));
             }
             if stmts.is_empty() {
                 return Err("SQL→DnaQL: INSERT has no rows".into());
@@ -191,7 +195,11 @@ pub(crate) fn transpile(
                     fk.column,
                     fk.target_chromosome,
                     fk.target_locus_column,
-                    if fk.on_delete_cascade { "CASCADE" } else { "RESTRICT" }
+                    if fk.on_delete_cascade {
+                        "CASCADE"
+                    } else {
+                        "RESTRICT"
+                    }
                 ));
             }
             let nie = if *if_not_exists { "IF NOT EXISTS " } else { "" };
@@ -236,7 +244,12 @@ fn emit_columns(
 ) -> Result<String, String> {
     use crate::sql_engine::SelectItem;
     if projection.is_empty() || matches!(projection, [SelectItem::Star]) {
-        return Ok(schema.columns.keys().cloned().collect::<Vec<_>>().join(", "));
+        return Ok(schema
+            .columns
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", "));
     }
     let mut cols = Vec::new();
     for item in projection {
@@ -288,11 +301,7 @@ fn emit_columns(
 /// DnaQL TX mutation requires. Any other predicate is rejected: DnaQL
 /// addresses rows by locus alone, so silently accepting `pk = 1 AND x = 2`
 /// would update rows SQL would have skipped.
-fn pk_locus(
-    where_clause: &Option<Expr>,
-    pk: &str,
-    table: &str,
-) -> Result<i64, String> {
+fn pk_locus(where_clause: &Option<Expr>, pk: &str, table: &str) -> Result<i64, String> {
     let w = where_clause.as_ref().ok_or_else(|| {
         format!(
             "SQL→DnaQL: UPDATE/DELETE on '{}' without WHERE would touch every row; DnaQL \
@@ -358,12 +367,9 @@ fn expr(e: &Expr) -> Result<String, String> {
         ),
         Expr::And(a, b) => Ok(format!("({} AND {})", expr(a)?, expr(b)?)),
         Expr::Or(a, b) => Ok(format!("({} OR {})", expr(a)?, expr(b)?)),
-        Expr::Cmp { op, left, right } => Ok(format!(
-            "{} {} {}",
-            expr(left)?,
-            op.as_str(),
-            expr(right)?
-        )),
+        Expr::Cmp { op, left, right } => {
+            Ok(format!("{} {} {}", expr(left)?, op.as_str(), expr(right)?))
+        }
         Expr::IsNull(inner) => Ok(format!("{} IS NULL", expr(inner)?)),
         Expr::IsNotNull(inner) => Ok(format!("{} IS NOT NULL", expr(inner)?)),
         Expr::Arith { op, left, right } => Ok(format!(
@@ -452,11 +458,7 @@ mod tests {
     use std::sync::Arc;
 
     fn engine(name: &str) -> Arc<Engine> {
-        let dir = std::env::temp_dir().join(format!(
-            "dna_s2d_{}_{}",
-            name,
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("dna_s2d_{}_{}", name, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         Engine::open(EngineConfig {
             dir_path: dir,
@@ -504,10 +506,7 @@ mod tests {
     fn select_star_uses_schema_columns() {
         let sql = setup("star");
         let out = sql.sql_to_dnaql("SELECT * FROM chr_users").unwrap();
-        assert_eq!(
-            out,
-            "FROM chr_users |> EMIT balance, user_id, username;"
-        );
+        assert_eq!(out, "FROM chr_users |> EMIT balance, user_id, username;");
     }
 
     #[test]
@@ -533,8 +532,10 @@ mod tests {
     #[test]
     fn insert_becomes_atomic_tx() {
         let sql = setup("ins");
-        sql.execute("INSERT INTO chr_users (user_id = 12, username = 'dr_watson', balance = 1500.5)")
-            .unwrap();
+        sql.execute(
+            "INSERT INTO chr_users (user_id = 12, username = 'dr_watson', balance = 1500.5)",
+        )
+        .unwrap();
         let out = sql
             .sql_to_dnaql(
                 "INSERT INTO chr_users (user_id, username, balance) VALUES \

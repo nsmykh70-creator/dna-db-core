@@ -12,9 +12,9 @@
 //! This replaces the previous stub that only flipped an enum with a
 //! hardcoded 64MB counter.
 
+use parking_lot::RwLock;
 use std::fs;
 use std::path::{Path, PathBuf};
-use parking_lot::RwLock;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageTier {
@@ -96,9 +96,7 @@ impl TieredStorageManager {
                 self.hot_dir.join(format!("{:06}.bloom", segment_id)),
             );
         }
-        self.tier_map
-            .write()
-            .insert(segment_id, StorageTier::Hot);
+        self.tier_map.write().insert(segment_id, StorageTier::Hot);
         self.promotions
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(true)
@@ -117,9 +115,12 @@ impl TieredStorageManager {
     }
 
     pub fn tier_of(&self, segment_id: u64) -> StorageTier {
-        *self.tier_map.read().get(&segment_id).unwrap_or(&StorageTier::Hot)
+        *self
+            .tier_map
+            .read()
+            .get(&segment_id)
+            .unwrap_or(&StorageTier::Hot)
     }
-
 
     /// Bytes used per tier (scans the dirs — real numbers).
     pub fn tier_bytes(&self) -> std::io::Result<(u64, u64)> {

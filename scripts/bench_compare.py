@@ -121,7 +121,9 @@ class Server:
              "--bind", "127.0.0.1",
              "--admin-pass", "bench-pass",
              "--sync", "strict",
-             "--no-scrub"],
+             "--no-scrub",
+             "--no-tls",
+             "--no-encryption"],
             stdout=self.log, stderr=self.log, cwd=PROJECT)
 
     def wait_ready(self, timeout=30):

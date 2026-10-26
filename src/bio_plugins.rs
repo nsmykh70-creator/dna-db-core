@@ -11,9 +11,9 @@
 //! Registration is runtime-extensible via BioPluginFn (planned: WASM modules
 //! in a future release, see ROADMAP).
 
+use crate::dna::PackedDna;
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use crate::dna::PackedDna;
 
 pub type BioPluginFn = fn(&[PackedDna], &[String]) -> Result<Vec<String>, String>;
 
@@ -83,7 +83,12 @@ impl BioPluginRegistry {
         v
     }
 
-    pub fn execute(&self, plugin_name: &str, inputs: &[PackedDna], args: &[String]) -> Result<Vec<String>, String> {
+    pub fn execute(
+        &self,
+        plugin_name: &str,
+        inputs: &[PackedDna],
+        args: &[String],
+    ) -> Result<Vec<String>, String> {
         let guard = self.plugins.read();
         let plugin = guard
             .get(plugin_name)
@@ -202,10 +207,7 @@ pub mod plugins {
         if inputs.is_empty() {
             return Err("orf_finder requires 1 sequence".into());
         }
-        let min_aa: usize = args
-            .first()
-            .and_then(|a| a.parse().ok())
-            .unwrap_or(30);
+        let min_aa: usize = args.first().and_then(|a| a.parse().ok()).unwrap_or(30);
         let orfs = inputs[0].orfs(min_aa);
         let out: Vec<String> = orfs
             .into_iter()
@@ -225,12 +227,23 @@ pub mod plugins {
         let seq = inputs[0].to_ascii();
         let window: usize = args.first().and_then(|a| a.parse().ok()).unwrap_or(100);
         if window == 0 || seq.len() < window {
-            return Err(format!("window {} exceeds sequence length {}", window, seq.len()));
+            return Err(format!(
+                "window {} exceeds sequence length {}",
+                window,
+                seq.len()
+            ));
         }
         let bytes = seq.as_bytes();
         let mut out = Vec::new();
-        let mut gc = bytes[..window].iter().filter(|&&c| c == b'G' || c == b'C').count();
-        out.push(format!("gc@0..{}={:.1}%", window, gc as f64 * 100.0 / window as f64));
+        let mut gc = bytes[..window]
+            .iter()
+            .filter(|&&c| c == b'G' || c == b'C')
+            .count();
+        out.push(format!(
+            "gc@0..{}={:.1}%",
+            window,
+            gc as f64 * 100.0 / window as f64
+        ));
         for start in 1..=bytes.len() - window {
             let out_going = bytes[start - 1];
             let in_coming = bytes[start + window - 1];
@@ -282,7 +295,9 @@ mod tests {
         let reg = BioPluginRegistry::new();
         // sequence with TGG at position 5 (1-based)
         let s = PackedDna::from_ascii("ACGTATGGCCCC").unwrap();
-        let out = reg.execute("crispr_pam_scan", &[s], &["NGG".to_string()]).unwrap();
+        let out = reg
+            .execute("crispr_pam_scan", &[s], &["NGG".to_string()])
+            .unwrap();
         assert!(out[0].starts_with("pam@6:TGG"), "got: {}", out[0]);
     }
 
@@ -296,10 +311,14 @@ mod tests {
         }
         seq.push_str("TAA");
         let s = PackedDna::from_ascii(&seq).unwrap();
-        let out = reg.execute("orf_finder", &[s.clone()], &["10".to_string()]).unwrap();
+        let out = reg
+            .execute("orf_finder", &[s.clone()], &["10".to_string()])
+            .unwrap();
         assert!(out[0].starts_with("orf@0:"));
         // With min 30 aa -> not found
-        let out2 = reg.execute("orf_finder", &[s], &["30".to_string()]).unwrap();
+        let out2 = reg
+            .execute("orf_finder", &[s], &["30".to_string()])
+            .unwrap();
         assert_eq!(out2[0], "no_orfs_found");
     }
 
