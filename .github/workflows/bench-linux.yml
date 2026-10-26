@@ -38,38 +38,82 @@ jobs:
             rustup default stable || true
           fi
 
-      - name: Install and start MySQL + PostgreSQL (native, no containers)
+      - name: Install MySQL + PostgreSQL (native, no containers)
         run: |
           set -eo pipefail
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
             mysql-server postgresql
-          sudo systemctl start mysql
+          sudo systemctl start mysql || true
           sudo systemctl start postgresql
 
-          # MySQL: root over TCP with password 'bench' (the benchmark's login)
-          sudo mysql -e "
-            CREATE USER IF NOT EXISTS 'root'@'127.0.0.1'
-              IDENTIFIED WITH mysql_native_password BY 'bench';
-            GRANT ALL ON *.* TO 'root'@'127.0.0.1' WITH GRANT OPTION;
-            ALTER USER 'root'@'localhost'
-              IDENTIFIED WITH mysql_native_password BY 'bench';
-            CREATE DATABASE IF NOT EXISTS bench;
-            FLUSH PRIVILEGES;"
+      - name: Configure MySQL (root password 'bench', database 'bench')
+        run: |
+          set -eo pipefail
+          # Statements executed by whichever bootstrap method succeeds below.
+          sudo tee /tmp/mysql-init.sql >/dev/null <<'SQL'
+          ALTER USER 'root'@'localhost' IDENTIFIED BY 'bench';
+          CREATE USER IF NOT EXISTS 'root'@'127.0.0.1' IDENTIFIED BY 'bench';
+          GRANT ALL ON *.* TO 'root'@'127.0.0.1' WITH GRANT OPTION;
+          CREATE USER IF NOT EXISTS 'bench'@'127.0.0.1' IDENTIFIED BY 'bench';
+          GRANT ALL ON *.* TO 'bench'@'127.0.0.1' WITH GRANT OPTION;
+          CREATE USER IF NOT EXISTS 'bench'@'localhost' IDENTIFIED BY 'bench';
+          GRANT ALL ON *.* TO 'bench'@'localhost' WITH GRANT OPTION;
+          CREATE DATABASE IF NOT EXISTS bench;
+          FLUSH PRIVILEGES;
+          SQL
+          sudo chmod 644 /tmp/mysql-init.sql
 
-          # PostgreSQL: user/database 'bench'
+          configured=0
+
+          # (a) password-less socket login (auth_socket images)
+          if sudo mysql -e "SELECT 1" >/dev/null 2>&1; then
+            echo "socket login works, configuring root directly"
+            sudo mysql < /tmp/mysql-init.sql && configured=1 || true
+          fi
+
+          # (b) Oracle-style temporary password in the error log
+          if [ "$configured" = 0 ] && sudo test -f /var/log/mysql/error.log; then
+            tmp_pw=$(sudo grep -o 'temporary password.*' \
+              /var/log/mysql/error.log | tail -1 | sed 's/.*: //' || true)
+            if [ -n "$tmp_pw" ]; then
+              echo "trying temporary password from error.log"
+              mysql -uroot -p"$tmp_pw" --connect-timeout=5 \
+                < /tmp/mysql-init.sql && configured=1 || true
+            fi
+          fi
+
+          # (c) restart once with --init-file (authoritative password reset)
+          if [ "$configured" = 0 ]; then
+            echo "resetting the root password via --init-file restart"
+            sudo systemctl stop mysql
+            sudo mkdir -p /etc/systemd/system/mysql.service.d
+            printf '[Service]\nExecStart=\nExecStart=/usr/sbin/mysqld --init-file=/tmp/mysql-init.sql\n' \
+              | sudo tee /etc/systemd/system/mysql.service.d/zz-init-file.conf >/dev/null
+            sudo systemctl daemon-reload
+            sudo systemctl start mysql
+            sudo rm -f /etc/systemd/system/mysql.service.d/zz-init-file.conf
+            sudo systemctl daemon-reload
+          fi
+
+          # verify: this must succeed for the benchmark to run
+          for i in $(seq 1 60); do
+            mysql -h127.0.0.1 -uroot -pbench -e "SELECT 1" >/dev/null 2>&1 && break
+            sleep 2
+          done
+          mysql -h127.0.0.1 -uroot -pbench -e "SELECT VERSION(); SELECT @@innodb_flush_log_at_trx_commit;"
+
+      - name: Configure PostgreSQL (user/database 'bench')
+        run: |
+          set -eo pipefail
           sudo -u postgres psql -c \
             "CREATE USER bench WITH PASSWORD 'bench';" || true
           sudo -u postgres psql -c \
             "CREATE DATABASE bench OWNER bench;" || true
-
-          # readiness
-          for i in $(seq 1 60); do
-            mysqladmin ping -h127.0.0.1 -uroot -pbench --silent && \
+          for i in $(seq 1 30); do
             pg_isready -h 127.0.0.1 -U bench && break
             sleep 2
           done
-          mysqladmin ping -h127.0.0.1 -uroot -pbench
           pg_isready -h 127.0.0.1 -U bench
 
       - name: Install Python dependencies
