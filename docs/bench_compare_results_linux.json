@@ -1,0 +1,259 @@
+{
+  "meta": {
+    "date": "2026-10-26 02:18:22",
+    "machine": "posix | Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+    "params": {
+      "load": 10000,
+      "reads": 4000,
+      "threads": 8,
+      "mixed_ops": 500,
+      "sql_rows": 3000,
+      "sql_queries": 1500,
+      "mt_rows": 8000,
+      "mt_threads": 8,
+      "batch_rows": 8000,
+      "batch_size": 200
+    },
+    "durability": {
+      "dnadb": "--sync strict (fsync WAL per ack)",
+      "mysql": "innodb_flush_log_at_trx_commit=1 (default)",
+      "postgres": "synchronous_commit=on (default)"
+    }
+  },
+  "systems": {
+    "dnadb": {
+      "name": "DNA-DB v3.0",
+      "version": "dna-db-core 3.0.0 (strict fsync)",
+      "load": {
+        "ops": 10000,
+        "secs": 3.078,
+        "ops_s": 3249,
+        "avg_ms": 0.308,
+        "p50_ms": 0.293,
+        "p95_ms": 0.383,
+        "p99_ms": 0.607
+      },
+      "load_mt": {
+        "ops": 8000,
+        "secs": 2.253,
+        "ops_s": 3551,
+        "threads": 8,
+        "errors": 0,
+        "avg_ms": 2.232,
+        "p50_ms": 2.211,
+        "p95_ms": 3.462,
+        "p99_ms": 4.197,
+        "verify_ok": true
+      },
+      "load_batch": {
+        "ops": 8000,
+        "secs": 0.043,
+        "ops_s": 183957,
+        "batches": 40,
+        "batch_size": 200,
+        "per_op": "batch",
+        "errors": 0,
+        "avg_ms": 1.085,
+        "p50_ms": 1.084,
+        "p95_ms": 1.223,
+        "p99_ms": 1.365,
+        "verify_ok": true
+      },
+      "point_read": {
+        "ops": 4000,
+        "secs": 0.163,
+        "ops_s": 24586,
+        "errors": 0,
+        "avg_ms": 0.04,
+        "p50_ms": 0.037,
+        "p95_ms": 0.054,
+        "p99_ms": 0.06
+      },
+      "mixed": {
+        "ops": 4000,
+        "secs": 0.338,
+        "ops_s": 11821,
+        "threads": 8,
+        "avg_ms": 0.631,
+        "p50_ms": 0.582,
+        "p95_ms": 1.208,
+        "p99_ms": 1.581
+      },
+      "sql_load": {
+        "ops": 3000,
+        "secs": 0.93,
+        "ops_s": 3226,
+        "avg_ms": 0.308,
+        "p50_ms": 0.303,
+        "p95_ms": 0.359,
+        "p99_ms": 0.422
+      },
+      "sql_point_query": {
+        "ops": 1500,
+        "secs": 0.082,
+        "ops_s": 18228,
+        "errors": 0,
+        "avg_ms": 0.049,
+        "p50_ms": 0.048,
+        "p95_ms": 0.062,
+        "p99_ms": 0.069
+      }
+    },
+    "mysql": {
+      "name": "MySQL",
+      "version": "MySQL 8.0.46-0ubuntu0.24.04.4 (innodb_flush_log_at_trx_commit=1)",
+      "load": {
+        "ops": 10000,
+        "secs": 6.984,
+        "ops_s": 1432,
+        "avg_ms": 0.698,
+        "p50_ms": 0.681,
+        "p95_ms": 0.898,
+        "p99_ms": 1.119
+      },
+      "load_mt": {
+        "ops": 8000,
+        "secs": 1.258,
+        "ops_s": 6361,
+        "threads": 8,
+        "errors": 0,
+        "avg_ms": 1.115,
+        "p50_ms": 1.083,
+        "p95_ms": 1.533,
+        "p99_ms": 1.848,
+        "verify_ok": true
+      },
+      "load_batch": {
+        "ops": 8000,
+        "secs": 0.08,
+        "ops_s": 100319,
+        "batches": 40,
+        "batch_size": 200,
+        "per_op": "batch",
+        "errors": 0,
+        "avg_ms": 1.992,
+        "p50_ms": 1.948,
+        "p95_ms": 2.44,
+        "p99_ms": 3.104,
+        "verify_ok": true
+      },
+      "point_read": {
+        "ops": 4000,
+        "secs": 0.36,
+        "ops_s": 11103,
+        "errors": 0,
+        "avg_ms": 0.089,
+        "p50_ms": 0.074,
+        "p95_ms": 0.105,
+        "p99_ms": 0.138
+      },
+      "mixed": {
+        "ops": 4000,
+        "secs": 0.383,
+        "ops_s": 10443,
+        "threads": 8,
+        "avg_ms": 0.437,
+        "p50_ms": 0.296,
+        "p95_ms": 1.18,
+        "p99_ms": 2.673
+      },
+      "sql_load": {
+        "ops": 3000,
+        "secs": 2.027,
+        "ops_s": 1480,
+        "avg_ms": 0.675,
+        "p50_ms": 0.678,
+        "p95_ms": 0.848,
+        "p99_ms": 0.988
+      },
+      "sql_point_query": {
+        "ops": 1500,
+        "secs": 0.14,
+        "ops_s": 10694,
+        "errors": 0,
+        "avg_ms": 0.092,
+        "p50_ms": 0.086,
+        "p95_ms": 0.126,
+        "p99_ms": 0.149
+      }
+    },
+    "postgres": {
+      "name": "PostgreSQL",
+      "version": "PostgreSQL 16.15 (Ubuntu 16.15-1.pgdg24.04+2) (synchronous_commit=on)",
+      "load": {
+        "ops": 10000,
+        "secs": 1.815,
+        "ops_s": 5510,
+        "avg_ms": 0.181,
+        "p50_ms": 0.174,
+        "p95_ms": 0.223,
+        "p99_ms": 0.271
+      },
+      "load_mt": {
+        "ops": 8000,
+        "secs": 0.4,
+        "ops_s": 20001,
+        "threads": 8,
+        "errors": 0,
+        "avg_ms": 0.369,
+        "p50_ms": 0.339,
+        "p95_ms": 0.508,
+        "p99_ms": 0.659,
+        "verify_ok": true
+      },
+      "load_batch": {
+        "ops": 8000,
+        "secs": 0.126,
+        "ops_s": 63661,
+        "batches": 40,
+        "batch_size": 200,
+        "per_op": "batch",
+        "errors": 0,
+        "avg_ms": 3.141,
+        "p50_ms": 0.912,
+        "p95_ms": 9.029,
+        "p99_ms": 39.796,
+        "verify_ok": true
+      },
+      "point_read": {
+        "ops": 4000,
+        "secs": 0.258,
+        "ops_s": 15502,
+        "errors": 0,
+        "avg_ms": 0.063,
+        "p50_ms": 0.058,
+        "p95_ms": 0.085,
+        "p99_ms": 0.099
+      },
+      "mixed": {
+        "ops": 4000,
+        "secs": 0.176,
+        "ops_s": 22742,
+        "threads": 8,
+        "avg_ms": 0.292,
+        "p50_ms": 0.212,
+        "p95_ms": 0.667,
+        "p99_ms": 1.041
+      },
+      "sql_load": {
+        "ops": 3000,
+        "secs": 0.573,
+        "ops_s": 5240,
+        "avg_ms": 0.191,
+        "p50_ms": 0.182,
+        "p95_ms": 0.234,
+        "p99_ms": 0.302
+      },
+      "sql_point_query": {
+        "ops": 1500,
+        "secs": 0.098,
+        "ops_s": 15350,
+        "errors": 0,
+        "avg_ms": 0.064,
+        "p50_ms": 0.057,
+        "p95_ms": 0.088,
+        "p99_ms": 0.095
+      }
+    }
+  }
+}
