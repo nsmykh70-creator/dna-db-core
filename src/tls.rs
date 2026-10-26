@@ -18,7 +18,8 @@ use std::sync::Arc;
 use rcgen::generate_simple_self_signed;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::ServerConfig;
+use rustls::server::WebPkiClientVerifier;
+use rustls::{RootCertStore, ServerConfig};
 
 fn provider() {
     // Installing twice is harmless. The first call wins and keeps the
@@ -31,6 +32,7 @@ pub fn load_or_generate(
     data_dir: &Path,
     cert_path: Option<&Path>,
     key_path: Option<&Path>,
+    client_ca_path: Option<&Path>,
 ) -> io::Result<Arc<ServerConfig>> {
     let explicit_pair = cert_path.is_some();
     let (cert_path, key_path) = match (cert_path, key_path) {
@@ -84,10 +86,35 @@ pub fn load_or_generate(
         ));
     }
     provider();
-    let config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let builder = ServerConfig::builder();
+    let config = if let Some(client_ca) = client_ca_path {
+        let mut roots = RootCertStore::empty();
+        let ca_certs = load_certs(client_ca)?;
+        if ca_certs.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("no client CA certificates found in {:?}", client_ca),
+            ));
+        }
+        for cert in ca_certs {
+            roots
+                .add(cert)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        }
+        let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+            .build()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        eprintln!("[TLS] mutual TLS required (client CA {:?})", client_ca);
+        builder
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(certs, key)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
+    } else {
+        builder
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
+    };
     eprintln!(
         "[TLS] serving with certificate {:?} (self-signed pairs are for development; \
          use --tls-cert/--tls-key for public deployments)",
@@ -176,7 +203,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let cert = dir.join("missing-cert.pem");
         let key = dir.join("missing-key.pem");
-        assert!(load_or_generate(&dir, Some(&cert), Some(&key)).is_err());
+        assert!(load_or_generate(&dir, Some(&cert), Some(&key), None).is_err());
         assert!(!cert.exists());
         assert!(!key.exists());
         let _ = std::fs::remove_dir_all(&dir);
@@ -193,7 +220,7 @@ mod tests {
                 .subsec_nanos()
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        let config = load_or_generate(&dir, None, None).unwrap();
+        let config = load_or_generate(&dir, None, None, None).unwrap();
         assert!(config.alpn_protocols.is_empty());
         assert!(dir.join("tls/cert.pem").exists());
         assert!(dir.join("tls/key.pem").exists());

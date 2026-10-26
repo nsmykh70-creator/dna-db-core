@@ -1,7 +1,7 @@
 # DNA-DB Core security model
 
 This document describes the production security controls in DNA-DB Core
-v3.2, the operational assumptions behind them, and the residual risks we have
+v3.3, the operational assumptions behind them, and the residual risks we have
 not eliminated. It is intentionally narrower than a compliance certification:
 DNA-DB is a single-node database, not a managed service.
 
@@ -9,7 +9,8 @@ DNA-DB is a single-node database, not a managed service.
 
 | Version | Security support |
 |---|---|
-| `3.2.x` | current production hardening release |
+| `3.3.x` | current production hardening release (mTLS, key rotation, clean `cargo audit`) |
+| `3.2.x` | previous hardening release; upgrade for mTLS/key rotation |
 | `<= 3.1` | no TLS, SHA-256 password hashing, no at-rest payload encryption — do not expose |
 
 Report vulnerabilities privately via the repository security advisory UI or
@@ -26,6 +27,10 @@ before a fix is available.
 * `serve` enables TLS by default. A self-signed localhost certificate
   (`DATA/tls/cert.pem` + `key.pem`) is generated on first start. For a public
   DNS name supply `--tls-cert` / `--tls-key` (for example Let's Encrypt).
+* **Mutual TLS is available**: pass `--tls-client-ca CA.pem` to require a
+  client certificate signed by that CA on both the TCP and HTTPS listeners.
+  `shell` accepts `--tls-client-cert` and `--tls-client-key`. Without a client
+  certificate the TLS 1.3 handshake is terminated before authentication.
 * HTTPS responses include
   `Strict-Transport-Security: max-age=31536000; includeSubDomains`.
 * `--no-tls` exists for local diagnostics and legacy benchmark clients. Never
@@ -103,6 +108,14 @@ before a fix is available.
   3. `DATA/.dna-db.key` — generated with OS CSPRNG on first start.
 * Back up the key **separately** from the data directory. Losing it makes
   values unrecoverable; copying it next to the data defeats the control.
+* **Offline key rotation** is supported by `rotate-key`. It opens the source
+  directory with the old key, copies every live logical row into a fresh
+  directory encrypted with the new key, preserves `users.json`,
+  `security_state.json` and `tls/`, then swaps directories. The old tree is
+  kept as `DATA.pre-rotate-<timestamp>` for rollback. The command is offline:
+  stop the server first, keep the new key outside `DATA`, and delete the
+  rollback tree plus old key after verification. External mirror disks are not
+  migrated automatically; re-seed the mirror after rotation.
 * WAL parity sidecars, SST parity shards, and the mirror contain the same
   ciphertext. Bloom sidecars contain keyed membership bits, not values.
 
@@ -115,10 +128,14 @@ before a fix is available.
   sensitive.
 * Compression happens above the encrypted payload; on-disk sizes reveal
   approximate value sizes.
-* There is no automatic key rotation or re-encryption tool. Rotation requires
-  exporting/importing data under the new key or a future offline migration.
-* There is no client-certificate (mTLS) authentication, per-table ACL, audit
-  log export, or external identity provider integration.
+* Key rotation is an **offline** copy-and-swap operation, not an online
+  re-encryption service. It needs free space for a second copy and RAM for one
+  merged scan of the live key space.
+* There is no per-table ACL, audit-log export, or external identity provider
+  (OIDC/SAML) integration. Roles are global (`admin`, `operator`, `viewer`);
+  use a separate database instance or the network layer when table-level
+  isolation is required. mTLS is transport authentication, not application
+  user identity.
 * A self-signed certificate is not identity verification. Use a real CA and
   pass `--tls-ca` to `shell` (or use a normal HTTPS client) for production.
 * `--no-encryption` and `--no-tls` are explicit, documented escapes, not
@@ -129,21 +146,18 @@ before a fix is available.
 * Single-node only: no replication, no distributed consensus, no protection
   against a malicious root on the host.
 
-## Residual dependency advisories
+## Dependency advisories
 
-`cargo audit` on the v3.2 lockfile reports **no known vulnerabilities**, but
-two warnings remain (the previous `rustls-pemfile` warning was removed with
-the dependency):
+`cargo audit` on the v3.3 lockfile reports **zero vulnerabilities and zero
+warnings**.
 
-| Crate | Advisory | Why it remains |
-|---|---|---|
-| `lru 0.7.8` | RUSTSEC-2026-0253 (unsound; panic safety in `LruCache::pop`) | transitive dependency of `reed-solomon-erasure 6.0`; the release profile uses `panic = "abort"`, and the affected cache is not on an unwind path we control. Track upstream. |
-| `instant 0.1.13` | RUSTSEC-2024-0384 (unmaintained) | transitive through the same Reed–Solomon crate. |
-| `rustls-pemfile 2.2.0` | RUSTSEC-2025-0134 (unmaintained) | removed in v3.2 in favour of `rustls-pki-types` PEM parsing; the lockfile no longer contains it. |
-
-The `lru`/`instant` warnings are tracked as residual supply-chain risk, not
-silently ignored. A future replacement of the Reed–Solomon dependency or a
-patched upstream release is the correct fix.
+The former `lru 0.7.8` and `instant 0.1.13` warnings came transitively through
+`reed-solomon-erasure 6.0.0`. The crate is now built from a vendored,
+byte-compatible copy (`vendor/reed-solomon-erasure`) that keeps the same
+GF(2^8) codec and on-disk parity format but upgrades `lru` to 0.19 and
+`parking_lot` to 0.12. Existing WAL/SST parity and self-healing sidecars remain
+readable; the change is covered by the full test suite and the rotation smoke
+test. The vendored crate retains its upstream MIT license.
 
 ## Operational checklist
 
@@ -154,5 +168,10 @@ patched upstream release is the correct fix.
 4. Keep `--bind` loopback unless a firewall and TLS are in place.
 5. Back up `DATA`, the key, and `users.json`; test restore.
 6. Monitor `security_state.json` growth and repeated lockout messages.
-7. Run `cargo audit` and `cargo test` on every upgrade.
-8. Remember: encryption protects values, not key names or traffic metadata.
+7. For high-assurance deployments, enable mTLS (`--tls-client-ca`) and keep
+   the client CA private key offline.
+8. Rotate payload keys with the server stopped:
+   `dna-db-core rotate-key --data-dir DATA --new-key-file /secure/new.key`.
+   Verify the server, then delete the `DATA.pre-rotate-*` tree and old key.
+9. Run `cargo audit` and `cargo test` on every upgrade.
+10. Remember: encryption protects values, not key names or traffic metadata.

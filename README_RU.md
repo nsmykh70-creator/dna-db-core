@@ -1,20 +1,23 @@
-# DNA-DB Core v3.2 «Paneldb Security» (production hardening)
+# DNA-DB Core v3.3 «Paneldb Security» (production hardening)
 
 > **English:** [README.md](README.md) · здесь — [русская версия](README_RU.md)
 
 Высокопроизводительный встраиваемый и клиент-серверный движок баз данных на Rust с архитектурой LSM-Tree, 2-битной компрессией нуклеотидов, двухнитевым зеркалированием дисков, языком **DnaQL**, **полноценным SQL-подмножеством** (агрегаты, GROUP BY/HAVING, ORDER BY, IN/подзапросы, **secondary- и диапазонные индексы**), встроенной **веб-панелью управления** (phpMyAdmin-подобной) и самовосстановлением при повреждении секторов.
 
-## 0.2. Production-безопасность (v3.2)
+## 0.2. Production-безопасность (v3.3)
 
 | Контроль | Реализация |
 |---|---|
 | Транспорт | **rustls TLS 1.2/1.3 на обоих слушателях** (бинарный TCP-протокол и HTTPS-панель), HSTS для HTTPS, plaintext на TLS-порт не принимается |
 | Сертификаты | пара PEM через `--tls-cert/--tls-key`; при первом старте генерируется self-signed сертификат для localhost в `DATA/tls/` (только для разработки) |
+| Mutual TLS | `--tls-client-ca CA.pem` требует клиентский сертификат, подписанный этим CA, на TCP и HTTPS; в shell — `--tls-client-cert/--tls-client-key` |
 | Пароли | **Argon2id** PHC-хеши в `DATA/users.json`, соль на пользователя, выравнивание времени для несуществующих пользователей |
 | Пользователи | bootstrap `admin` / `password`, затем создание/отключение/удаление пользователей и сброс/смена пароля в панели; роли `admin`, `operator`, `viewer`; последнего активного администратора удалить нельзя |
 | Сессии | 256-битные CSPRNG bearer-токены, TTL 12 ч, отзыв при смене пароля/отключении |
 | Brute force | персистентный **lockout по IP и по логину** (5 ошибок / 60 с), глобальный throttle, последовательный Argon2 (ограниченная память) |
 | Шифрование at rest | XChaCha20-Poly1305 AEAD для значения до записи в WAL/SST/зеркало; ключ из `DNA_DB_ENCRYPTION_KEY`, `--encryption-key-file` или `DATA/.dna-db.key`; старые plaintext-строки читаются |
+| Ротация ключа | offline `rotate-key` копирует все живые строки в новый каталог с новым ключом, сохраняет users/TLS и оставляет rollback-копию |
+| Supply chain | `cargo audit` чист (0 уязвимостей, 0 warning); vendored byte-compatible Reed–Solomon убирает `lru`/`instant` advisories |
 | Защита панели | CSP с SHA-256-хешем inline-скрипта SPA (без `unsafe-inline` для скриптов), `X-Frame-Options: DENY`, `nosniff`, `no-referrer`, ограничивающий `Permissions-Policy` |
 | Pre-auth DoS | лимит pre-auth кадра 64 KiB (вместо 128 × 16 MiB), 10 с таймаут до аутентификации, 64 одновременных соединения панели, 128 TCP-соединений |
 | Bind | по умолчанию loopback (`127.0.0.1`); публикация — только явный `--bind` |
@@ -31,8 +34,20 @@
   --tls-key  /etc/letsencrypt/live/db.example/privkey.pem \
   --admin-pass 'change-me-now'
 
+# mutual TLS (TCP + панель):
+./target/release/dna-db-core serve --data-dir ./dna_data \
+  --tls-cert server.pem --tls-key server.key --tls-client-ca clients-ca.pem
+
 # shell по TLS к локальному self-signed серверу:
 ./target/release/dna-db-core shell --tls-ca ./dna_data/tls/cert.pem
+
+# mTLS shell:
+./target/release/dna-db-core shell --tls-ca ca.pem \
+  --tls-client-cert client.pem --tls-client-key client.key
+
+# offline-ротация ключа (сервер остановлен; новый ключ — вне DATA):
+./target/release/dna-db-core rotate-key \
+  --data-dir ./dna_data --new-key-file /secure/dna-new.key
 
 # только для локальной диагностики (не на недоверенной сети):
 #   --no-tls   --no-encryption
@@ -41,8 +56,9 @@
 > **Храните ключ шифрования отдельно от каталога данных.** Без ключа значения
 > не восстановить. Ключи записей и их количество остаются видимыми в WAL/SST
 > by design; AEAD защищает значения приложения, а не ключевое пространство LSM.
-> Модель угроз, чек-лист эксплуатации и остаточные `cargo audit`-предупреждения
-> — в [SECURITY.md](SECURITY.md) и [SECURITY_RU.md](SECURITY_RU.md).
+> Per-table ACL и внешнего IdP нет; роли глобальные. Модель угроз, процедура
+> ротации и остаточные ограничения — в [SECURITY.md](SECURITY.md) и
+> [SECURITY_RU.md](SECURITY_RU.md).
 
 ## 0.1. Новое в v3.1 — SQL и веб-панель
 

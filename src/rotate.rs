@@ -1,0 +1,297 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//! Offline encryption-key rotation.
+//!
+//! Rotation never rewrites SST/WAL bytes in place. It opens the existing
+//! database read-only with the old key, copies every live logical row into a
+//! fresh directory using the new key, copies the non-database sidecars
+//! (`users.json`, `security_state.json`, `tls/`) and finally swaps the
+//! directories. The old directory is retained as
+//! `<data-dir>.pre-rotate-<timestamp>` for rollback; delete it together with
+//! the old key after verification.
+//!
+//! This also handles a historical plaintext database (`old_crypto=None`):
+//! every row is read as plaintext and written encrypted with the new key.
+//!
+//! The operation is offline. It must not run while a server has the directory
+//! open. Allocation is proportional to the number of live logical rows because
+//! the engine exposes a merged scan, not a streaming iterator; the documented
+//! rotation procedure therefore requires free RAM for one copy of the logical
+//! dataset.
+
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use crate::crypto::Crypto;
+use crate::engine::{Engine, EngineConfig};
+use crate::repair::RepairPolicy;
+use crate::wal::{SyncMode, WalOp};
+
+pub struct RotateOptions {
+    pub memtable_capacity: usize,
+    pub erasure_k: usize,
+    pub erasure_m: usize,
+    pub wal_segment_capacity: u64,
+}
+
+impl Default for RotateOptions {
+    fn default() -> Self {
+        Self {
+            memtable_capacity: 8 * 1024 * 1024,
+            erasure_k: 4,
+            erasure_m: 2,
+            wal_segment_capacity: 64 * 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct RotateReport {
+    pub keys: usize,
+    pub plaintext_bytes: u64,
+    pub backup_dir: PathBuf,
+    pub new_fingerprint: String,
+}
+
+fn engine_config(dir: &Path, crypto: Option<Arc<Crypto>>, options: &RotateOptions) -> EngineConfig {
+    EngineConfig {
+        dir_path: dir.to_path_buf(),
+        memtable_capacity: options.memtable_capacity,
+        sync_mode: SyncMode::Strict,
+        mirror_disk_path: None,
+        erasure_k: options.erasure_k,
+        erasure_m: options.erasure_m,
+        repair_policy: RepairPolicy::RepairOnRead,
+        scrub: None,
+        wal_segment_capacity: options.wal_segment_capacity,
+        crypto,
+    }
+}
+
+/// Rotate the payload key of an offline data directory.
+pub fn rotate_key(
+    data_dir: &Path,
+    old_crypto: Option<Arc<Crypto>>,
+    new_crypto: Arc<Crypto>,
+    options: RotateOptions,
+) -> io::Result<RotateReport> {
+    if !data_dir.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("data directory {:?} does not exist", data_dir),
+        ));
+    }
+
+    if let (Some(old), new) = (&old_crypto, &new_crypto) {
+        if old.fingerprint() == new.fingerprint() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "old and new encryption keys are identical",
+            ));
+        }
+    }
+
+    let parent = data_dir
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = data_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("dna_data");
+    let stamp = format!(
+        "{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let staging = parent.join(format!(".{name}.rotate-{stamp}"));
+    let backup = parent.join(format!("{name}.pre-rotate-{stamp}"));
+    if staging.exists() || backup.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "rotation staging/backup directory already exists",
+        ));
+    }
+    fs::create_dir(&staging)?;
+
+    let result = (|| -> io::Result<(usize, u64)> {
+        let old_was_plaintext = old_crypto.is_none();
+        let old = Engine::open(engine_config(data_dir, old_crypto, &options))?;
+        let new = Engine::open(engine_config(&staging, Some(new_crypto.clone()), &options))?;
+
+        // A merged scan returns every live logical row, including schemas,
+        // indexes and user tables. Writing through write_batch produces one
+        // WAL fsync per chunk and re-encrypts each value with the new key.
+        let rows = old.scan_prefix(b"")?;
+        if old_was_plaintext && rows.iter().any(|(_, value)| value.starts_with(b"DNAE1")) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "database contains encrypted values but no old key was supplied; \
+                 pass --old-key-file or DNA_DB_ENCRYPTION_KEY",
+            ));
+        }
+        let mut keys = 0usize;
+        let mut plaintext_bytes = 0u64;
+        for chunk in rows.chunks(1000) {
+            let ops: Vec<(WalOp, Vec<u8>, Option<Vec<u8>>)> = chunk
+                .iter()
+                .map(|(key, value)| {
+                    keys += 1;
+                    plaintext_bytes += (key.len() + value.len()) as u64;
+                    (WalOp::Put, key.clone(), Some(value.clone()))
+                })
+                .collect();
+            if !ops.is_empty() {
+                new.write_batch(&ops)?;
+            }
+        }
+        new.flush()?;
+        new.checkpoint()?;
+        drop(new);
+        drop(old);
+        Ok((keys, plaintext_bytes))
+    })();
+
+    let (keys, plaintext_bytes) = match result {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(e);
+        }
+    };
+
+    // Non-database state is intentionally kept in the same directory by the
+    // server. Copy it into the new tree before the atomic directory swap.
+    for file in ["users.json", "security_state.json"] {
+        let src = data_dir.join(file);
+        if src.is_file() {
+            fs::copy(&src, staging.join(file))?;
+        }
+    }
+    let tls_src = data_dir.join("tls");
+    if tls_src.is_dir() {
+        copy_dir_all(&tls_src, &staging.join("tls"))?;
+    }
+
+    if let Err(e) = fs::rename(data_dir, &backup) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(e);
+    }
+    if let Err(e) = fs::rename(&staging, data_dir) {
+        // Best-effort rollback: put the untouched original back.
+        let _ = fs::rename(&backup, data_dir);
+        let _ = fs::remove_dir_all(&staging);
+        return Err(e);
+    }
+
+    Ok(RotateReport {
+        keys,
+        plaintext_bytes,
+        backup_dir: backup,
+        new_fingerprint: new_crypto.fingerprint(),
+    })
+}
+
+fn copy_dir_all(src: &Path, dst: &Path) -> io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let target = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_all(&entry.path(), &target)?;
+        } else if ty.is_file() {
+            fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "dna_rotate_{tag}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn rotates_payload_and_preserves_rows() {
+        let dir = temp_dir("ok");
+        let old = Arc::new(Crypto::from_key([7u8; 32]));
+        let new = Arc::new(Crypto::from_key([9u8; 32]));
+        {
+            let engine = Engine::open(engine_config(
+                &dir,
+                Some(old.clone()),
+                &RotateOptions::default(),
+            ))
+            .unwrap();
+            engine.put(b"chr1:1", b"secret-A").unwrap();
+            engine.put(b"chr1:2", b"secret-B").unwrap();
+            engine.put(b"index:chr1", b"idx").unwrap();
+            engine.flush().unwrap();
+            engine.checkpoint().unwrap();
+        }
+
+        let report = rotate_key(
+            &dir,
+            Some(old.clone()),
+            new.clone(),
+            RotateOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(report.keys, 3);
+        assert!(report.backup_dir.is_dir());
+
+        let engine = Engine::open(engine_config(
+            &dir,
+            Some(new.clone()),
+            &RotateOptions::default(),
+        ))
+        .unwrap();
+        assert_eq!(
+            engine.get(b"chr1:1").unwrap().as_deref(),
+            Some(b"secret-A".as_slice())
+        );
+        assert_eq!(
+            engine.get(b"chr1:2").unwrap().as_deref(),
+            Some(b"secret-B".as_slice())
+        );
+        assert!(engine.get(b"missing").unwrap().is_none());
+        drop(engine);
+
+        let old_engine = Engine::open(engine_config(&dir, Some(old), &RotateOptions::default()));
+        // The new envelopes are authenticated with the new key; opening with
+        // the old key must fail on read, not return garbage.
+        if let Ok(old_engine) = old_engine {
+            assert!(old_engine.get(b"chr1:1").is_err());
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&report.backup_dir);
+    }
+
+    #[test]
+    fn rejects_same_key() {
+        let dir = temp_dir("same");
+        let key = Arc::new(Crypto::from_key([1u8; 32]));
+        let err = rotate_key(&dir, Some(key.clone()), key, RotateOptions::default()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

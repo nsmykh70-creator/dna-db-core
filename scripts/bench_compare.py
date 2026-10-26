@@ -28,6 +28,7 @@ import os
 import random
 import shutil
 import socket
+import ssl
 import statistics
 import struct
 import subprocess
@@ -44,9 +45,17 @@ PROJECT = os.path.dirname(HERE)
 # ---------------------------------------------------------------------------
 
 class DnaDbClient:
-    def __init__(self, host, port, user, password):
-        self.sock = socket.create_connection((host, port), timeout=120)
-        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    def __init__(self, host, port, user, password, cafile=None,
+                 certfile=None, keyfile=None):
+        raw = socket.create_connection((host, port), timeout=120)
+        raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        if cafile:
+            ctx = ssl.create_default_context(cafile=cafile)
+            if certfile:
+                ctx.load_cert_chain(certfile, keyfile)
+            self.sock = ctx.wrap_socket(raw, server_hostname=host)
+        else:
+            self.sock = raw
         self._send(b"\x01" + user.encode() + b":" + password.encode())
         if self._recv_exact(2) != b"OK":
             raise RuntimeError("DNA-DB auth failed")
@@ -110,21 +119,25 @@ def free_port():
 
 
 class Server:
-    def __init__(self, data_dir, port):
+    def __init__(self, data_dir, port, tls=False, encryption=False):
         self.port = port
+        self.tls = tls
+        self.cert_path = os.path.join(data_dir, "tls", "cert.pem") if tls else None
         self.log_path = os.path.join(tempfile.gettempdir(), "dna_bench_srv.log")
         self.log = open(self.log_path, "ab")
-        self.proc = subprocess.Popen(
-            [find_binary(), "serve",
-             "--data-dir", data_dir,
-             "--port", str(port),
-             "--bind", "127.0.0.1",
-             "--admin-pass", "bench-pass",
-             "--sync", "strict",
-             "--no-scrub",
-             "--no-tls",
-             "--no-encryption"],
-            stdout=self.log, stderr=self.log, cwd=PROJECT)
+        cmd = [find_binary(), "serve",
+               "--data-dir", data_dir,
+               "--port", str(port),
+               "--bind", "127.0.0.1",
+               "--admin-pass", "bench-pass",
+               "--sync", "strict",
+               "--no-scrub"]
+        if not tls:
+            cmd.append("--no-tls")
+        if not encryption:
+            cmd.append("--no-encryption")
+        self.proc = subprocess.Popen(cmd, stdout=self.log, stderr=self.log,
+                                     cwd=PROJECT)
 
     def wait_ready(self, timeout=30):
         deadline = time.time() + timeout
@@ -132,7 +145,8 @@ class Server:
             if self.proc.poll() is not None:
                 raise RuntimeError("DNA-DB died on startup, see %s" % self.log_path)
             try:
-                DnaDbClient("127.0.0.1", self.port, "admin", "bench-pass").close()
+                DnaDbClient("127.0.0.1", self.port, "admin", "bench-pass",
+                            cafile=self.cert_path).close()
                 return
             except OSError:
                 time.sleep(0.05)
@@ -271,14 +285,17 @@ def run_batch(n_rows, batch_size, put_batch):
 # ---------------------------------------------------------------------------
 
 class DnaDbAdapter:
-    name = "DNA-DB v3.0"
-    version = "dna-db-core 3.0.0 (strict fsync)"
+    name = "DNA-DB v3.3"
 
-    def __init__(self, port):
+    def __init__(self, port, cafile=None, mode="legacy"):
         self.port = port
+        self.cafile = cafile
+        self.mode = mode
+        self.version = ("dna-db-core 3.3.0 (%s, strict fsync)" % mode)
 
     def connect(self):
-        return DnaDbClient("127.0.0.1", self.port, "admin", "bench-pass")
+        return DnaDbClient("127.0.0.1", self.port, "admin", "bench-pass",
+                           cafile=self.cafile)
 
     def setup(self):
         # fresh server, fresh storage — only the SQL demo tables need creating
@@ -931,6 +948,12 @@ def main():
         PROJECT, "docs", "bench_compare_results.json"))
     ap.add_argument("--skip-dnadb", action="store_true")
     ap.add_argument("--skip-sql", action="store_true")
+    ap.add_argument("--only-dnadb", action="store_true",
+                    help="run DNA-DB phases only (skip MySQL/PostgreSQL)")
+    ap.add_argument("--dnadb-tls", action="store_true",
+                    help="run DNA-DB with TLS (production path)")
+    ap.add_argument("--dnadb-encryption", action="store_true",
+                    help="run DNA-DB with at-rest AEAD encryption")
     args = ap.parse_args()
     seed_base = 777
 
@@ -945,7 +968,9 @@ def main():
                        "batch_rows": args.batch_rows,
                        "batch_size": args.batch_size},
             "durability": {
-                "dnadb": "--sync strict (fsync WAL per ack)",
+                "dnadb": "--sync strict (fsync WAL per ack)" +
+                         ("; TLS" if args.dnadb_tls else "; cleartext") +
+                         ("; AEAD at rest" if args.dnadb_encryption else "; no encryption"),
                 "mysql": "innodb_flush_log_at_trx_commit=1 (default)",
                 "postgres": "synchronous_commit=on (default)",
             },
@@ -957,10 +982,14 @@ def main():
     if not args.skip_dnadb:
         port = free_port()
         data_dir = tempfile.mkdtemp(prefix="dna_bench_")
-        srv = Server(data_dir, port)
+        srv = Server(data_dir, port, tls=args.dnadb_tls,
+                     encryption=args.dnadb_encryption)
         try:
             srv.wait_ready()
-            ad = DnaDbAdapter(port)
+            mode = ("TLS+AEAD" if args.dnadb_tls and args.dnadb_encryption
+                    else "TLS" if args.dnadb_tls
+                    else "AEAD" if args.dnadb_encryption else "legacy")
+            ad = DnaDbAdapter(port, cafile=srv.cert_path, mode=mode)
             results["systems"]["dnadb"] = {"name": ad.name, "version": ad.version}
             run_adapter(ad, args, results["systems"]["dnadb"])
             ad.close()
@@ -968,6 +997,11 @@ def main():
         finally:
             srv.stop()
             shutil.rmtree(data_dir, ignore_errors=True)
+
+    if args.only_dnadb:
+        dump_json(args.json_out, results)
+        print("\nJSON report: %s" % args.json_out)
+        return
 
     # MySQL
     ad = MySqlAdapter()

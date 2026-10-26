@@ -1,6 +1,6 @@
 [package]
 name = "dna-db-core"
-version = "3.2.0"
+version = "3.3.0"
 edition = "2021"
 authors = ["DNA-DB Engineering Team"]
 description = "High-performance LSM storage engine with 2-bit DNA packing, dual-strand hot-swap, DnaQL/SQL, TLS, Argon2id auth and encryption at rest"
@@ -29,6 +29,12 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-pki-types = { version = "1", features = ["std"] }
 webpki-roots = "1"
 rcgen = "0.13"
+
+[patch.crates-io]
+# Kept byte-compatible with reed-solomon-erasure 6.0.0 (WAL/SST parity from
+# older releases must remain readable).  The local copy only upgrades lru and
+# parking_lot to remove RUSTSEC-2026-0253 / RUSTSEC-2024-0384 from the tree.
+reed-solomon-erasure = { path = "vendor/reed-solomon-erasure" }
 
 [profile.release]
 opt-level = 3

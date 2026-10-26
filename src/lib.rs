@@ -29,6 +29,7 @@ pub mod protocol;
 pub mod reed_solomon;
 pub mod relational;
 pub mod repair;
+pub mod rotate;
 pub mod segment;
 pub mod segment_block;
 pub mod server;

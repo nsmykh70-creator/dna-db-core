@@ -41,7 +41,7 @@ impl SyncArg {
 #[command(
     name = "dna-db-core",
     version,
-    about = "DNA-DB: genomic-relational LSM storage engine with self-healing, TLS and encryption at rest (v3.2)"
+    about = "DNA-DB: genomic-relational LSM storage engine with self-healing, TLS and encryption at rest (v3.3)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -76,6 +76,9 @@ enum Command {
         /// PEM private key (required together with --tls-cert)
         #[arg(long)]
         tls_key: Option<String>,
+        /// Require client certificates signed by this PEM CA (mutual TLS)
+        #[arg(long)]
+        tls_client_ca: Option<String>,
         /// Disable payload encryption at rest (not recommended)
         #[arg(long, default_value_t = false)]
         no_encryption: bool,
@@ -136,6 +139,12 @@ enum Command {
         /// PEM CA/certificate for a private or self-signed server
         #[arg(long)]
         tls_ca: Option<String>,
+        /// PEM client certificate chain (for mutual TLS)
+        #[arg(long)]
+        tls_client_cert: Option<String>,
+        /// PEM client private key (required together with --tls-client-cert)
+        #[arg(long)]
+        tls_client_key: Option<String>,
     },
     /// Offline genome health check: scan / repair / migrate segments
     Doctor {
@@ -170,6 +179,26 @@ enum Command {
         #[arg(long)]
         sql: Option<String>,
     },
+    /// Offline payload-key rotation (re-encrypts every logical row)
+    #[command(name = "rotate-key")]
+    RotateKey {
+        #[arg(long, default_value = "./dna_data")]
+        data_dir: String,
+        /// Old key file (default: DATA/.dna-db.key or DNA_DB_ENCRYPTION_KEY)
+        #[arg(long)]
+        old_key_file: Option<String>,
+        /// New key file; generated when absent. Must be outside DATA.
+        #[arg(long)]
+        new_key_file: String,
+        #[arg(long, default_value_t = 8)]
+        memtable_mb: usize,
+        #[arg(long, default_value_t = 4)]
+        erasure_k: usize,
+        #[arg(long, default_value_t = 2)]
+        erasure_m: usize,
+        #[arg(long, default_value_t = 64)]
+        wal_rotate_mb: u64,
+    },
 }
 
 fn sync_arg_to_mode(mode: &SyncArg) -> SyncMode {
@@ -189,6 +218,7 @@ fn main() {
             no_tls,
             tls_cert,
             tls_key,
+            tls_client_ca,
             no_encryption,
             encryption_key_file,
             sync,
@@ -234,6 +264,7 @@ fn main() {
                 *no_tls,
                 tls_cert.as_deref(),
                 tls_key.as_deref(),
+                tls_client_ca.as_deref(),
                 *no_encryption,
                 encryption_key_file.as_deref(),
             )
@@ -246,12 +277,23 @@ fn main() {
             pass,
             no_tls,
             tls_ca,
+            tls_client_cert,
+            tls_client_key,
         } => {
             let pass = pass
                 .clone()
                 .or_else(|| std::env::var("DNA_DB_ADMIN_PASS").ok())
                 .unwrap_or_else(|| "password".to_string());
-            run_shell(host, *port, user, &pass, *no_tls, tls_ca.as_deref())
+            run_shell(
+                host,
+                *port,
+                user,
+                &pass,
+                *no_tls,
+                tls_ca.as_deref(),
+                tls_client_cert.as_deref(),
+                tls_client_key.as_deref(),
+            )
         }
         Command::Doctor {
             data_dir,
@@ -271,6 +313,23 @@ fn main() {
             *erasure_m,
         ),
         Command::Sql2Dnaql { data_dir, sql } => run_sql2dnaql(data_dir, sql.as_deref()),
+        Command::RotateKey {
+            data_dir,
+            old_key_file,
+            new_key_file,
+            memtable_mb,
+            erasure_k,
+            erasure_m,
+            wal_rotate_mb,
+        } => run_rotate_key(
+            data_dir,
+            old_key_file.as_deref(),
+            new_key_file,
+            *memtable_mb,
+            *erasure_k,
+            *erasure_m,
+            *wal_rotate_mb,
+        ),
     };
     std::process::exit(code);
 }
@@ -350,6 +409,7 @@ fn run_server(
     no_tls: bool,
     tls_cert: Option<&str>,
     tls_key: Option<&str>,
+    tls_client_ca: Option<&str>,
     no_encryption: bool,
     encryption_key_file: Option<&str>,
 ) -> i32 {
@@ -402,6 +462,7 @@ fn run_server(
             data_path,
             tls_cert.map(std::path::Path::new),
             tls_key.map(std::path::Path::new),
+            tls_client_ca.map(std::path::Path::new),
         ) {
             Ok(tls) => Some(tls),
             Err(e) => {
@@ -801,6 +862,99 @@ fn run_bench(data_dir: &str, ops: usize) -> i32 {
 }
 
 /// Offline doctor: scan / fix / migrate (P5.1).
+#[allow(clippy::too_many_arguments)]
+fn run_rotate_key(
+    data_dir: &str,
+    old_key_file: Option<&str>,
+    new_key_file: &str,
+    memtable_mb: usize,
+    erasure_k: usize,
+    erasure_m: usize,
+    wal_rotate_mb: u64,
+) -> i32 {
+    let data_path = std::path::Path::new(data_dir);
+    let data_abs = match std::fs::canonicalize(data_path) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[FATAL] cannot resolve data directory {:?}: {e}", data_path);
+            return 2;
+        }
+    };
+    let new_path = std::path::Path::new(new_key_file);
+    let new_parent = new_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let new_abs = match std::fs::canonicalize(new_parent) {
+        Ok(p) => p.join(new_path.file_name().unwrap_or_default()),
+        Err(e) => {
+            eprintln!("[FATAL] cannot resolve new key directory {new_parent:?}: {e}");
+            return 2;
+        }
+    };
+    if new_abs.starts_with(&data_abs) {
+        eprintln!(
+            "[FATAL] --new-key-file must be outside the data directory; \
+             keep key material separate from ciphertext"
+        );
+        return 2;
+    }
+
+    let old_crypto = match dna_db_core::crypto::Crypto::load_existing(
+        data_path,
+        old_key_file.map(std::path::Path::new),
+    ) {
+        Ok(crypto) => crypto,
+        Err(e) => {
+            eprintln!("[FATAL] cannot load old encryption key: {e}");
+            return 2;
+        }
+    };
+    match &old_crypto {
+        Some(crypto) => eprintln!("[ROTATE] old key fingerprint {}", crypto.fingerprint()),
+        None => eprintln!("[ROTATE] no old key found; treating the source as plaintext"),
+    }
+
+    let (new_crypto, created) = match dna_db_core::crypto::Crypto::load_or_create_key_file(new_path)
+    {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[FATAL] cannot load/create new key: {e}");
+            return 2;
+        }
+    };
+    eprintln!(
+        "[ROTATE] new key {} at {:?}",
+        if created { "generated" } else { "loaded" },
+        new_path
+    );
+
+    let options = dna_db_core::rotate::RotateOptions {
+        memtable_capacity: memtable_mb * 1024 * 1024,
+        erasure_k,
+        erasure_m,
+        wal_segment_capacity: wal_rotate_mb * 1024 * 1024,
+    };
+    match dna_db_core::rotate::rotate_key(data_path, old_crypto, new_crypto, options) {
+        Ok(report) => {
+            println!(
+                "[ROTATE] complete: {} live keys, {} plaintext bytes; new fingerprint {}",
+                report.keys, report.plaintext_bytes, report.new_fingerprint
+            );
+            println!("[ROTATE] rollback copy: {:?}", report.backup_dir);
+            println!("[ROTATE] verify the server, then delete the rollback copy and the old key");
+            0
+        }
+        Err(e) => {
+            if created {
+                let _ = std::fs::remove_file(new_path);
+            }
+            eprintln!("[FATAL] key rotation failed: {e}");
+            1
+        }
+    }
+}
+
 fn run_doctor(
     data_dir: &str,
     mirror_dir: Option<&str>,
@@ -1005,9 +1159,11 @@ fn shell_connect(
     port: u16,
     no_tls: bool,
     tls_ca: Option<&str>,
+    tls_client_cert: Option<&str>,
+    tls_client_key: Option<&str>,
 ) -> std::io::Result<ShellStream> {
     use rustls::pki_types::pem::PemObject;
-    use rustls::pki_types::{CertificateDer, ServerName};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 
     let tcp = std::net::TcpStream::connect((host, port))?;
     tcp.set_nodelay(true).ok();
@@ -1025,9 +1181,30 @@ fn shell_connect(
     } else {
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     }
-    let config = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    let builder = rustls::ClientConfig::builder().with_root_certificates(roots);
+    let config = match (tls_client_cert, tls_client_key) {
+        (Some(cert_path), Some(key_path)) => {
+            let certs = CertificateDer::pem_file_iter(cert_path)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
+                })?;
+            let key = PrivateKeyDer::from_pem_file(key_path).map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
+            })?;
+            builder
+                .with_client_auth_cert(certs, key)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?
+        }
+        (None, None) => builder.with_no_client_auth(),
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "--tls-client-cert and --tls-client-key must be supplied together",
+            ))
+        }
+    };
     let server_name = match host.parse::<std::net::IpAddr>() {
         Ok(ip) => ServerName::IpAddress(ip.into()),
         Err(_) => ServerName::try_from(host.to_string())
@@ -1047,14 +1224,17 @@ fn run_shell(
     pass: &str,
     no_tls: bool,
     tls_ca: Option<&str>,
+    tls_client_cert: Option<&str>,
+    tls_client_key: Option<&str>,
 ) -> i32 {
-    let mut stream = match shell_connect(host, port, no_tls, tls_ca) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("cannot connect to {}:{}: {}", host, port, e);
-            return 1;
-        }
-    };
+    let mut stream =
+        match shell_connect(host, port, no_tls, tls_ca, tls_client_cert, tls_client_key) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("cannot connect to {}:{}: {}", host, port, e);
+                return 1;
+            }
+        };
 
     // Auth
     let msg = format!("\x01{}:{}", user, pass);

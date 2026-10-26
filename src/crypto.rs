@@ -49,6 +49,26 @@ impl Crypto {
         Self { key }
     }
 
+    /// Load a key file, creating a new 32-byte key when the file is absent.
+    ///
+    /// This deliberately ignores `DNA_DB_ENCRYPTION_KEY`: it is used by the
+    /// offline key-rotation command, where the environment normally still
+    /// contains the *old* key.
+    pub fn load_or_create_key_file(path: &Path) -> io::Result<(Arc<Self>, bool)> {
+        if path.exists() {
+            return Ok((Arc::new(Self::from_key(read_key_file(path)?)), false));
+        }
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let mut key = [0u8; KEY_LEN];
+        OsRng.fill_bytes(&mut key);
+        write_key_file(path, &key)?;
+        Ok((Arc::new(Self::from_key(key)), true))
+    }
+
     /// Load the master key, creating a development key file when none exists.
     pub fn load_or_create(data_dir: &Path, key_file: Option<&Path>) -> io::Result<Arc<Self>> {
         if let Ok(value) = std::env::var("DNA_DB_ENCRYPTION_KEY") {

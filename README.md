@@ -1,20 +1,23 @@
-# DNA-DB Core v3.2 «Paneldb Security» (production hardening)
+# DNA-DB Core v3.3 «Paneldb Security» (production hardening)
 
 > This repository is bilingual: **English** (this file) · [Русский](README_RU.md)
 
 A high-performance embeddable and client/server database engine written in Rust, featuring an LSM-Tree architecture, 2-bit nucleotide compression, dual-strand disk mirroring, the **DnaQL** query language, a **full SQL subset** (aggregates, GROUP BY/HAVING, ORDER BY, IN/subqueries, **secondary and range indexes**), a built-in **web admin panel** (phpMyAdmin-style) and self-healing on sector corruption.
 
-## 0.2. Production security (v3.2)
+## 0.2. Production security (v3.3)
 
 | Control | Implementation |
 |---|---|
 | Transport | **rustls TLS 1.2/1.3 on both listeners** (binary TCP protocol and HTTPS panel), HSTS on HTTPS, no plaintext fallback on the TLS port |
 | Certificates | `--tls-cert/--tls-key` PEM pair; a self-signed localhost pair is generated under `DATA/tls/` on first start (development only) |
+| Mutual TLS | `--tls-client-ca CA.pem` requires a CA-signed client certificate on TCP and HTTPS; `shell --tls-client-cert/--tls-client-key` for the CLI |
 | Passwords | **Argon2id** PHC hashes in `DATA/users.json`, per-user salt, timing-equalised unknown users |
 | Users | bootstrap `admin` / `password`, then create/disable/delete users and reset/change passwords in the panel; roles `admin`, `operator`, `viewer`; the last active admin cannot be removed |
 | Sessions | 256-bit CSPRNG bearer tokens, 12 h TTL, revoked on password change/disable |
 | Brute force | persistent **per-IP and per-username lockout** (5 failures / 60 s), global failure throttle, serialised Argon2 (bounded memory) |
 | Encryption at rest | XChaCha20-Poly1305 AEAD per value before WAL/SST/mirror writes; key from `DNA_DB_ENCRYPTION_KEY`, `--encryption-key-file` or `DATA/.dna-db.key`; legacy plaintext rows remain readable |
+| Key rotation | offline `rotate-key` copy-and-swap re-encrypts every live row under a new key and preserves users/TLS state; rollback tree is retained |
+| Supply chain | `cargo audit` clean (0 vulnerabilities, 0 warnings); vendored byte-compatible Reed–Solomon crate removes the `lru`/`instant` advisories |
 | Panel hardening | CSP with SHA-256 hash for the inline SPA script (no `unsafe-inline` for scripts), `X-Frame-Options: DENY`, `nosniff`, `no-referrer`, restrictive `Permissions-Policy` |
 | Pre-auth DoS | 64 KiB pre-auth frame cap (instead of 128 × 16 MiB allocation), 10 s pre-auth read timeout, 64 concurrent panel connections, 128 TCP connections |
 | Bind | loopback (`127.0.0.1`) by default; public exposure is an explicit `--bind` decision |
@@ -31,8 +34,20 @@ A high-performance embeddable and client/server database engine written in Rust,
   --tls-key  /etc/letsencrypt/live/db.example/privkey.pem \
   --admin-pass 'change-me-now'
 
+# mutual TLS (TCP + panel):
+./target/release/dna-db-core serve --data-dir ./dna_data \
+  --tls-cert server.pem --tls-key server.key --tls-client-ca clients-ca.pem
+
 # shell over TLS against a self-signed local server:
 ./target/release/dna-db-core shell --tls-ca ./dna_data/tls/cert.pem
+
+# mTLS shell:
+./target/release/dna-db-core shell --tls-ca ca.pem \
+  --tls-client-cert client.pem --tls-client-key client.key
+
+# offline key rotation (stop the server first; keep the new key outside DATA):
+./target/release/dna-db-core rotate-key \
+  --data-dir ./dna_data --new-key-file /secure/dna-new.key
 
 # development-only escapes (never on an untrusted network):
 #   --no-tls   --no-encryption
@@ -41,8 +56,9 @@ A high-performance embeddable and client/server database engine written in Rust,
 > **Back up the encryption key separately from the data directory.** Without the
 > key the values are unrecoverable. Record keys and row counts remain visible
 > in WAL/SST indexes by design; the AEAD envelope protects application values,
-> not the LSM key space. See [SECURITY.md](SECURITY.md) for the threat model,
-> operational checklist and residual `cargo audit` warnings.
+> not the LSM key space. There is no per-table ACL or external IdP; roles are
+> global. See [SECURITY.md](SECURITY.md) for the threat model, rotation
+> procedure and residual limitations.
 
 ## 0.1. What's new in v3.1 — SQL and the web panel
 
