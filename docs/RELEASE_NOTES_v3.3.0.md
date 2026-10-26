@@ -92,6 +92,6 @@ dna-db-core rotate-key \
 ## ?????????
 
 - `dna-db-core-v3.3.0-windows-x86_64.zip`
-- SHA-256: `b3bb8c5d0a4d0fd699a8085b658e1fc3476f0fb838c464ea945bcdd2072e5024`
+- SHA-256: `12eb25289da4aa7e3d4b11071b07655b71c3c1028c7801d1870257a992689269`
 - `BENCHMARK_REPORT_2026-10-26_RU.md`
 - `security_results_2026-10-26_public_v3.3.0.json`
