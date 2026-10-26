@@ -4,6 +4,10 @@
 
 **Run date:** 2026-10-26 · **Raw data:** [bench_compare_results.json](bench_compare_results.json) · **Logs:** [bench_compare_run.log](bench_compare_run.log) · **Charts:** [`charts/`](charts/)
 
+> ✅ **Native Linux rerun — GitHub Actions, no containers: see §8 below.**
+> apt MySQL 8.0.46 / PostgreSQL 16.15 on `ubuntu-latest` ·
+> [bench_compare_results_linux.json](bench_compare_results_linux.json) · [bench_linux_run.log](bench_linux_run.log) · [charts/`linux/`](charts/linux/)
+
 ---
 
 ## 1. TL;DR
@@ -226,3 +230,131 @@ python scripts/gen_charts.py        # -> docs/charts/*.png
 
 Raw machine-readable results: [bench_compare_results.json](bench_compare_results.json) ·
 raw console log: [bench_compare_run.log](bench_compare_run.log).
+
+---
+
+## 8. Native Linux rerun — GitHub Actions, no containers (2026-10-26)
+
+The same benchmark, re-run on a GitHub-hosted **ubuntu-latest** runner: MySQL and PostgreSQL
+installed **natively via apt** (systemd services on the same host, connections over TCP
+`127.0.0.1`), DNA-DB as a native binary — **no Docker, no WSL2, no containers anywhere**.
+This run exists to directly test the caveat from §2: how much of the reported gap was container
+virtualization?
+
+* **Workflow:** [Bench (Linux, native DBs)](https://github.com/nsmykh70-creator/dna-db-core/actions/workflows/bench-linux.yml)
+  (run #4, 96 s end-to-end, triggered by push; re-runnable via *workflow_dispatch*)
+* **Host:** `Linux 6.17.0-1022-azure-x86_64`, glibc 2.39, 2026-10-26 02:18 UTC, GitHub-hosted shared VM
+* **Raw data:** [bench_compare_results_linux.json](bench_compare_results_linux.json) ·
+  **log:** [bench_linux_run.log](bench_linux_run.log) ·
+  **charts:** [`charts/linux/`](charts/linux/)
+* **Versions, detected at run time:** `dna-db-core 3.0.0 (strict fsync)` ·
+  `MySQL 8.0.46-0ubuntu0.24.04.4` (`innodb_flush_log_at_trx_commit=1`) ·
+  `PostgreSQL 16.15 (Ubuntu 16.15-1.pgdg24.04+2)` (`synchronous_commit=on`)
+* **Identical to §2–§3:** same parameters (load 10 000 → MT 8×1 000 → batch 40×200 → point read
+  4 000 → mixed 8×500, seed 777 → SQL 3 000/1 500), same RNG sequence, same fairness rules
+  (autocommit, default durability everywhere), every read verified.
+
+### 8.1 Results (ops/s, higher is better)
+
+| Phase | DNA-DB | MySQL | PostgreSQL | DNA-DB vs MySQL | DNA-DB vs PG |
+|---|---:|---:|---:|---:|---:|
+| Load (insert, single thread) | 3 249 | 1 432 | **5 510** | **2.3×** | 0.6× (PG wins) |
+| MT load (insert, 8 threads) | 3 551 | 6 361 | **20 001** | 0.6× (MySQL wins) | 0.2× (PG wins) |
+| Batch load (200 rows/statement) | **183 957** | 100 319 | 63 661 | **1.8×** | **2.9×** |
+| Point read ×4 000 | **24 586** | 11 103 | 15 502 | **2.2×** | **1.6×** |
+| Mixed 80/20, 8 threads | 11 821 | 10 443 | **22 742** | **1.1×** | 0.5× (PG wins) |
+| SQL `INSERT` 3 000 rows | 3 226 | 1 480 | **5 240** | **2.2×** | 0.6× (PG wins) |
+| SQL `SELECT … WHERE pk` ×1 500 | **18 228** | 10 694 | 15 350 | **1.7×** | **1.2×** |
+| Verified reads returning a wrong value | **0** | 0 | 0 | | |
+| Row count verified after MT/batch load | 8 000/8 000 | 8 000/8 000 | 8 000/8 000 | | |
+
+![Throughput by workload phase — native Linux](charts/linux/throughput.png)
+
+**Latency — point read (ms, p50/p95/p99):**
+
+| System | p50 | p95 | p99 |
+|---|---:|---:|---:|
+| **DNA-DB** | **0.037** | **0.054** | **0.060** |
+| PostgreSQL | 0.058 | 0.085 | 0.099 |
+| MySQL | 0.074 | 0.105 | 0.138 |
+
+![Point read latency — native Linux](charts/linux/latency_point_read.png)
+
+**Latency — SQL `SELECT … WHERE pk` (ms):**
+
+| System | p50 | p95 | p99 |
+|---|---:|---:|---:|
+| **DNA-DB** | **0.048** | **0.062** | **0.069** |
+| PostgreSQL | 0.057 | 0.088 | 0.095 |
+| MySQL | 0.086 | 0.126 | 0.149 |
+
+![SQL SELECT latency — native Linux](charts/linux/latency_sql_select.png)
+
+**Peak write throughput & correctness:**
+
+| Metric | DNA-DB | MySQL | PostgreSQL |
+|---|---:|---:|---:|
+| MT ÷ single-thread scaling | 1.09× | **4.4×** | **3.6×** |
+| Batch ÷ single-thread scaling | **56.6×** | 70.0× | 11.5× |
+| p50 of one INSERT, MT phase (ms) | 2.21 | 1.08 | **0.34** |
+| p50 of one 200-row statement (ms) | **1.08** | 1.95 | 0.91 |
+| Errors / mismatches | **0** | 0 | 0 |
+
+![Peak write throughput — native Linux](charts/linux/peak_write.png)
+*(logarithmic y-axis)*
+
+![Correctness — native Linux](charts/linux/correctness.png)
+
+### 8.2 What changed versus the Windows/Docker run — and why
+
+| Metric (rows/s) | Docker on Windows/WSL2 (§1) | Native Linux (§8) | Change |
+|---|---:|---:|---:|
+| MySQL single-thread insert | 141 | 1 432 | **10.2×** |
+| MySQL MT insert, 8 threads | 621 | 6 361 | **10.2×** |
+| PostgreSQL single-thread insert | 356 | 5 510 | **15.5×** |
+| PostgreSQL MT insert, 8 threads | 1 876 | 20 001 | **10.7×** |
+| DNA-DB single-thread insert | 1 060 | 3 249 | 3.1× |
+| DNA-DB MT insert, 8 threads | 1 124 | 3 551 | 3.2× |
+
+What this tells us:
+
+1. **The container caveat from §2 was real and large.** Going native, MySQL and PostgreSQL gained
+   **10–16×**, while DNA-DB — which ran natively in *both* runs — gained only ~3× (and the two
+   runs used different machines, so that ~3× is mostly the host difference). The divergence is
+   what isolates the container effect: every fsync crossed the Docker Desktop/WSL2 VM layer and
+   every client connection crossed the container network stack. Most of §1's gap was
+   virtualization, not the engines.
+2. **On equal footing PostgreSQL leads the write-heavy phases:** single-thread 5 510 rows/s
+   (1.7× DNA-DB), 8-thread 20 001 (5.6× DNA-DB), mixed 22 742 (1.9×) — group commit plus shared
+   buffers amortize fsync over 8 concurrent commits exactly as §3.5 predicted.
+3. **DNA-DB still wins point reads, batch and PK SELECT:** 24 586 reads/s (1.6× PostgreSQL,
+   2.2× MySQL), 183 957 rows/s batched (2.9× PostgreSQL — one WAL frame per 200-row statement),
+   18 228 SQL SELECT/s (1.2× PostgreSQL) with the lowest latency in every column.
+4. **The known weakness is now confirmed without container noise:** DNA-DB scales only
+   **1.09×** from 1 to 8 writer threads vs MySQL's 4.4× and PostgreSQL's 3.6× — the per-ack WAL
+   lock serializes concurrent writers. This is the "group commit for the WAL" item in ROADMAP;
+   §3.5 showed the same shape, and native Linux shows it more clearly.
+5. **MySQL natively is no longer the laggard:** it matches DNA-DB in the mixed phase
+   (10 443 vs 11 821 ops/s) and beats it in MT inserts — its §1 numbers were dominated by VM
+   fsync overhead.
+
+**Honest caveats for this run:**
+
+1. GitHub-hosted shared VM (burstable CPU, noisy neighbours); each phase lasts only 2–7 s, so
+   expect a few percent run-to-run variance — this is a single run (re-dispatch the workflow for
+   more samples).
+2. Default apt server configurations, default durability everywhere (same fairness rule as §2);
+   no tuning for either server, no warm-up cache reuse between phases.
+3. The microbenchmark limitations of §2 still apply: single-key operations, one connection per
+   thread — not TPC-C, no joins/replication/analytics.
+
+### 8.3 Reproduce
+
+```bash
+# push a change touching scripts/bench_compare.py | scripts/gen_charts.py |
+# .github/workflows/bench-linux.yml, or trigger manually:
+#   Actions → Bench (Linux, native DBs) → Run workflow
+```
+The workflow installs MySQL/PostgreSQL natively (apt), configures both for user/password/db
+`bench` with default durability, builds DNA-DB in release mode, runs the same script, renders
+charts into `docs/charts/linux/` and commits JSON + log + PNGs back to the repository.
