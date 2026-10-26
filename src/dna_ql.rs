@@ -31,9 +31,10 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use crate::dna::PackedDna;
 use crate::engine::Engine;
-use crate::expr::{self, CmpOp, Expr};
+use crate::expr::{self, ArithOp, CmpOp, Expr};
 use crate::relational::{RowCodec, Value};
 use crate::simd_bitap::BitapMatcher;
+use crate::sql_engine::SqlEngine;
 use crate::tx::TransactionCoordinator;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -75,6 +76,21 @@ pub enum DnaQlAst {
         chromosome: String,
         fix: bool,
     },
+    /// CREATE CHROMOSOME name (col TYPE, ..., PRIMARY KEY (...),
+    /// FOREIGN KEY (...) REFERENCES ...) — schema DDL. The parenthesis body
+    /// is kept as raw definition clauses and handed verbatim to the SQL
+    /// engine, so DnaQL DDL and SQL CREATE TABLE accept exactly the same
+    /// grammar (types, PRIMARY KEY, FOREIGN KEY, NOT NULL, lengths).
+    CreateChromosome {
+        table: String,
+        definitions: Vec<String>,
+        if_not_exists: bool,
+    },
+    /// DROP CHROMOSOME name [IF EXISTS]
+    DropChromosome {
+        table: String,
+        if_exists: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +98,10 @@ pub enum PipelineStage {
     Link(Option<LinkSpec>),
     Filter(Expr),
     Emit(Vec<String>),
+    /// `|> SORT column [ASC|DESC]` — order the rows (was SQL-only before).
+    Sort { column: String, asc: bool },
+    /// `|> LIMIT n` — keep the first n rows after the previous stage.
+    Limit(usize),
 }
 
 #[derive(Debug, Clone)]
@@ -146,6 +166,9 @@ enum Tok {
     LBrace,
     RBrace,
     Star,
+    Plus,      // +
+    Minus,     // -
+    Slash,     // /
     Eof,
 }
 
@@ -196,6 +219,9 @@ fn tokenize(input: &str) -> Result<Vec<Tok>, String> {
             '?' => { toks.push(Tok::Question); i += 1; }
             '~' => { toks.push(Tok::Tilde); i += 1; }
             '*' => { toks.push(Tok::Star); i += 1; }
+            '+' => { toks.push(Tok::Plus); i += 1; }
+            '-' => { toks.push(Tok::Minus); i += 1; }
+            '/' => { toks.push(Tok::Slash); i += 1; }
             '=' => { toks.push(Tok::Eq); i += 1; }
             '<' => { toks.push(Tok::Lt); i += 1; }
             '>' => { toks.push(Tok::Gt); i += 1; }
@@ -343,6 +369,8 @@ impl Parser {
             Tok::Ident(s) if s.eq_ignore_ascii_case("ANALYZE") => self.parse_bio(),
             Tok::Ident(s) if s.eq_ignore_ascii_case("VERIFY") => self.parse_health_check(false),
             Tok::Ident(s) if s.eq_ignore_ascii_case("REPAIR") => self.parse_health_check(true),
+            Tok::Ident(s) if s.eq_ignore_ascii_case("CREATE") => self.parse_create_chromosome(),
+            Tok::Ident(s) if s.eq_ignore_ascii_case("DROP") => self.parse_drop_chromosome(),
             Tok::Ident(_) => self.parse_quick_search(),
             t => Err(format!("DnaQL: unexpected token {:?}", t)),
         }
@@ -366,6 +394,129 @@ impl Parser {
             self.next();
         }
         Ok(DnaQlAst::HealthCheck { chromosome, fix })
+    }
+
+    /// CREATE CHROMOSOME <name> [IF NOT EXISTS] (col TYPE, ...);
+    /// The parenthesis body is collected as raw definition clauses at top
+    /// comma level: "id INT", "PRIMARY KEY (id)", "FOREIGN KEY ...
+    /// REFERENCES ..." with nested parens kept intact. Types and constraints
+    /// are validated when the rendered CREATE TABLE runs through the SQL
+    /// engine. Without an explicit PRIMARY KEY the first column is the locus.
+    fn parse_create_chromosome(&mut self) -> Result<DnaQlAst, String> {
+        self.next(); // CREATE
+        let kw = self.ident()?;
+        if !kw.eq_ignore_ascii_case("CHROMOSOME") {
+            return Err(format!(
+                "DnaQL: expected CHROMOSOME after CREATE, got {:?}",
+                kw
+            ));
+        }
+        let table = self.ident()?;
+        let if_not_exists = if self.kw("IF") {
+            self.expect_kw("NOT")?;
+            self.expect_kw("EXISTS")?;
+            true
+        } else {
+            false
+        };
+        self.expect(Tok::LParen)?;
+        let mut definitions: Vec<String> = Vec::new();
+        let mut buf = String::new();
+        let mut depth = 0usize;
+        loop {
+            match self.peek().clone() {
+                Tok::RParen if depth == 0 => {
+                    self.next();
+                    break;
+                }
+                Tok::RParen => {
+                    self.next();
+                    depth -= 1;
+                    push_clause_token(&mut buf, ")");
+                }
+                Tok::LParen => {
+                    self.next();
+                    depth += 1;
+                    push_clause_token(&mut buf, "(");
+                }
+                Tok::Comma if depth == 0 => {
+                    self.next();
+                    let clause = buf.trim().to_string();
+                    if !clause.is_empty() {
+                        definitions.push(clause);
+                    }
+                    buf.clear();
+                }
+                Tok::Ident(s) => {
+                    self.next();
+                    push_clause_token(&mut buf, &s);
+                }
+                Tok::Int(i) => {
+                    self.next();
+                    push_clause_token(&mut buf, &i.to_string());
+                }
+                Tok::Float(f) => {
+                    self.next();
+                    push_clause_token(&mut buf, &float_token(&f));
+                }
+                Tok::Str(s) => {
+                    self.next();
+                    push_clause_token(&mut buf, &format!("'{}'", s));
+                }
+                Tok::Star => {
+                    self.next();
+                    push_clause_token(&mut buf, "*");
+                }
+                Tok::Dot => {
+                    self.next();
+                    push_clause_token(&mut buf, ".");
+                }
+                Tok::Semicolon if depth == 0 => {
+                    self.next();
+                    break;
+                }
+                t => {
+                    return Err(format!(
+                        "DnaQL: unexpected token {:?} in CREATE CHROMOSOME column list",
+                        t
+                    ))
+                }
+            }
+        }
+        let tail = buf.trim().to_string();
+        if !tail.is_empty() {
+            definitions.push(tail);
+        }
+        if matches!(self.peek(), Tok::Semicolon) {
+            self.next();
+        }
+        if definitions.is_empty() {
+            return Err("DnaQL: CREATE CHROMOSOME needs at least one column".into());
+        }
+        Ok(DnaQlAst::CreateChromosome { table, definitions, if_not_exists })
+    }
+
+    /// DROP CHROMOSOME <name> [IF EXISTS];
+    fn parse_drop_chromosome(&mut self) -> Result<DnaQlAst, String> {
+        self.next(); // DROP
+        let kw = self.ident()?;
+        if !kw.eq_ignore_ascii_case("CHROMOSOME") {
+            return Err(format!(
+                "DnaQL: expected CHROMOSOME after DROP, got {:?}",
+                kw
+            ));
+        }
+        let table = self.ident()?;
+        let if_exists = if self.kw("IF") {
+            self.expect_kw("EXISTS")?;
+            true
+        } else {
+            false
+        };
+        if matches!(self.peek(), Tok::Semicolon) {
+            self.next();
+        }
+        Ok(DnaQlAst::DropChromosome { table, if_exists })
     }
 
     // Quick: chr ? 'PAT' ~K -> chr2(col) => emit a,b ;
@@ -507,6 +658,21 @@ impl Parser {
             } else if self.kw("EMIT") {
                 let p = self.parse_projection()?;
                 stages.push(PipelineStage::Emit(p));
+            } else if self.kw("SORT") {
+                let column = self.ident()?;
+                let asc = if self.kw("DESC") {
+                    false
+                } else {
+                    self.kw("ASC");
+                    true
+                };
+                stages.push(PipelineStage::Sort { column, asc });
+            } else if self.kw("LIMIT") {
+                let n = self.int()?;
+                if n < 0 {
+                    return Err("DnaQL: LIMIT expects a non-negative integer".into());
+                }
+                stages.push(PipelineStage::Limit(n as usize));
             } else {
                 return Err(format!("DnaQL: unknown pipeline stage {:?}", self.peek()));
             }
@@ -645,6 +811,14 @@ impl Parser {
 
     fn parse_value(&mut self) -> Result<Value, String> {
         match self.next() {
+            Tok::Minus => match self.next() {
+                Tok::Int(i) => i
+                    .checked_neg()
+                    .map(Value::Int)
+                    .ok_or_else(|| "DnaQL: integer literal out of range".to_string()),
+                Tok::Float(f) => Ok(Value::Float(-f)),
+                t => Err(format!("DnaQL: expected number after '-', got {:?}", t)),
+            },
             Tok::Int(i) => Ok(Value::Int(i)),
             Tok::Float(f) => Ok(Value::Float(f)),
             Tok::Str(s) => {
@@ -729,13 +903,88 @@ impl Parser {
             return Ok(Expr::Cmp { op, left: Box::new(left), right: Box::new(right) });
         }
         if self.kw("IS") {
+            if self.kw("NOT") {
+                self.expect_kw("NULL")?;
+                return Ok(Expr::IsNotNull(Box::new(left)));
+            }
             self.expect_kw("NULL")?;
             return Ok(Expr::IsNull(Box::new(left)));
+        }
+        // `col IN (v1, v2, ...)` — same semantics as SQL; subqueries do not
+        // exist in DnaQL (the SQL engine materialises those itself).
+        if self.kw("IN") {
+            let column = match left {
+                Expr::Column(c) => c,
+                other => {
+                    return Err(format!(
+                        "DnaQL: IN requires a column on the left, got '{}'",
+                        other.describe()
+                    ))
+                }
+            };
+            self.expect(Tok::LParen)?;
+            let mut values = Vec::new();
+            loop {
+                values.push(self.parse_value()?);
+                if matches!(self.peek(), Tok::Comma) {
+                    self.next();
+                } else {
+                    break;
+                }
+            }
+            self.expect(Tok::RParen)?;
+            return Ok(Expr::InList { column, values });
         }
         Ok(left)
     }
 
+    /// additive  ::= multiplicative (('+' | '-') multiplicative)*
     fn parse_operand(&mut self) -> Result<Expr, String> {
+        let mut left = self.parse_multiplicative()?;
+        loop {
+            let op = match self.peek() {
+                Tok::Plus => ArithOp::Add,
+                Tok::Minus => ArithOp::Sub,
+                _ => break,
+            };
+            self.next();
+            let right = self.parse_multiplicative()?;
+            left = Expr::Arith { op, left: Box::new(left), right: Box::new(right) };
+        }
+        Ok(left)
+    }
+
+    /// multiplicative ::= unary (('*' | '/') unary)*
+    fn parse_multiplicative(&mut self) -> Result<Expr, String> {
+        let mut left = self.parse_unary()?;
+        loop {
+            let op = match self.peek() {
+                Tok::Star => ArithOp::Mul,
+                Tok::Slash => ArithOp::Div,
+                _ => break,
+            };
+            self.next();
+            let right = self.parse_unary()?;
+            left = Expr::Arith { op, left: Box::new(left), right: Box::new(right) };
+        }
+        Ok(left)
+    }
+
+    /// unary ::= '-' primary | primary
+    fn parse_unary(&mut self) -> Result<Expr, String> {
+        if matches!(self.peek(), Tok::Minus) {
+            self.next();
+            let inner = self.parse_unary()?;
+            return Ok(Expr::Arith {
+                op: ArithOp::Sub,
+                left: Box::new(Expr::Literal(Value::Int(0))),
+                right: Box::new(inner),
+            });
+        }
+        self.parse_primary()
+    }
+
+    fn parse_primary(&mut self) -> Result<Expr, String> {
         match self.peek().clone() {
             Tok::Int(i) => {
                 self.next();
@@ -774,6 +1023,26 @@ impl Parser {
     }
 }
 
+/// Append one raw token to a CREATE CHROMOSOME definition clause buffer,
+/// separating tokens with a single space (whitespace is irrelevant to the
+/// SQL engine that re-parses these clauses).
+fn push_clause_token(buf: &mut String, tok: &str) {
+    if !buf.is_empty() {
+        buf.push(' ');
+    }
+    buf.push_str(tok);
+}
+
+/// Float rendering that always keeps a decimal point, so re-parsing the
+/// token yields a Float (and not an Int) again.
+pub(crate) fn float_token(f: &f64) -> String {
+    if f.is_finite() && f.fract() == 0.0 {
+        format!("{:.1}", f)
+    } else {
+        format!("{}", f)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Engine (parser + executor)
 // ---------------------------------------------------------------------------
@@ -781,12 +1050,15 @@ impl Parser {
 pub struct DnaQlEngine {
     pub engine: Arc<Engine>,
     pub tx: TransactionCoordinator,
+    /// Shared SQL engine — schema DDL (CREATE/DROP CHROMOSOME) goes through
+    /// it so the SQL side's in-memory schema cache stays consistent.
+    pub sql: Arc<SqlEngine>,
 }
 
 impl DnaQlEngine {
-    pub fn new(engine: Arc<Engine>) -> Self {
+    pub fn new(engine: Arc<Engine>, sql: Arc<SqlEngine>) -> Self {
         let tx = TransactionCoordinator::new(engine.clone());
-        Self { engine, tx }
+        Self { engine, tx, sql }
     }
 
     pub fn parse(&self, query: &str) -> Result<DnaQlAst, String> {
@@ -813,6 +1085,12 @@ impl DnaQlEngine {
             }
             DnaQlAst::HealthCheck { chromosome, fix } => {
                 self.exec_health_check(chromosome, *fix)?
+            }
+            DnaQlAst::CreateChromosome { table, definitions, if_not_exists } => {
+                self.exec_create_chromosome(table, definitions, *if_not_exists)?
+            }
+            DnaQlAst::DropChromosome { table, if_exists } => {
+                self.exec_drop_chromosome(table, *if_exists)?
             }
         };
 
@@ -930,6 +1208,74 @@ impl DnaQlEngine {
         Ok((out, note))
     }
 
+    fn exec_create_chromosome(
+        &self,
+        table: &str,
+        definitions: &[String],
+        if_not_exists: bool,
+    ) -> Result<(Vec<DnaQlRow>, String), String> {
+        if definitions.is_empty() {
+            return Err("DnaQL: CREATE CHROMOSOME needs at least one column".into());
+        }
+        let mut clauses: Vec<String> = definitions.to_vec();
+        // No explicit PRIMARY KEY clause: the first column becomes the locus,
+        // mirroring SQL CREATE TABLE's fallback (first column as PK).
+        let has_pk = definitions.iter().any(|d| {
+            d.split_whitespace()
+                .next()
+                .map(|w| w.eq_ignore_ascii_case("PRIMARY"))
+                .unwrap_or(false)
+        });
+        if !has_pk {
+            let first = definitions[0]
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
+            if first.is_empty() {
+                return Err("DnaQL: CREATE CHROMOSOME first clause names no column".into());
+            }
+            clauses.push(format!("PRIMARY KEY ({})", first));
+        }
+        let nie = if if_not_exists { "IF NOT EXISTS " } else { "" };
+        let sql = format!(
+            "CREATE TABLE {}{} ({})",
+            nie,
+            table,
+            clauses.join(", ")
+        );
+        let res = self
+            .sql
+            .execute(&sql)
+            .map_err(|e| format!("DnaQL DDL: {}", e))?;
+        Ok((
+            vec![],
+            res.message
+                .unwrap_or_else(|| format!("chromosome '{}' created", table)),
+        ))
+    }
+
+    fn exec_drop_chromosome(
+        &self,
+        table: &str,
+        if_exists: bool,
+    ) -> Result<(Vec<DnaQlRow>, String), String> {
+        let sql = if if_exists {
+            format!("DROP TABLE IF EXISTS {}", table)
+        } else {
+            format!("DROP TABLE {}", table)
+        };
+        let res = self
+            .sql
+            .execute(&sql)
+            .map_err(|e| format!("DnaQL DDL: {}", e))?;
+        Ok((
+            vec![],
+            res.message
+                .unwrap_or_else(|| format!("chromosome '{}' dropped", table)),
+        ))
+    }
+
     fn exec_pipeline(
         &self,
         source: &str,
@@ -987,6 +1333,23 @@ impl DnaQlEngine {
                         }
                         row.fields = filtered;
                     }
+                }
+                PipelineStage::Sort { column, asc } => {
+                    plan.push(format!(
+                        "Sort({} {})",
+                        column,
+                        if *asc { "ASC" } else { "DESC" }
+                    ));
+                    rows.sort_by(|a, b| {
+                        let va = a.fields.get(column).cloned().unwrap_or(Value::Null);
+                        let vb = b.fields.get(column).cloned().unwrap_or(Value::Null);
+                        let ord = va.compare(&vb);
+                        if *asc { ord } else { ord.reverse() }
+                    });
+                }
+                PipelineStage::Limit(n) => {
+                    plan.push(format!("Limit({})", n));
+                    rows.truncate(*n);
                 }
             }
         }
@@ -1243,6 +1606,20 @@ fn ast_summary(ast: &DnaQlAst) -> String {
                 chromosome, fix
             )
         }
+        DnaQlAst::CreateChromosome { table, definitions, if_not_exists } => {
+            format!(
+                "CreateChromosome {{ table: '{}', definitions: {}, if_not_exists: {} }}",
+                table,
+                definitions.len(),
+                if_not_exists
+            )
+        }
+        DnaQlAst::DropChromosome { table, if_exists } => {
+            format!(
+                "DropChromosome {{ table: '{}', if_exists: {} }}",
+                table, if_exists
+            )
+        }
     }
 }
 
@@ -1306,7 +1683,8 @@ mod tests {
             engine.put(key.as_bytes(), &payload).unwrap();
         }
 
-        let ql = DnaQlEngine::new(engine.clone());
+        let sql = Arc::new(SqlEngine::new(engine.clone()));
+        let ql = DnaQlEngine::new(engine.clone(), sql);
         (engine, ql)
     }
 

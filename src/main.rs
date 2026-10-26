@@ -5,6 +5,7 @@
 //!   dna-db-core bench   [--data-dir ./bench_tmp]
 //!   dna-db-core shell   --host 127.0.0.1 --port 9999
 //!   dna-db-core doctor  --data-dir ./dna_data [--fix] [--migrate] [--json]
+//!   dna-db-core sql2dnaql --sql "SELECT ..." [--data-dir ./dna_data]
 
 use clap::{Parser, Subcommand, ValueEnum};
 use std::io::{BufRead, Read, Write};
@@ -132,6 +133,16 @@ enum Command {
         #[arg(long)]
         mirror_dir: Option<String>,
     },
+    /// Convert SQL statements into the equivalent DnaQL query
+    #[command(name = "sql2dnaql")]
+    Sql2Dnaql {
+        /// Database directory holding the schemas the SQL refers to
+        #[arg(long, default_value = "./dna_data")]
+        data_dir: String,
+        /// SQL text to convert; reads from stdin when omitted
+        #[arg(long)]
+        sql: Option<String>,
+    },
 }
 
 fn sync_arg_to_mode(mode: &SyncArg) -> SyncMode {
@@ -222,8 +233,54 @@ fn main() {
             *erasure_k,
             *erasure_m,
         ),
+        Command::Sql2Dnaql { data_dir, sql } => run_sql2dnaql(data_dir, sql.as_deref()),
     };
     std::process::exit(code);
+}
+
+/// `sql2dnaql` — print the DnaQL equivalent of the given SQL statement(s).
+/// Reads stdin when --sql is not given, so it composes in pipelines:
+///   cat migration.sql | dna-db-core sql2dnaql --data-dir ./dna_data
+fn run_sql2dnaql(data_dir: &str, sql: Option<&str>) -> i32 {
+    let text = match sql {
+        Some(s) => s.to_string(),
+        None => {
+            let mut buf = String::new();
+            if let Err(e) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf) {
+                eprintln!("[FATAL] cannot read stdin: {}", e);
+                return 2;
+            }
+            buf
+        }
+    };
+    if text.trim().is_empty() {
+        eprintln!("[FATAL] no SQL given (use --sql \"...\" or pipe it on stdin)");
+        return 2;
+    }
+    let engine = match Engine::open(EngineConfig {
+        dir_path: std::path::PathBuf::from(data_dir),
+        memtable_capacity: 8 * 1024 * 1024,
+        sync_mode: SyncMode::Strict,
+        mirror_disk_path: None,
+        ..Default::default()
+    }) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("[FATAL] cannot open data dir '{}': {}", data_dir, e);
+            return 2;
+        }
+    };
+    let sql_engine = SqlEngine::new(engine);
+    match sql_engine.sql_to_dnaql(&text) {
+        Ok(out) => {
+            println!("{}", out);
+            0
+        }
+        Err(e) => {
+            eprintln!("[ERROR] {}", e);
+            2
+        }
+    }
 }
 
 fn run_server(
@@ -283,8 +340,8 @@ fn run_server(
         seed_demo_data(&engine);
     }
 
-    let dnaql = Arc::new(DnaQlEngine::new(engine.clone()));
     let sql = Arc::new(SqlEngine::new(engine.clone()));
+    let dnaql = Arc::new(DnaQlEngine::new(engine.clone(), sql.clone()));
 
     // Embedded web admin panel (phpMyAdmin-style). Non-fatal bind errors.
     if admin_port != 0 {

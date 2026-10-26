@@ -22,6 +22,16 @@ pub enum Expr {
         right: Box<Expr>,
     },
     IsNull(Box<Expr>),
+    /// `col IS NOT NULL` — the negation of IsNull (never NULL-valued itself).
+    IsNotNull(Box<Expr>),
+    /// Arithmetic in projections / operands: `total_usd * 2`.
+    /// Int op Int stays Int for `+ - *`; division always yields Float and
+    /// division by zero yields NULL (documented SQL surface behaviour).
+    Arith {
+        op: ArithOp,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
     /// `col IN (v1, v2, ...)` — evaluated here; NULL semantics: no match
     /// when the column value is NULL or the list contains NULL only.
     InList {
@@ -35,6 +45,25 @@ pub enum Expr {
         /// Rendered sub-SELECT, re-executed by the SQL engine.
         query: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArithOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+impl ArithOp {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ArithOp::Add => "+",
+            ArithOp::Sub => "-",
+            ArithOp::Mul => "*",
+            ArithOp::Div => "/",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +111,18 @@ impl Expr {
                 let v = e.eval(row)?;
                 Some(Value::Int(v.is_null() as i64))
             }
+            Expr::IsNotNull(e) => {
+                let v = e.eval(row)?;
+                Some(Value::Int((!v.is_null()) as i64))
+            }
+            Expr::Arith { op, left, right } => {
+                let l = left.eval(row)?;
+                let r = right.eval(row)?;
+                if l.is_null() || r.is_null() {
+                    return Some(Value::Null);
+                }
+                arith(*op, &l, &r)
+            }
             Expr::InList { column, values } => {
                 let v = row.get(column).cloned()?;
                 if v.is_null() {
@@ -126,6 +167,10 @@ impl Expr {
             Expr::And(a, b) => format!("({} AND {})", a.describe(), b.describe()),
             Expr::Or(a, b) => format!("({} OR {})", a.describe(), b.describe()),
             Expr::IsNull(e) => format!("{} IS NULL", e.describe()),
+            Expr::IsNotNull(e) => format!("{} IS NOT NULL", e.describe()),
+            Expr::Arith { op, left, right } => {
+                format!("{} {} {}", left.describe(), op.as_str(), right.describe())
+            }
             Expr::InList { column, values } => format!(
                 "{} IN ({})",
                 column,
@@ -153,7 +198,11 @@ impl Expr {
                 }
             }
             Expr::Literal(_) => {}
-            Expr::Not(e) |            Expr::IsNull(e) => e.collect_columns(out),
+            Expr::Not(e) | Expr::IsNull(e) | Expr::IsNotNull(e) => e.collect_columns(out),
+            Expr::Arith { left, right, .. } => {
+                left.collect_columns(out);
+                right.collect_columns(out);
+            }
             Expr::InList { column, .. } | Expr::InSubquery { column, .. } => {
                 if !out.contains(column) {
                     out.push(column.clone());
@@ -169,6 +218,32 @@ impl Expr {
             }
         }
     }
+}
+
+/// Numeric arithmetic with Int/Float promotion. Division always produces a
+/// Float; x / 0 (and x / 0.0) produces NULL instead of panicking.
+fn arith(op: ArithOp, l: &Value, r: &Value) -> Option<Value> {
+    fn num(v: &Value) -> Option<(f64, bool)> {
+        match v {
+            Value::Int(i) => Some((*i as f64, true)),
+            Value::Float(f) => Some((*f, false)),
+            _ => None,
+        }
+    }
+    let (a, ai) = num(l)?;
+    let (b, bi) = num(r)?;
+    if op == ArithOp::Div && b == 0.0 {
+        return Some(Value::Null);
+    }
+    Some(match op {
+        ArithOp::Add if ai && bi => Value::Int((a as i64).wrapping_add(b as i64)),
+        ArithOp::Sub if ai && bi => Value::Int((a as i64).wrapping_sub(b as i64)),
+        ArithOp::Mul if ai && bi => Value::Int((a as i64).wrapping_mul(b as i64)),
+        ArithOp::Add => Value::Float(a + b),
+        ArithOp::Sub => Value::Float(a - b),
+        ArithOp::Mul => Value::Float(a * b),
+        ArithOp::Div => Value::Float(a / b),
+    })
 }
 
 fn is_truthy(v: &Value) -> bool {

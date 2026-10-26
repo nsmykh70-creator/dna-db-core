@@ -21,6 +21,8 @@ thiserror = "1.0"
 sha2 = "0.10"
 subtle = "2.5"
 reed-solomon-erasure = "6.0"
+# Encryption at rest (XChaCha20-Poly1305 AEAD for row payloads).
+chacha20poly1305 = "0.10"
 
 [profile.release]
 opt-level = 3

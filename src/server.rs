@@ -450,8 +450,8 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        let dnaql = Arc::new(DnaQlEngine::new(engine.clone()));
         let sql = Arc::new(SqlEngine::new(engine.clone()));
+        let dnaql = Arc::new(DnaQlEngine::new(engine.clone(), sql.clone()));
         let server = Arc::new(DnaDbServer::new(
             engine,
             dnaql,
@@ -619,10 +619,12 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
+        let sql = Arc::new(SqlEngine::new(engine.clone()));
+        let dnaql = Arc::new(DnaQlEngine::new(engine.clone(), sql.clone()));
         let server = DnaDbServer::new(
             engine.clone(),
-            Arc::new(DnaQlEngine::new(engine.clone())),
-            Arc::new(SqlEngine::new(engine)),
+            dnaql,
+            sql,
             ServerConfig::default(),
         );
         assert_eq!(

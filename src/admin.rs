@@ -562,7 +562,7 @@ mod tests {
         sql.execute("CREATE TABLE chr_t (id INT, name TEXT, PRIMARY KEY (id))").unwrap();
         sql.execute("INSERT INTO chr_t (id = 1, name = 'alpha')").unwrap();
         sql.execute("INSERT INTO chr_t (id = 2, name = 'beta')").unwrap();
-        let dnaql = Arc::new(DnaQlEngine::new(engine.clone()));
+        let dnaql = Arc::new(DnaQlEngine::new(engine.clone(), sql.clone()));
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();

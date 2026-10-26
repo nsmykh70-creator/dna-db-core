@@ -26,6 +26,7 @@ pub mod protocol;
 pub mod server;
 pub mod relational;
 pub mod sql_engine;
+mod sql_to_dnaql;
 pub mod tx;
 pub mod dna_ql;
 pub mod simd_bitap;

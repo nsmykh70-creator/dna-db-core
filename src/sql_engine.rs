@@ -19,7 +19,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use crate::engine::Engine;
-use crate::expr::{CmpOp, Expr};
+use crate::expr::{ArithOp, CmpOp, Expr};
 use crate::relational::{
     encode_index_value, encode_ordered_value, ChromosomeTable, ColumnType,
     ForeignKeyConstraint, RowCodec, SecondaryIndexMeta, Value,
@@ -61,6 +61,9 @@ enum STok {
     LParen,
     RParen,
     Star,
+    Plus,
+    Minus,
+    Slash,
     Eq,
     Ne,
     Lt,
@@ -84,6 +87,8 @@ fn stokenize(input: &str) -> Result<Vec<STok>, String> {
             '(' => { toks.push(STok::LParen); i += 1; }
             ')' => { toks.push(STok::RParen); i += 1; }
             '*' => { toks.push(STok::Star); i += 1; }
+            '+' => { toks.push(STok::Plus); i += 1; }
+            '/' => { toks.push(STok::Slash); i += 1; }
             '.' => { toks.push(STok::Dot); i += 1; }
             '=' => { toks.push(STok::Eq); i += 1; }
             '!' if i + 1 < b.len() && b[i + 1] == '=' => { toks.push(STok::Ne); i += 2; }
@@ -117,7 +122,16 @@ fn stokenize(input: &str) -> Result<Vec<STok>, String> {
                 }
                 toks.push(STok::Str(s));
             }
-            '-' if i + 1 < b.len() && b[i + 1].is_ascii_digit() => {
+            // `-5` is a negative literal only at an operand start position;
+            // after an operand (`a-5`) the same character is the subtraction
+            // operator, tokenized below.
+            '-' if i + 1 < b.len()
+                && b[i + 1].is_ascii_digit()
+                && (toks.is_empty()
+                    || matches!(toks.last(),
+                        Some(STok::Comma | STok::Semi | STok::LParen | STok::Eq | STok::Ne
+                            | STok::Lt | STok::Le | STok::Gt | STok::Ge | STok::Plus
+                            | STok::Minus | STok::Star | STok::Slash))) => {
                 let mut num = String::new();
                 let mut is_float = false;
                 num.push('-');
@@ -138,6 +152,7 @@ fn stokenize(input: &str) -> Result<Vec<STok>, String> {
                     toks.push(STok::Int(num.parse().map_err(|_| "SQL: bad int")?));
                 }
             }
+            '-' => { toks.push(STok::Minus); i += 1; }
             '0'..='9' => {
                 let mut num = String::new();
                 let mut is_float = false;
@@ -177,7 +192,7 @@ fn stokenize(input: &str) -> Result<Vec<STok>, String> {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
-enum Stmt {
+pub(crate) enum Stmt {
     Select {
         projection: Vec<SelectItem>, // empty = *
         from: String,
@@ -220,13 +235,19 @@ enum Stmt {
     DropIndex {
         name: String,
         if_exists: bool,
+        /// Optional `ON <table>` qualifier (documented syntax).
+        table: Option<String>,
     },
+    /// `EXPLAIN <statement>` — DML/DDL are described without executing;
+    /// a SELECT is executed read-only so the plan reflects reality
+    /// (only its plan is returned, rows are discarded).
+    Explain(Box<Stmt>),
 }
 
 /// One item of a SELECT projection: a plain column or an aggregate call,
 /// each optionally renamed with `AS alias`.
 #[derive(Debug, Clone)]
-enum SelectItem {
+pub(crate) enum SelectItem {
     Star,
     Column {
         source: String,
@@ -240,10 +261,16 @@ enum SelectItem {
         /// Aggregate key inside HAVING/ORDER BY (canonical rendering).
         canonical: String,
     },
+    /// Computed projection: an arithmetic expression, e.g. `total_usd * 2`.
+    Computed {
+        expr: Expr,
+        /// Output column name: alias if given, else the rendered expression.
+        rendered: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AggFunc {
+pub(crate) enum AggFunc {
     Count,
     Sum,
     Avg,
@@ -265,15 +292,15 @@ impl AggFunc {
 }
 
 #[derive(Debug, Clone)]
-struct JoinSpec {
-    join_type: JoinType,
-    table: String,
-    left_col: String,  // qualified or bare (resolved later)
-    right_col: String,
+pub(crate) struct JoinSpec {
+    pub(crate) join_type: JoinType,
+    pub(crate) table: String,
+    pub(crate) left_col: String,  // qualified or bare (resolved later)
+    pub(crate) right_col: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum JoinType {
+pub(crate) enum JoinType {
     Inner,
     Left,
 }
@@ -329,8 +356,8 @@ impl SParser {
             let lower = s.to_ascii_lowercase();
             if !matches!(
                 lower.as_str(),
-                "join" | "inner" | "left" | "right" | "where" | "limit" | "on"
-                    | "group" | "order" | "union" | "having"
+                "join" | "inner" | "left" | "right" | "where" | "limit" | "offset"
+                    | "on" | "group" | "order" | "union" | "having"
             ) {
                 self.next();
             }
@@ -339,6 +366,14 @@ impl SParser {
 
     fn value(&mut self) -> Result<Value, String> {
         match self.next() {
+            STok::Minus => match self.next() {
+                STok::Int(i) => i
+                    .checked_neg()
+                    .map(Value::Int)
+                    .ok_or_else(|| "SQL: integer literal out of range".to_string()),
+                STok::Float(f) => Ok(Value::Float(-f)),
+                t => Err(format!("SQL: expected number after '-', got {:?}", t)),
+            },
             STok::Int(i) => Ok(Value::Int(i)),
             STok::Float(f) => Ok(Value::Float(f)),
             STok::Str(s) => Ok(typed_string_literal(&s)),
@@ -354,6 +389,11 @@ impl SParser {
         else if self.kw("DELETE") { self.parse_delete() }
         else if self.kw("CREATE") { self.parse_create() }
         else if self.kw("DROP") { self.parse_drop() }
+        else if self.kw("EXPLAIN") {
+            self.next();
+            let inner = self.parse_stmt()?;
+            Ok(Stmt::Explain(Box::new(inner)))
+        }
         else { Err(format!("SQL: unsupported statement starting at {:?}", self.peek())) }
     }
 
@@ -433,6 +473,12 @@ impl SParser {
             loop {
                 // order key: a column, or an aggregate call (COUNT(*) ...)
                 let mut key = self.ident()?;
+                // qualified reference `t.col` — the qualifier is stripped
+                // (single-namespace row model), as in projections.
+                if matches!(self.peek(), STok::Dot) {
+                    self.next();
+                    key = self.ident()?;
+                }
                 if matches!(self.peek(), STok::LParen) {
                     self.next();
                     let arg = if matches!(self.peek(), STok::Star) {
@@ -479,37 +525,45 @@ impl SParser {
         })
     }
 
-    /// One projection item: `*`, a plain column, or an aggregate call.
+    /// One projection item: `*`, a plain column, an aggregate call or an
+    /// arithmetic expression (`total_usd * 2 AS doub`).
     fn parse_select_item(&mut self) -> Result<SelectItem, String> {
         if matches!(self.peek(), STok::Star) {
             self.next();
             return Ok(SelectItem::Star);
         }
-        let name = self.ident()?;
-        // qualified: alias.col -> col
-        let name = if matches!(self.peek(), STok::Dot) {
-            self.next();
-            self.ident()?
-        } else {
-            name
-        };
-        if matches!(self.peek(), STok::LParen) {
-            self.next();
-            let arg = if matches!(self.peek(), STok::Star) {
+        // aggregate call: COUNT(*) / SUM(col) — recognised before the general
+        // expression path so `COUNT(*)` never parses as multiplication.
+        if let STok::Ident(s) = self.peek().clone() {
+            if matches!(self.peek_at(1), STok::LParen) && AggFunc::from_name(&s).is_ok() {
                 self.next();
-                None
-            } else {
-                Some(self.ident()?)
-            };
-            self.expect(STok::RParen)?;
-            let func = AggFunc::from_name(&name)?;
-            let canonical = render_agg(&name, arg.as_deref());
-            let alias = self.maybe_as_alias()?;
-            let rendered = alias.clone().unwrap_or_else(|| canonical.clone());
-            return Ok(SelectItem::Agg { func, arg, rendered, canonical });
+                self.next(); // (
+                let arg = if matches!(self.peek(), STok::Star) {
+                    self.next();
+                    None
+                } else {
+                    Some(self.ident()?)
+                };
+                self.expect(STok::RParen)?;
+                let func = AggFunc::from_name(&s)?;
+                let canonical = render_agg(&s, arg.as_deref());
+                let alias = self.maybe_as_alias()?;
+                let rendered = alias.clone().unwrap_or_else(|| canonical.clone());
+                return Ok(SelectItem::Agg { func, arg, rendered, canonical });
+            }
         }
-        let alias = self.maybe_as_alias()?;
-        Ok(SelectItem::Column { source: name, alias })
+        let expr = self.parse_operand()?;
+        match expr {
+            Expr::Column(source) => {
+                let alias = self.maybe_as_alias()?;
+                Ok(SelectItem::Column { source, alias })
+            }
+            other => {
+                let alias = self.maybe_as_alias()?;
+                let rendered = alias.unwrap_or_else(|| other.describe());
+                Ok(SelectItem::Computed { expr: other, rendered })
+            }
+        }
     }
 
     /// Optional `AS alias` / bare alias after an item.
@@ -523,8 +577,9 @@ impl SParser {
             let lower = s.to_ascii_lowercase();
             if !matches!(
                 lower.as_str(),
-                "from" | "where" | "group" | "having" | "order" | "limit" | "join"
-                    | "inner" | "left" | "on" | "and" | "or" | "asc" | "desc" | "union"
+                "from" | "where" | "group" | "having" | "order" | "limit" | "offset"
+                    | "join" | "inner" | "left" | "on" | "and" | "or" | "asc" | "desc"
+                    | "union"
             ) {
                 return Ok(Some(self.ident()?));
             }
@@ -728,8 +783,11 @@ impl SParser {
                 false
             };
             let name = self.ident()?;
+            // Documented form: DROP INDEX <name> ON <table>. The bare form
+            // without ON stays accepted (used by existing scripts/tests).
+            let table = if self.kw("ON") { Some(self.ident()?) } else { None };
             if matches!(self.peek(), STok::Semi) { self.next(); }
-            return Ok(Stmt::DropIndex { name, if_exists });
+            return Ok(Stmt::DropIndex { name, if_exists, table });
         }
         self.expect_kw("TABLE")?;
         let if_exists = if self.kw("IF") {
@@ -816,12 +874,48 @@ impl SParser {
             return Ok(Expr::InList { column, values });
         }
         if self.kw("IS") {
+            if self.kw("NOT") {
+                self.expect_kw("NULL")?;
+                return Ok(Expr::IsNotNull(Box::new(left)));
+            }
             self.expect_kw("NULL")?;
             return Ok(Expr::IsNull(Box::new(left)));
         }
         Ok(left)
     }
+    /// Additive level of an arithmetic expression: `a + b - c`.
     fn parse_operand(&mut self) -> Result<Expr, String> {
+        let mut left = self.parse_multiplicative()?;
+        loop {
+            let op = match self.peek() {
+                STok::Plus => ArithOp::Add,
+                STok::Minus => ArithOp::Sub,
+                _ => break,
+            };
+            self.next();
+            let right = self.parse_multiplicative()?;
+            left = Expr::Arith { op, left: Box::new(left), right: Box::new(right) };
+        }
+        Ok(left)
+    }
+    /// Multiplicative level: `a * b / c`.
+    fn parse_multiplicative(&mut self) -> Result<Expr, String> {
+        let mut left = self.parse_primary()?;
+        loop {
+            let op = match self.peek() {
+                STok::Star => ArithOp::Mul,
+                STok::Slash => ArithOp::Div,
+                _ => break,
+            };
+            self.next();
+            let right = self.parse_primary()?;
+            left = Expr::Arith { op, left: Box::new(left), right: Box::new(right) };
+        }
+        Ok(left)
+    }
+    /// Primary: literal, column (qualified `t.col` is stripped), aggregate
+    /// call, parenthesised expression or unary minus.
+    fn parse_primary(&mut self) -> Result<Expr, String> {
         match self.peek().clone() {
             STok::Int(i) => { self.next(); Ok(Expr::Literal(Value::Int(i))) }
             STok::Float(f) => { self.next(); Ok(Expr::Literal(Value::Float(f))) }
@@ -866,6 +960,18 @@ impl SParser {
                 match self.next() {
                     STok::RParen => Ok(e),
                     t => Err(format!("SQL: expected ')', got {:?}", t)),
+                }
+            }
+            STok::Minus => {
+                self.next();
+                match self.parse_primary()? {
+                    Expr::Literal(Value::Int(i)) => Ok(Expr::Literal(Value::Int(-i))),
+                    Expr::Literal(Value::Float(f)) => Ok(Expr::Literal(Value::Float(-f))),
+                    other => Ok(Expr::Arith {
+                        op: ArithOp::Sub,
+                        left: Box::new(Expr::Literal(Value::Int(0))),
+                        right: Box::new(other),
+                    }),
                 }
             }
             t => Err(format!("SQL: expected operand, got {:?}", t)),
@@ -937,6 +1043,34 @@ impl SqlEngine {
         self.schemas.read().get(table).cloned()
     }
 
+    /// Convert one or more SQL statements (separated by `;`) into the
+    /// equivalent DnaQL query text. Statements without a DnaQL equivalent
+    /// (JOIN, aggregates, CREATE INDEX, EXPLAIN, ...) return an explicit
+    /// error naming the construct — nothing is silently approximated.
+    ///
+    /// ```text
+    /// let dnaql = engine.sql_to_dnaql(
+    ///     "SELECT user_id, username FROM chr_users WHERE balance > 100 LIMIT 10"
+    /// ).unwrap();
+    /// assert_eq!(
+    ///     dnaql,
+    ///     "FROM chr_users |> WHERE balance > 100 |> LIMIT 10 |> EMIT user_id, username;"
+    /// );
+    /// ```
+    pub fn sql_to_dnaql(&self, sql: &str) -> Result<String, String> {
+        let toks = stokenize(sql)?;
+        let mut p = SParser { toks, pos: 0 };
+        let mut out = Vec::new();
+        while p.peek() != &STok::Eof {
+            let stmt = p.parse_stmt()?;
+            out.push(crate::sql_to_dnaql::transpile(&stmt, &|t| self.get_schema(t))?);
+        }
+        if out.is_empty() {
+            return Err("SQL: nothing to convert (empty statement)".into());
+        }
+        Ok(out.join("\n"))
+    }
+
     pub fn execute(&self, sql: &str) -> Result<QueryResult, String> {
         let start = std::time::Instant::now();
         // SHOW HEALTH — engine health snapshot (P5.2), handled before the
@@ -987,7 +1121,10 @@ impl SqlEngine {
             Stmt::CreateIndex { name, table, column, unique, if_not_exists } => {
                 self.exec_create_index(&name, &table, &column, unique, if_not_exists)?
             }
-            Stmt::DropIndex { name, if_exists } => self.exec_drop_index(&name, if_exists)?,
+            Stmt::DropIndex { name, if_exists, table } => {
+                self.exec_drop_index(&name, if_exists, table.as_deref())?
+            }
+            Stmt::Explain(inner) => self.exec_explain(*inner)?,
         };
         Ok(QueryResult {
             columns,
@@ -996,6 +1133,103 @@ impl SqlEngine {
             execution_time_us: start.elapsed().as_micros() as u64,
             message,
         })
+    }
+
+    // ---------- EXPLAIN ----------
+
+    /// EXPLAIN: DML/DDL are described without running (no side effects); a
+    /// SELECT runs read-only so the reported access paths are the real ones,
+    /// but only the plan is returned — result rows are discarded.
+    fn exec_explain(
+        &self,
+        inner: Stmt,
+    ) -> Result<(Vec<String>, Vec<BTreeMap<String, Value>>, String, Option<String>), String> {
+        match inner {
+            Stmt::Select {
+                projection, from, joins, where_clause, group_by, having, order_by, limit, offset,
+            } => {
+                let (_, rows, plan, _) = self.exec_select(
+                    &projection, &from, &joins, where_clause, &group_by, having, &order_by,
+                    limit, offset,
+                )?;
+                let n = rows.len();
+                Ok((
+                    vec!["plan".into()],
+                    vec![mk_row(&[("plan", Value::Text(plan.clone()))])],
+                    format!("Explain(Select rows={})", n),
+                    Some(format!(
+                        "{} row(s); the SELECT ran read-only so the plan is real, rows discarded",
+                        n
+                    )),
+                ))
+            }
+            other => {
+                let desc = Self::describe_stmt(&other);
+                Ok((
+                    vec!["plan".into()],
+                    vec![mk_row(&[("plan", Value::Text(desc.clone()))])],
+                    format!("Explain({})", desc),
+                    Some("statement NOT executed".into()),
+                ))
+            }
+        }
+    }
+
+    /// Static plan description for a non-SELECT statement (EXPLAIN without
+    /// execution — nothing is mutated).
+    fn describe_stmt(stmt: &Stmt) -> String {
+        match stmt {
+            Stmt::Select { from, .. } => format!("Select(FROM {})", from),
+            Stmt::Insert { table, rows } => {
+                format!("Insert({}, {} row(s))", table, rows.len())
+            }
+            Stmt::Update { table, assignments, where_clause } => {
+                let set = assignments
+                    .iter()
+                    .map(|(k, v)| format!("{} = {}", k, v))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let w = where_clause
+                    .as_ref()
+                    .map(|e| format!(" WHERE {}", e.describe()))
+                    .unwrap_or_default();
+                format!("Update({} SET {}{})", table, set, w)
+            }
+            Stmt::Delete { table, where_clause } => format!(
+                "Delete({}{})",
+                table,
+                where_clause
+                    .as_ref()
+                    .map(|e| format!(" WHERE {}", e.describe()))
+                    .unwrap_or_default()
+            ),
+            Stmt::CreateTable { table, if_not_exists } => format!(
+                "CreateTable({}{})",
+                table.name,
+                if *if_not_exists { " [if-not-exists]" } else { "" }
+            ),
+            Stmt::DropTable { table, if_exists } => format!(
+                "DropTable({}{})",
+                table,
+                if *if_exists { " [if-exists]" } else { "" }
+            ),
+            Stmt::CreateIndex { name, table, column, unique, .. } => format!(
+                "CreateIndex({} ON {}({}){})",
+                name,
+                table,
+                column,
+                if *unique { " UNIQUE" } else { "" }
+            ),
+            Stmt::DropIndex { name, table, .. } => format!(
+                "DropIndex({}{})",
+                name,
+                table
+                    .as_ref()
+                    .map(|t| format!(" ON {}", t))
+                    .unwrap_or_default()
+            ),
+            Stmt::Explain(_) => "Explain(...)".into(),
+        }
     }
 
     // ---------- storage helpers ----------
@@ -1249,18 +1483,26 @@ impl SqlEngine {
         &self,
         name: &str,
         if_exists: bool,
+        table: Option<&str>,
     ) -> Result<(Vec<String>, Vec<BTreeMap<String, Value>>, String, Option<String>), String> {
-        // Locate the index across schemas.
+        // Locate the index: within the `ON <table>` table when qualified,
+        // otherwise across all schemas (legacy bare `DROP INDEX name`).
         let target = {
             let schemas = self.schemas.read();
-            schemas
-                .values()
-                .find_map(|t| {
+            match table {
+                Some(want) => schemas.get(want).and_then(|t| {
                     t.secondary_indexes
                         .iter()
                         .find(|i| i.name == name)
                         .map(|i| (t.name.clone(), i.column.clone()))
-                })
+                }),
+                None => schemas.values().find_map(|t| {
+                    t.secondary_indexes
+                        .iter()
+                        .find(|i| i.name == name)
+                        .map(|i| (t.name.clone(), i.column.clone()))
+                }),
+            }
         };
         let Some((table, column)) = target else {
             if if_exists {
@@ -1271,7 +1513,13 @@ impl SqlEngine {
                     None,
                 ));
             }
-            return Err(format!("index '{}' does not exist", name));
+            return Err(match table {
+                Some(want) => format!(
+                    "index '{}' does not exist on table '{}'",
+                    name, want
+                ),
+                None => format!("index '{}' does not exist", name),
+            });
         };
 
         // Delete every entry of this column's index in one batch.
@@ -1990,6 +2238,25 @@ impl SqlEngine {
             )?;
         }
 
+        // A computed projection item may be referenced from ORDER BY by its
+        // output alias — materialise such items into the rows before sorting.
+        if !projection.is_empty()
+            && !projection.iter().any(|p| matches!(p, SelectItem::Star))
+        {
+            for item in projection {
+                if let SelectItem::Computed { expr, rendered } = item {
+                    if order_by.iter().any(|(k, _)| k == rendered) {
+                        for row in current.iter_mut() {
+                            if !row.contains_key(rendered) {
+                                let v = expr.eval(row).unwrap_or(Value::Null);
+                                row.insert(rendered.clone(), v);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // ORDER BY (post-aggregation, pre-projection: sorting may reference
         // columns the projection would otherwise drop).
         if !order_by.is_empty() {
@@ -2020,28 +2287,46 @@ impl SqlEngine {
             let star = projection.is_empty()
                 || projection.iter().any(|p| matches!(p, SelectItem::Star));
             if !star {
-                let columns: Vec<(String, String)> = projection
-                    .iter()
-                    .filter_map(|item| match item {
+                let mut columns: Vec<(String, String)> = Vec::new();
+                let mut computed: Vec<(String, Expr)> = Vec::new();
+                let mut specs: Vec<String> = Vec::new();
+                for item in projection {
+                    match item {
                         SelectItem::Column { source, alias } => {
-                            Some((source.clone(), alias.clone().unwrap_or_else(|| source.clone())))
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                plan.push_str(&format!(
-                    " -> Project({:?})",
-                    columns
-                        .iter()
-                        .map(|(src, out)| {
-                            if src == out {
-                                src.clone()
+                            let out = alias.clone().unwrap_or_else(|| source.clone());
+                            specs.push(if out == *source {
+                                source.clone()
                             } else {
-                                format!("{} AS {}", src, out)
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                ));
+                                format!("{} AS {}", source, out)
+                            });
+                            columns.push((source.clone(), out));
+                        }
+                        SelectItem::Computed { expr, rendered } => {
+                            specs.push(format!("{} AS {}", expr.describe(), rendered));
+                            computed.push((rendered.clone(), expr.clone()));
+                        }
+                        SelectItem::Agg { rendered, .. } => specs.push(rendered.clone()),
+                        SelectItem::Star => {}
+                    }
+                }
+                // A computed expression may only reference real columns of
+                // the source table (plain columns keep the legacy behaviour
+                // of being skipped when absent).
+                if let Some(schema) = self.get_schema(&from) {
+                    let mut refs = Vec::new();
+                    for (_, expr) in &computed {
+                        expr.collect_columns(&mut refs);
+                    }
+                    for c in refs {
+                        if !schema.columns.contains_key(&c) {
+                            return Err(format!(
+                                "SQL: unknown column '{}' in projection",
+                                c
+                            ));
+                        }
+                    }
+                }
+                plan.push_str(&format!(" -> Project({:?})", specs));
                 current = current
                     .into_iter()
                     .map(|r| {
@@ -2050,6 +2335,10 @@ impl SqlEngine {
                             if let Some(v) = r.get(src) {
                                 out.insert(out_name.clone(), v.clone());
                             }
+                        }
+                        for (out_name, expr) in &computed {
+                            let v = expr.eval(&r).unwrap_or(Value::Null);
+                            out.insert(out_name.clone(), v);
                         }
                         out
                     })
@@ -2078,11 +2367,26 @@ impl SqlEngine {
                                 keep.push(rendered.clone());
                             }
                         }
+                        SelectItem::Computed { rendered, .. } => {
+                            if !keep.contains(rendered) {
+                                keep.push(rendered.clone());
+                            }
+                        }
                         SelectItem::Star => {}
                     }
                 }
                 for row in current.iter_mut() {
                     row.retain(|k, _| keep.contains(k));
+                }
+                // Computed items evaluate against the aggregated rows (group
+                // columns and aggregate results are all present at this point).
+                for item in projection {
+                    if let SelectItem::Computed { expr, rendered } = item {
+                        for row in current.iter_mut() {
+                            let v = expr.eval(row).unwrap_or(Value::Null);
+                            row.insert(rendered.clone(), v);
+                        }
+                    }
                 }
             }
         }
@@ -2242,6 +2546,12 @@ impl SqlEngine {
                 Expr::InList { .. } | Expr::Literal(_) | Expr::Column(_) => Ok(e.clone()),
                 Expr::Not(inner) => Ok(Expr::Not(Box::new(walk(sql, inner)?))),
                 Expr::IsNull(inner) => Ok(Expr::IsNull(Box::new(walk(sql, inner)?))),
+                Expr::IsNotNull(inner) => Ok(Expr::IsNotNull(Box::new(walk(sql, inner)?))),
+                Expr::Arith { op, left, right } => Ok(Expr::Arith {
+                    op: *op,
+                    left: Box::new(walk(sql, left)?),
+                    right: Box::new(walk(sql, right)?),
+                }),
                 Expr::And(a, b) => Ok(Expr::And(Box::new(walk(sql, a)?), Box::new(walk(sql, b)?))),
                 Expr::Or(a, b) => Ok(Expr::Or(Box::new(walk(sql, a)?), Box::new(walk(sql, b)?))),
                 Expr::Cmp { op, left, right } => Ok(Expr::Cmp {
@@ -2721,6 +3031,10 @@ fn expr_to_sql(e: &Expr) -> String {
         Expr::And(a, b) => format!("({} AND {})", expr_to_sql(a), expr_to_sql(b)),
         Expr::Or(a, b) => format!("({} OR {})", expr_to_sql(a), expr_to_sql(b)),
         Expr::IsNull(inner) => format!("{} IS NULL", expr_to_sql(inner)),
+        Expr::IsNotNull(inner) => format!("{} IS NOT NULL", expr_to_sql(inner)),
+        Expr::Arith { op, left, right } => {
+            format!("{} {} {}", expr_to_sql(left), op.as_str(), expr_to_sql(right))
+        }
         Expr::Cmp { op, left, right } => {
             format!("{} {} {}", expr_to_sql(left), op.as_str(), expr_to_sql(right))
         }
@@ -2758,6 +3072,14 @@ fn render_select_sql(stmt: &Stmt) -> String {
                     Some(a) if a != source => format!("{} AS {}", source, a),
                     _ => source.clone(),
                 },
+                SelectItem::Computed { expr, rendered } => {
+                    let base = expr_to_sql(expr);
+                    if *rendered == expr.describe() {
+                        base
+                    } else {
+                        format!("{} AS {}", base, rendered)
+                    }
+                }
                 SelectItem::Agg { canonical, .. } => canonical.clone(),
             })
             .collect::<Vec<_>>()
