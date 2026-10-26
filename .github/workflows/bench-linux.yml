@@ -83,17 +83,38 @@ jobs:
             fi
           fi
 
-          # (c) restart once with --init-file (authoritative password reset)
+          # (c) authoritative: temporary --skip-grant-tables server, the
+          #     documented MySQL root-password-reset procedure
           if [ "$configured" = 0 ]; then
-            echo "resetting the root password via --init-file restart"
-            sudo systemctl stop mysql
-            sudo mkdir -p /etc/systemd/system/mysql.service.d
-            printf '[Service]\nExecStart=\nExecStart=/usr/sbin/mysqld --init-file=/tmp/mysql-init.sql\n' \
-              | sudo tee /etc/systemd/system/mysql.service.d/zz-init-file.conf >/dev/null
+            echo "resetting root password via a temporary --skip-grant-tables server"
+            sudo systemctl stop mysql || true
+            sudo mkdir -p /var/run/mysqld
+            sudo chown mysql:mysql /var/run/mysqld
+            sudo -u mysql /usr/sbin/mysqld --skip-grant-tables >/dev/null 2>&1 &
+            ok=0
+            for i in $(seq 1 45); do
+              if mysql -e "SELECT 1" >/dev/null 2>&1; then ok=1; break; fi
+              sleep 1
+            done
+            if [ "$ok" = 1 ]; then
+              mysql -e "FLUSH PRIVILEGES;"
+              mysql < /tmp/mysql-init.sql && configured=1 || true
+            else
+              echo "temporary server did not come up; error.log:"
+              sudo tail -40 /var/log/mysql/error.log || true
+            fi
+            mb_pid=$(pgrep -u mysql -x mysqld | head -1 || true)
+            if [ -n "$mb_pid" ]; then
+              sudo kill "$mb_pid" 2>/dev/null || true
+              for i in $(seq 1 30); do
+                kill -0 "$mb_pid" 2>/dev/null || break
+                sleep 1
+              done
+              sudo kill -9 "$mb_pid" 2>/dev/null || true
+            fi
             sudo systemctl daemon-reload
-            sudo systemctl start mysql
-            sudo rm -f /etc/systemd/system/mysql.service.d/zz-init-file.conf
-            sudo systemctl daemon-reload
+            sudo systemctl reset-failed mysql || true
+            sudo systemctl start mysql || true
           fi
 
           # verify: this must succeed for the benchmark to run
@@ -101,7 +122,13 @@ jobs:
             mysql -h127.0.0.1 -uroot -pbench -e "SELECT 1" >/dev/null 2>&1 && break
             sleep 2
           done
-          mysql -h127.0.0.1 -uroot -pbench -e "SELECT VERSION(); SELECT @@innodb_flush_log_at_trx_commit;"
+          if ! mysql -h127.0.0.1 -uroot -pbench -e \
+              "SELECT VERSION(); SELECT @@innodb_flush_log_at_trx_commit;"; then
+            echo "MySQL verification failed; diagnostics:"
+            sudo tail -40 /var/log/mysql/error.log || true
+            sudo systemctl status mysql --no-pager || true
+            exit 1
+          fi
 
       - name: Configure PostgreSQL (user/database 'bench')
         run: |
