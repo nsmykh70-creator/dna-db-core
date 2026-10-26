@@ -1,6 +1,6 @@
 {
   "meta": {
-    "date": "2026-10-26 12:57:55",
+    "date": "2026-10-26 14:38:08",
     "machine": "posix | Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
     "params": {
       "load": 10000,
@@ -15,88 +15,88 @@
       "batch_size": 200
     },
     "durability": {
-      "dnadb": "--sync strict (fsync WAL per ack)",
+      "dnadb": "--sync strict (fsync WAL per ack); cleartext; no encryption",
       "mysql": "innodb_flush_log_at_trx_commit=1 (default)",
       "postgres": "synchronous_commit=on (default)"
     }
   },
   "systems": {
     "dnadb": {
-      "name": "DNA-DB v3.0",
-      "version": "dna-db-core 3.0.0 (strict fsync)",
+      "name": "DNA-DB v3.3",
+      "version": "dna-db-core 3.3.0 (legacy, strict fsync)",
       "load": {
         "ops": 10000,
-        "secs": 2.388,
-        "ops_s": 4187,
-        "avg_ms": 0.239,
-        "p50_ms": 0.228,
-        "p95_ms": 0.292,
-        "p99_ms": 0.352
+        "secs": 1.975,
+        "ops_s": 5064,
+        "avg_ms": 0.197,
+        "p50_ms": 0.189,
+        "p95_ms": 0.257,
+        "p99_ms": 0.317
       },
       "load_mt": {
         "ops": 8000,
-        "secs": 2.097,
-        "ops_s": 3814,
+        "secs": 1.514,
+        "ops_s": 5286,
         "threads": 8,
         "errors": 0,
-        "avg_ms": 1.988,
-        "p50_ms": 1.604,
-        "p95_ms": 3.084,
-        "p99_ms": 4.373,
+        "avg_ms": 1.306,
+        "p50_ms": 1.269,
+        "p95_ms": 2.271,
+        "p99_ms": 2.877,
         "verify_ok": true
       },
       "load_batch": {
         "ops": 8000,
-        "secs": 0.031,
-        "ops_s": 260755,
+        "secs": 0.045,
+        "ops_s": 178586,
         "batches": 40,
         "batch_size": 200,
         "per_op": "batch",
         "errors": 0,
-        "avg_ms": 0.767,
-        "p50_ms": 0.759,
-        "p95_ms": 0.823,
-        "p99_ms": 0.881,
+        "avg_ms": 1.119,
+        "p50_ms": 1.088,
+        "p95_ms": 1.295,
+        "p99_ms": 1.487,
         "verify_ok": true
       },
       "point_read": {
         "ops": 4000,
-        "secs": 0.131,
-        "ops_s": 30642,
+        "secs": 0.152,
+        "ops_s": 26276,
         "errors": 0,
-        "avg_ms": 0.032,
-        "p50_ms": 0.031,
-        "p95_ms": 0.037,
-        "p99_ms": 0.043
+        "avg_ms": 0.037,
+        "p50_ms": 0.036,
+        "p95_ms": 0.044,
+        "p99_ms": 0.053
       },
       "mixed": {
         "ops": 4000,
-        "secs": 0.264,
-        "ops_s": 15136,
+        "secs": 0.273,
+        "ops_s": 14635,
         "threads": 8,
-        "avg_ms": 0.319,
-        "p50_ms": 0.275,
-        "p95_ms": 0.714,
-        "p99_ms": 0.942
+        "avg_ms": 0.165,
+        "p50_ms": 0.146,
+        "p95_ms": 0.382,
+        "p99_ms": 0.521
       },
       "sql_load": {
         "ops": 3000,
-        "secs": 0.719,
-        "ops_s": 4173,
-        "avg_ms": 0.239,
-        "p50_ms": 0.234,
-        "p95_ms": 0.278,
-        "p99_ms": 0.334
+        "secs": 0.634,
+        "ops_s": 4734,
+        "avg_ms": 0.209,
+        "p50_ms": 0.202,
+        "p95_ms": 0.252,
+        "p99_ms": 0.304
       },
       "sql_point_query": {
         "ops": 1500,
-        "secs": 0.058,
-        "ops_s": 25686,
+        "secs": 0.076,
+        "ops_s": 19667,
         "errors": 0,
-        "avg_ms": 0.036,
-        "p50_ms": 0.036,
-        "p95_ms": 0.039,
-        "p99_ms": 0.05
+        "avg_ms": 0.044,
+        "p50_ms": 0.043,
+        "p95_ms": 0.049,
+        "p99_ms": 0.064
       }
     },
     "mysql": {
@@ -104,77 +104,77 @@
       "version": "MySQL 8.0.46-0ubuntu0.24.04.4 (innodb_flush_log_at_trx_commit=1)",
       "load": {
         "ops": 10000,
-        "secs": 5.914,
-        "ops_s": 1691,
-        "avg_ms": 0.591,
-        "p50_ms": 0.492,
-        "p95_ms": 0.665,
-        "p99_ms": 1.104
+        "secs": 5.171,
+        "ops_s": 1934,
+        "avg_ms": 0.517,
+        "p50_ms": 0.514,
+        "p95_ms": 0.644,
+        "p99_ms": 0.764
       },
       "load_mt": {
         "ops": 8000,
-        "secs": 1.012,
-        "ops_s": 7908,
+        "secs": 1.123,
+        "ops_s": 7122,
         "threads": 8,
         "errors": 0,
-        "avg_ms": 0.927,
-        "p50_ms": 0.856,
-        "p95_ms": 1.315,
-        "p99_ms": 2.322,
+        "avg_ms": 0.973,
+        "p50_ms": 0.942,
+        "p95_ms": 1.376,
+        "p99_ms": 1.659,
         "verify_ok": true
       },
       "load_batch": {
         "ops": 8000,
-        "secs": 0.084,
-        "ops_s": 95621,
+        "secs": 0.094,
+        "ops_s": 85333,
         "batches": 40,
         "batch_size": 200,
         "per_op": "batch",
         "errors": 0,
-        "avg_ms": 2.091,
-        "p50_ms": 1.719,
-        "p95_ms": 4.217,
-        "p99_ms": 5.48,
+        "avg_ms": 2.341,
+        "p50_ms": 2.214,
+        "p95_ms": 2.956,
+        "p99_ms": 5.099,
         "verify_ok": true
       },
       "point_read": {
         "ops": 4000,
-        "secs": 0.259,
-        "ops_s": 15440,
+        "secs": 0.673,
+        "ops_s": 5947,
         "errors": 0,
-        "avg_ms": 0.064,
-        "p50_ms": 0.063,
-        "p95_ms": 0.076,
-        "p99_ms": 0.086
+        "avg_ms": 0.166,
+        "p50_ms": 0.173,
+        "p95_ms": 0.197,
+        "p99_ms": 0.211
       },
       "mixed": {
         "ops": 4000,
-        "secs": 0.239,
-        "ops_s": 16737,
+        "secs": 0.481,
+        "ops_s": 8309,
         "threads": 8,
-        "avg_ms": 0.278,
-        "p50_ms": 0.222,
-        "p95_ms": 0.669,
-        "p99_ms": 1.109
+        "avg_ms": 0.672,
+        "p50_ms": 0.575,
+        "p95_ms": 1.435,
+        "p99_ms": 2.24
       },
       "sql_load": {
         "ops": 3000,
-        "secs": 2.124,
-        "ops_s": 1412,
-        "avg_ms": 0.708,
-        "p50_ms": 0.473,
-        "p95_ms": 0.653,
-        "p99_ms": 2.177
+        "secs": 1.573,
+        "ops_s": 1907,
+        "avg_ms": 0.524,
+        "p50_ms": 0.519,
+        "p95_ms": 0.667,
+        "p99_ms": 0.807
       },
       "sql_point_query": {
         "ops": 1500,
-        "secs": 0.101,
-        "ops_s": 14890,
+        "secs": 0.282,
+        "ops_s": 5313,
         "errors": 0,
-        "avg_ms": 0.066,
-        "p50_ms": 0.072,
-        "p95_ms": 0.084,
-        "p99_ms": 0.096
+        "avg_ms": 0.184,
+        "p50_ms": 0.193,
+        "p95_ms": 0.217,
+        "p99_ms": 0.231
       }
     },
     "postgres": {
@@ -182,77 +182,77 @@
       "version": "PostgreSQL 16.15 (Ubuntu 16.15-1.pgdg24.04+2) (synchronous_commit=on)",
       "load": {
         "ops": 10000,
-        "secs": 1.448,
-        "ops_s": 6906,
-        "avg_ms": 0.145,
-        "p50_ms": 0.139,
-        "p95_ms": 0.172,
-        "p99_ms": 0.209
+        "secs": 1.776,
+        "ops_s": 5632,
+        "avg_ms": 0.177,
+        "p50_ms": 0.163,
+        "p95_ms": 0.219,
+        "p99_ms": 0.273
       },
       "load_mt": {
         "ops": 8000,
-        "secs": 0.292,
-        "ops_s": 27422,
+        "secs": 0.443,
+        "ops_s": 18054,
         "threads": 8,
         "errors": 0,
-        "avg_ms": 0.271,
-        "p50_ms": 0.258,
-        "p95_ms": 0.376,
-        "p99_ms": 0.448,
+        "avg_ms": 0.41,
+        "p50_ms": 0.376,
+        "p95_ms": 0.62,
+        "p99_ms": 0.794,
         "verify_ok": true
       },
       "load_batch": {
         "ops": 8000,
-        "secs": 0.028,
-        "ops_s": 287209,
+        "secs": 0.044,
+        "ops_s": 183695,
         "batches": 40,
         "batch_size": 200,
         "per_op": "batch",
         "errors": 0,
-        "avg_ms": 0.695,
-        "p50_ms": 0.685,
-        "p95_ms": 0.774,
-        "p99_ms": 1.15,
+        "avg_ms": 1.088,
+        "p50_ms": 1.078,
+        "p95_ms": 1.222,
+        "p99_ms": 1.698,
         "verify_ok": true
       },
       "point_read": {
         "ops": 4000,
-        "secs": 0.167,
-        "ops_s": 23953,
+        "secs": 0.37,
+        "ops_s": 10819,
         "errors": 0,
-        "avg_ms": 0.041,
-        "p50_ms": 0.041,
-        "p95_ms": 0.044,
-        "p99_ms": 0.054
+        "avg_ms": 0.09,
+        "p50_ms": 0.081,
+        "p95_ms": 0.132,
+        "p99_ms": 0.165
       },
       "mixed": {
         "ops": 4000,
-        "secs": 0.121,
-        "ops_s": 33030,
+        "secs": 0.211,
+        "ops_s": 18990,
         "threads": 8,
-        "avg_ms": 0.193,
-        "p50_ms": 0.141,
-        "p95_ms": 0.457,
-        "p99_ms": 0.672
+        "avg_ms": 0.35,
+        "p50_ms": 0.289,
+        "p95_ms": 0.764,
+        "p99_ms": 1.075
       },
       "sql_load": {
         "ops": 3000,
-        "secs": 0.456,
-        "ops_s": 6578,
-        "avg_ms": 0.152,
-        "p50_ms": 0.146,
-        "p95_ms": 0.181,
-        "p99_ms": 0.244
+        "secs": 0.538,
+        "ops_s": 5573,
+        "avg_ms": 0.179,
+        "p50_ms": 0.166,
+        "p95_ms": 0.225,
+        "p99_ms": 0.268
       },
       "sql_point_query": {
         "ops": 1500,
-        "secs": 0.072,
-        "ops_s": 20879,
+        "secs": 0.196,
+        "ops_s": 7666,
         "errors": 0,
-        "avg_ms": 0.047,
-        "p50_ms": 0.049,
-        "p95_ms": 0.052,
-        "p99_ms": 0.062
+        "avg_ms": 0.126,
+        "p50_ms": 0.124,
+        "p95_ms": 0.137,
+        "p99_ms": 0.143
       }
     }
   }
