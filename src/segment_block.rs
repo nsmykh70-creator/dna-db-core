@@ -98,6 +98,20 @@ impl RepairHook for NoRepair {
     }
 }
 
+/// Validation-only hook: allows local Reed–Solomon repair during a full sweep
+/// but never escalates to the mirror (which is what is being validated).
+struct ValidationRepair;
+
+impl RepairHook for ValidationRepair {
+    fn repair_on_read(&self) -> bool {
+        true
+    }
+    fn on_repaired(&self, _: &Path, _: usize, _: &[usize], _: u64) {}
+    fn on_unrecoverable(&self, _: &Path, _: usize, _: &[usize]) -> bool {
+        false
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Interleaving geometry (pure functions, unit-tested)
 // ---------------------------------------------------------------------------
@@ -322,9 +336,8 @@ impl BlockSegmentWriter {
         };
         superblock[68..72].copy_from_slice(&sb_crc.to_le_bytes());
 
-        // ---- footer (64 B, full geometry redundancy) -----------------------
+        // ---- footer (64 B, full geometry redundancy + self CRC) ------------
         let mut footer = [0u8; FOOTER_SIZE];
-        footer[0..4].copy_from_slice(&sb_crc.to_le_bytes());
         footer[4..12].copy_from_slice(&(entries.len() as u64).to_le_bytes());
         footer[12..16].copy_from_slice(&table_a_crc.to_le_bytes());
         footer[16..20].copy_from_slice(&table_b_crc.to_le_bytes());
@@ -336,6 +349,12 @@ impl BlockSegmentWriter {
         footer[38..46].copy_from_slice(&(index_bytes as u64).to_le_bytes());
         footer[46..54].copy_from_slice(&table_offset.to_le_bytes());
         footer[56..64].copy_from_slice(BLOCK_MAGIC);
+        let footer_crc = {
+            let mut h = Hasher::new();
+            h.update(&footer[4..64]);
+            h.finalize()
+        };
+        footer[0..4].copy_from_slice(&footer_crc.to_le_bytes());
 
         // ---- write atomically -----------------------------------------------
         let tmp_path = dir.join(format!("{:06}.tmp", segment_id));
@@ -413,6 +432,10 @@ struct IndexEntry {
 pub struct BlockSegmentReader {
     path: PathBuf,
     file: RwLock<File>,
+    /// False when the file was opened read-only (read-only media, doctor
+    /// inspection); parity reconstruction is then unavailable but all reads
+    /// that do not need repair still work.
+    writable: bool,
     k: usize,
     m: usize,
     interleave_seed: u64,
@@ -429,9 +452,14 @@ pub struct BlockSegmentReader {
     bloom: Bloom,
     codec: ErasureCodec,
     hook: RwLock<Arc<dyn RepairHook>>,
-    /// Data-region stripes whose damage exceeds parity (quarantined at open:
-    /// reads touching them fail honestly; the rest of the segment works).
-    quarantined: Mutex<HashSet<usize>>,
+    /// (region_is_index, stripe) pairs whose damage exceeds parity. Regions
+    /// are namespaced: data stripe N and index stripe N are different physical
+    /// stripes and must not share quarantine state.
+    quarantined: Mutex<HashSet<(bool, usize)>>,
+    /// Logical data-byte ranges skipped while rebuilding a damaged index.
+    /// Lookups that miss the (incomplete) index but pass the Bloom filter must
+    /// fail instead of pretending the key does not exist.
+    lost_ranges: Mutex<Vec<(usize, usize)>>,
     /// Statistics: blocks repaired in place by this reader instance.
     pub repairs_done: std::sync::atomic::AtomicU64,
     /// Set when the in-memory index was rebuilt from the record stream
@@ -459,7 +487,16 @@ impl BlockSegmentReader {
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         // Read+write: the repair pipeline rewrites damaged blocks in place.
-        let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
+        // If the medium is read-only, fall back to read-only mode instead of
+        // refusing to open: reads and doctor scans still work, only in-place
+        // parity reconstruction is unavailable.
+        let (mut file, writable) = match OpenOptions::new().read(true).write(true).open(&path) {
+            Ok(file) => (file, true),
+            Err(rw_error) => match File::open(&path) {
+                Ok(file) => (file, false),
+                Err(_) => return Err(rw_error),
+            },
+        };
         let len = file.metadata()?.len();
         if len < (SUPERBLOCK_SIZE + FOOTER_SIZE) as u64 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "segment too small"));
@@ -469,7 +506,12 @@ impl BlockSegmentReader {
         file.seek(SeekFrom::Start(len - FOOTER_SIZE as u64))?;
         let mut footer = [0u8; FOOTER_SIZE];
         file.read_exact(&mut footer)?;
-        let footer_ok = &footer[56..64] == BLOCK_MAGIC;
+        let footer_magic_ok = &footer[56..64] == BLOCK_MAGIC;
+        let footer_crc_ok = {
+            let mut h = Hasher::new();
+            h.update(&footer[4..64]);
+            h.finalize() == u32::from_le_bytes(footer[0..4].try_into().unwrap())
+        };
 
         // ---- superblock ------------------------------------------------------
         file.seek(SeekFrom::Start(0))?;
@@ -481,6 +523,16 @@ impl BlockSegmentReader {
             h.update(&sb[0..68]);
             h.finalize() == u32::from_le_bytes(sb[68..72].try_into().unwrap())
         };
+        // New footers carry their own CRC32. Old footers stored the superblock
+        // CRC in the same field; accept those when the superblock proves it.
+        let legacy_footer_ok = footer_magic_ok
+            && sb_crc_ok
+            && footer[0..4] == sb[68..72];
+        // If the superblock itself is unavailable, an old footer cannot be
+        // verified; accept its magic for backward compatibility (same as the
+        // pre-fix behaviour), while new footers are verified above.
+        let footer_ok =
+            footer_magic_ok && (footer_crc_ok || legacy_footer_ok || !sb_crc_ok);
         if !sb_magic_ok && !footer_ok {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -552,7 +604,7 @@ impl BlockSegmentReader {
             let table_raw_b = read_table(table_offset + (table_len * 4) as u64)?;
             if verify(&table_raw_b, table_b_crc) {
                 eprintln!(
-                    "[DNASST02] {:?}: CRC table copy A damaged; using copy B (doctor --fix rewrites A)",
+                    "[DNASST02] {:?}: CRC table copy A damaged; using copy B (copy A remains damaged; run doctor --fix to rewrite it)",
                     path.file_name().unwrap_or_default()
                 );
                 table_raw_b
@@ -576,6 +628,7 @@ impl BlockSegmentReader {
         let mut reader = Self {
             path,
             file: RwLock::new(file),
+            writable,
             k,
             m,
             interleave_seed,
@@ -591,16 +644,37 @@ impl BlockSegmentReader {
             codec,
             hook: RwLock::new(Arc::new(NoRepair)),
             quarantined: Mutex::new(HashSet::new()),
+            lost_ranges: Mutex::new(Vec::new()),
             repairs_done: std::sync::atomic::AtomicU64::new(0),
             index_rebuilt: std::sync::atomic::AtomicBool::new(false),
         };
 
-        // Bloom sidecar (optional).
+        // Bloom sidecar (optional). A corrupt sidecar is derived data: it must
+        // never block opening the segment. Fall back to a permissive filter so
+        // every lookup still goes to the authoritative block index.
         let bloom_path = reader.path.with_extension("bloom");
         if bloom_path.exists() {
-            let raw = std::fs::read(&bloom_path)?;
-            reader.bloom = Bloom::from_bytes(&raw)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            match std::fs::read(&bloom_path) {
+                Ok(raw) => match Bloom::from_bytes(&raw) {
+                    Ok(bloom) => reader.bloom = bloom,
+                    Err(e) => {
+                        eprintln!(
+                            "[DNASST02] {:?}: invalid bloom sidecar ({}); using permissive filter",
+                            bloom_path.file_name().unwrap_or_default(),
+                            e
+                        );
+                        reader.bloom = Bloom::permissive();
+                    }
+                },
+                Err(e) => {
+                    eprintln!(
+                        "[DNASST02] {:?}: cannot read bloom sidecar ({}); using permissive filter",
+                        bloom_path.file_name().unwrap_or_default(),
+                        e
+                    );
+                    reader.bloom = Bloom::permissive();
+                }
+            }
         }
 
         // Block index — read through the verified path. If the index region
@@ -820,7 +894,17 @@ impl BlockSegmentReader {
         }
 
         let hook = self.hook.read().clone();
-        if self.is_quarantined(stripe) {
+        if !self.writable {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "segment {:?} is read-only; stripe {} needs parity repair but cannot be written",
+                    self.path.file_name().unwrap_or_default(),
+                    stripe
+                ),
+            ));
+        }
+        if self.is_quarantined(index_region, stripe) {
             return Err(self.unrecoverable_error(index_region, stripe, &damaged_idx));
         }
         if !hook.repair_on_read() {
@@ -986,9 +1070,12 @@ impl BlockSegmentReader {
 
     /// Rebuild the block index by scanning the record stream directly.
     /// Records that cannot be read (their stripe exceeded parity) are
-    /// skipped; the scan resynchronises at the next block boundary.
+    /// skipped; the scan resynchronises at the next block boundary. Skipped
+    /// byte ranges are remembered so `get()` can return an honest error for a
+    /// key that might live there instead of `Ok(None)`.
     fn rebuild_index_from_records(&mut self) -> io::Result<()> {
         let mut entries = Vec::new();
+        let mut lost = Vec::new();
         let mut pos = 0usize;
         let mut lost_records = 0usize;
         while pos < self.data_bytes {
@@ -1005,7 +1092,11 @@ impl BlockSegmentReader {
                     // Damage inside this record: resync at the next logical
                     // block boundary (record boundaries are unknown there).
                     lost_records += 1;
-                    pos = (pos / BLOCK_SIZE + 1) * BLOCK_SIZE;
+                    let next = ((pos / BLOCK_SIZE + 1) * BLOCK_SIZE).min(self.data_bytes);
+                    if next > pos {
+                        lost.push((pos, next));
+                    }
+                    pos = next;
                 }
             }
         }
@@ -1016,6 +1107,7 @@ impl BlockSegmentReader {
             lost_records
         );
         self.index = entries;
+        *self.lost_ranges.lock() = lost;
         Ok(())
     }
 
@@ -1060,11 +1152,25 @@ impl BlockSegmentReader {
             .binary_search_by(|e| e.key.as_slice().cmp(lookup_key))
         {
             Ok(i) => i,
-            Err(_) => return Ok(None),
+            Err(_) => {
+                // The index was rebuilt while some records were unreachable.
+                // Bloom said "maybe", so the key may be in a lost block range:
+                // never report a false negative as a clean miss.
+                if !self.lost_ranges.lock().is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "key may be stored in an unreadable range of segment {:?}; run doctor",
+                            self.path.file_name().unwrap_or_default()
+                        ),
+                    ));
+                }
+                return Ok(None);
+            }
         };
         let entry = &self.index[i];
         let stripe = entry.block as usize / self.k;
-        if self.is_quarantined(stripe) {
+        if self.is_quarantined(false, stripe) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -1127,6 +1233,26 @@ impl BlockSegmentReader {
         Ok(self.repairs_done.load(std::sync::atomic::Ordering::Relaxed))
     }
 
+    /// Like `validate_all`, but temporarily enables local parity repair. This
+    /// is used by mirror reconciliation: a strand with repairable damage must
+    /// be healed *before* it is compared with its twin, otherwise the mirror
+    /// layer would wrongly declare it unusable and copy the other strand over
+    /// it (or abort startup when the other strand is missing).
+    pub fn validate_all_with_repair(&self) -> io::Result<u64> {
+        let previous = {
+            let mut hook = self.hook.write();
+            std::mem::replace(&mut *hook, Arc::new(ValidationRepair))
+        };
+        let result = self.validate_all();
+        *self.hook.write() = previous;
+        result
+    }
+
+    /// Number of logical byte ranges that the rebuilt index had to skip.
+    pub fn lost_range_count(&self) -> usize {
+        self.lost_ranges.lock().len()
+    }
+
     /// Quarantine-mode validation for engine open: verify every block
     /// WITHOUT repairing. Stripes with damage ≤ m stay usable (on-read
     /// repair / scrubber will fix them); stripes with damage > m are
@@ -1165,7 +1291,7 @@ impl BlockSegmentReader {
                 continue;
             }
             if bad > self.m {
-                quarantined.insert(stripe);
+                quarantined.insert((false, stripe));
             } else {
                 repairable += 1;
             }
@@ -1187,9 +1313,14 @@ impl BlockSegmentReader {
         self.quarantined.lock().len()
     }
 
+    /// Whether in-place parity repair is possible for this handle.
+    pub fn is_writable(&self) -> bool {
+        self.writable
+    }
+
     #[inline]
-    fn is_quarantined(&self, stripe: usize) -> bool {
-        self.quarantined.lock().contains(&stripe)
+    fn is_quarantined(&self, index_region: bool, stripe: usize) -> bool {
+        self.quarantined.lock().contains(&(index_region, stripe))
     }
 
     /// Lesion scan WITHOUT repair (policy ScrubOnly / doctor dry run):

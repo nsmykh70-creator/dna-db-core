@@ -709,13 +709,31 @@ fn run_doctor(
 
     // Cross-strand cascade (A↔B): heal damaged copies across the spirals.
     // Runs after the per-side RS fix so parity is tried first, mirror second.
+    // Repair both strands, not only the primary: a damaged B-only segment or
+    // closed WAL must not stay invisible just because the CLI was pointed at A.
+    if fix && !migrate {
+        if let Some(mirror) = mirror_dir {
+            match repair::doctor_fix(std::path::Path::new(mirror)) {
+                Ok(b_report) => {
+                    if !b_report.errors.is_empty() {
+                        eprintln!(
+                            "[DOCTOR] Strand B fix completed with {} error(s)",
+                            b_report.errors.len()
+                        );
+                    }
+                }
+                Err(e) => eprintln!("[DOCTOR] Strand B fix failed: {e}"),
+            }
+        }
+    }
+
     let cascade = match (mirror_dir, migrate) {
         (Some(mirror), false) => {
             match repair::doctor_cascade_strands(dir, std::path::Path::new(mirror), fix) {
                 Ok(c) => Some(c),
                 Err(e) => {
                     eprintln!("[DOCTOR] cross-strand cascade failed: {}", e);
-                    return 1;
+                    None
                 }
             }
         }
@@ -753,6 +771,12 @@ fn run_doctor(
                     );
                     if let Some(d) = &v.detail {
                         println!("      detail: {}", d);
+                    }
+                }
+                if !report.errors.is_empty() {
+                    println!("fix errors ({}):", report.errors.len());
+                    for e in &report.errors {
+                        println!("  - {}", e);
                     }
                 }
                 if let Some(c) = &cascade {

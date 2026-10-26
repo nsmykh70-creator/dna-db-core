@@ -20,7 +20,7 @@ use crc32fast::Hasher;
 
 use crate::bloom::Bloom;
 use crate::memtable::EntryValue;
-use crate::segment_block::{BlockLookup, BlockSegmentReader, RepairHook, BLOCK_MAGIC, LEGACY_MAGIC};
+use crate::segment_block::{BlockLookup, BlockSegmentReader, RepairHook};
 
 pub const SEGMENT_MAGIC: &[u8; 8] = b"DNASST01";
 const SPARSE_EVERY: usize = 16;
@@ -605,25 +605,29 @@ pub enum SegmentFile {
 }
 
 impl SegmentFile {
-    /// Open with magic auto-detection.
+    /// Open with format auto-detection.
+    ///
+    /// The DNASST02 container keeps a redundant superblock at offset 0 and a
+    /// footer at the end. The footer is only a convenience: when it is lost,
+    /// `BlockSegmentReader::open` can still recover the geometry from the
+    /// superblock. Therefore the dispatcher must try the block reader first and
+    /// fall back to legacy, instead of trusting the last 8 bytes exclusively.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
-        use std::io::{Read, Seek, SeekFrom};
         let path = path.as_ref();
-        let mut f = std::fs::File::open(path)?;
-        let len = f.metadata()?.len();
-        if len < 16 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "segment too small"));
-        }
-        f.seek(SeekFrom::Start(len - 8))?;
-        let mut magic = [0u8; 8];
-        f.read_exact(&mut magic)?;
-        match &magic {
-            BLOCK_MAGIC => Ok(SegmentFile::Block(BlockSegmentReader::open(path)?)),
-            LEGACY_MAGIC => Ok(SegmentFile::Legacy(SegmentReader::open(path)?)),
-            other => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unknown segment magic {:?}", String::from_utf8_lossy(other)),
-            )),
+        match BlockSegmentReader::open(path) {
+            Ok(reader) => Ok(SegmentFile::Block(reader)),
+            Err(block_error) => match SegmentReader::open(path) {
+                Ok(reader) => Ok(SegmentFile::Legacy(reader)),
+                Err(legacy_error) => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "unrecognized segment {:?}: block: {}; legacy: {}",
+                        path.file_name().unwrap_or_default(),
+                        block_error,
+                        legacy_error
+                    ),
+                )),
+            },
         }
     }
 
@@ -659,6 +663,18 @@ impl SegmentFile {
                 Ok(0)
             }
             SegmentFile::Block(r) => r.validate_all(),
+        }
+    }
+
+    /// Validation that may repair DNASST02 parity locally, but never recurses
+    /// into the mirror layer. Used by mirror reconciliation.
+    pub fn validate_repairable(&self) -> io::Result<u64> {
+        match self {
+            SegmentFile::Legacy(r) => {
+                r.validate_all()?;
+                Ok(0)
+            }
+            SegmentFile::Block(r) => r.validate_all_with_repair(),
         }
     }
 

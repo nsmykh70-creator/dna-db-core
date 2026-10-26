@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use parking_lot::{Mutex, RwLock};
 use crate::segment::SegmentFile;
-use crate::wal::{SyncMode, WalEntry, WalOp, WalReader, WalWriter};
+use crate::wal::{SyncMode, WalEntry, WalOp, WalParity, WalReader, WalWriter};
 
 const MANIFEST_FILE: &str = "segments.manifest";
 const MANIFEST_MAGIC: &[u8; 8] = b"DNAMAN01";
@@ -212,6 +212,24 @@ impl DualStrandMirror {
                 (true, true) if files_equal(&primary, &backup)? => {
                     sync_bloom(&primary, &backup)?;
                 }
+                (true, true) if formats_differ(&primary, &backup) => {
+                    // Never let an older DNASST01 copy overwrite a migrated
+                    // DNASST02 copy: `doctor --migrate` must survive restart.
+                    let primary_format = SegmentFile::open(&primary)?.format_tag();
+                    let backup_format = SegmentFile::open(&backup)?.format_tag();
+                    if primary_format == "DNASST02" {
+                        copy_segment_pair(&primary, &secondary_dir)?;
+                        eprintln!(
+                            "[MIRROR] Strand B copy of {file_name} is {backup_format}; migrated from A"
+                        );
+                    } else {
+                        copy_segment_pair(&backup, &self.primary_dir)?;
+                        validate_segment(&primary)?;
+                        eprintln!(
+                            "[MIRROR] Strand A copy of {file_name} is {primary_format}; migrated from B"
+                        );
+                    }
+                }
                 (true, true) if !has_manifest => {
                     // Legacy databases have no manifest; A is authoritative
                     // during this one-time migration.
@@ -322,8 +340,9 @@ impl DualStrandMirror {
     }
 
     /// Rotate Strand B's active WAL to `wal_<seq>.wal`, mirroring the
-    /// rotation the engine performed on Strand A (same seq number).
-    pub fn rotate_wal(&self, seq: u64) -> io::Result<()> {
+    /// rotation the engine performed on Strand A (same seq number), and
+    /// immediately RS-protect the frozen B copy too.
+    pub fn rotate_wal(&self, seq: u64, k: usize, m: usize) -> io::Result<()> {
         let secondary_dir = self.secondary_dir.read().clone();
         let backup = secondary_dir.join("active.wal");
         let closed = secondary_dir.join(format!("wal_{seq:06}.wal"));
@@ -349,6 +368,16 @@ impl DualStrandMirror {
         }
         #[cfg(windows)]
         let _ = &secondary_dir;
+        // Strand B's closed WAL needs the same erasure protection as A's; a
+        // missing B parity sidecar made B-only recovery fall back to copying A.
+        if std::fs::metadata(&closed).map(|m| m.len() > 0).unwrap_or(false) {
+            if let Err(e) = WalParity::protect(&closed, k, m) {
+                eprintln!(
+                    "[MIRROR] Strand B WAL parity protection failed for {:?}: {e}",
+                    closed.file_name().unwrap_or_default()
+                );
+            }
+        }
         match WalWriter::open(&backup, SyncMode::Strict) {
             Ok(w) => {
                 *guard = Some(w);
@@ -405,11 +434,16 @@ impl DualStrandMirror {
                 _ => continue,
             };
             let backup = secondary_dir.join(&name);
-            if wal_copy_holds_valid_frames(&backup) {
-                continue;
+            let backup_valid_len = wal_copy_valid_len(&backup);
+            let primary_valid_len = wal_copy_valid_len(&path);
+            if let (Some(b_len), Some(a_len)) = (backup_valid_len, primary_valid_len) {
+                if b_len >= a_len {
+                    // B is valid and at least as complete as A; nothing to do.
+                    continue;
+                }
             }
             // Validate A's copy before propagating it (probe clone).
-            if !wal_copy_holds_valid_frames(&path) {
+            if primary_valid_len.is_none() {
                 // Damaged on both strands: the startup loop already logged
                 // A's parity/cascade outcome; nothing safe to copy.
                 continue;
@@ -417,13 +451,53 @@ impl DualStrandMirror {
             copy_atomic(&path, &backup)?;
             // Keep the parity sidecar in lockstep when present.
             let parity = path.with_extension("wal.parity");
+            let backup_parity = backup.with_extension("wal.parity");
             if parity.exists() {
-                let _ = copy_atomic(&parity, &backup.with_extension("wal.parity"));
+                copy_atomic(&parity, &backup_parity)?;
+            } else if backup_parity.exists() {
+                std::fs::remove_file(&backup_parity)?;
+                sync_directory(&secondary_dir)?;
             }
             rebuilt += 1;
-            eprintln!("[MIRROR] Rebuilt damaged Strand B closed WAL {name} from Strand A");
+            eprintln!("[MIRROR] Rebuilt damaged/stale Strand B closed WAL {name} from Strand A");
         }
         Ok(rebuilt)
+    }
+
+    /// Startup B->A half for *missing* closed WALs: a validated closed WAL
+    /// that exists only on Strand B is real data (for example, a crash between
+    /// B rotation and A rotation). Copy it to Strand A before recovery scans
+    /// the primary directory. Damaged A copies are handled by
+    /// `restore_closed_wal_better` in the engine loop.
+    pub fn heal_primary_closed_wals(&self, primary_dir: &Path) -> io::Result<usize> {
+        let secondary_dir = self.secondary_dir.read().clone();
+        let mut restored = 0usize;
+        let entries = match std::fs::read_dir(&secondary_dir) {
+            Ok(entries) => entries,
+            Err(_) => return Ok(0),
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = match path.file_name().map(|n| n.to_string_lossy().to_string()) {
+                Some(n) if n.starts_with("wal_") && n.ends_with(".wal") => n,
+                _ => continue,
+            };
+            let primary = primary_dir.join(&name);
+            if primary.exists() {
+                continue;
+            }
+            if wal_copy_valid_len(&path).is_none() {
+                continue;
+            }
+            copy_atomic(&path, &primary)?;
+            let parity = path.with_extension("wal.parity");
+            if parity.exists() {
+                copy_atomic(&parity, &primary.with_extension("wal.parity"))?;
+            }
+            restored += 1;
+            eprintln!("[MIRROR] Restored B-only closed WAL {name} to Strand A");
+        }
+        Ok(restored)
     }
 
     /// B→A cascade with a downgrade guard: restore `name` from Strand B only
@@ -461,7 +535,17 @@ impl DualStrandMirror {
     /// repair (keeps the strands byte-identical).
     pub fn sync_closed_wal(&self, name: &str, primary_dir: &Path) -> io::Result<()> {
         let secondary_dir = self.secondary_dir.read().clone();
-        copy_atomic(&primary_dir.join(name), &secondary_dir.join(name))?;
+        let source = primary_dir.join(name);
+        let destination = secondary_dir.join(name);
+        copy_atomic(&source, &destination)?;
+        let source_parity = source.with_extension("wal.parity");
+        let destination_parity = destination.with_extension("wal.parity");
+        if source_parity.exists() {
+            copy_atomic(&source_parity, &destination_parity)?;
+        } else if destination_parity.exists() {
+            std::fs::remove_file(&destination_parity)?;
+            sync_directory(&secondary_dir)?;
+        }
         Ok(())
     }
 
@@ -563,6 +647,13 @@ impl DualStrandMirror {
                 } else if name_str == MANIFEST_FILE {
                     copy_atomic(&source, &new_disk_path.join(&name))?;
                     primary_files.insert(name_str.to_string());
+                } else if name_str.starts_with("wal_")
+                    && (name_str.ends_with(".wal") || name_str.ends_with(".wal.parity"))
+                {
+                    // Closed WALs are immutable and may still be needed for
+                    // recovery of a crash that happened before checkpoint.
+                    copy_atomic(&source, &new_disk_path.join(&name))?;
+                    primary_files.insert(name_str.to_string());
                 } else if source.extension().is_some_and(|extension| extension == "sst") {
                     validate_segment(&source)?;
                     copy_segment_pair(&source, new_disk_path)?;
@@ -577,9 +668,12 @@ impl DualStrandMirror {
                 let path = entry.path();
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy();
-                if (name_str.ends_with(".sst") || name_str.ends_with(".bloom"))
-                    && !primary_files.contains(name_str.as_ref())
-                {
+                let is_db_file = name_str.ends_with(".sst")
+                    || name_str.ends_with(".bloom")
+                    || (name_str.starts_with("wal_")
+                        && (name_str.ends_with(".wal") || name_str.ends_with(".wal.parity")))
+                    || name_str.ends_with(".tmp");
+                if is_db_file && !primary_files.contains(name_str.as_ref()) {
                     std::fs::remove_file(path)?;
                 }
             }
@@ -714,8 +808,22 @@ fn select_manifest(
         }
         (Ok(Some(manifest)), _) | (_, Ok(Some(manifest))) => (Some(manifest), true),
         (Ok(None), Ok(None)) => (None, false),
-        (Err(error), Ok(None)) | (Ok(None), Err(error)) | (Err(error), Err(_)) => {
-            return Err(error);
+        // One manifest is corrupt but the other is absent: rebuild the active
+        // set from the primary segment directory instead of making the whole
+        // database unopenable. (A genuine both-strand conflict still fails.)
+        (Err(error), Ok(None)) => {
+            eprintln!("[MIRROR] Strand A manifest unreadable ({error}); rebuilding active set from segments");
+            (None, false)
+        }
+        (Ok(None), Err(error)) => {
+            eprintln!("[MIRROR] Strand B manifest unreadable ({error}); rebuilding active set from Strand A segments");
+            (None, false)
+        }
+        (Err(a), Err(b)) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("both segment manifests are unreadable: A: {a}; B: {b}"),
+            ));
         }
     };
 
@@ -785,8 +893,22 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 fn validate_segment(path: &Path) -> io::Result<()> {
-    SegmentFile::open(path)?.validate_all()?;
+    // Reconciliation must heal repairable parity damage on the strand being
+    // validated before deciding that it is unusable. Otherwise one missing
+    // strand plus one damaged block would abort startup even though the block
+    // is fully recoverable from that strand's own parity.
+    SegmentFile::open(path)?.validate_repairable()?;
     Ok(())
+}
+
+/// True when both files open successfully and use different SSTable formats.
+/// A failure to open is ignored here; normal validation reports it and the
+/// `(false, true)` / `(true, false)` arms handle it.
+fn formats_differ(a: &Path, b: &Path) -> bool {
+    match (SegmentFile::open(a), SegmentFile::open(b)) {
+        (Ok(left), Ok(right)) => left.format_tag() != right.format_tag(),
+        _ => false,
+    }
 }
 
 fn copy_atomic(source: &Path, destination: &Path) -> io::Result<()> {
@@ -794,16 +916,22 @@ fn copy_atomic(source: &Path, destination: &Path) -> io::Result<()> {
         io::Error::new(io::ErrorKind::InvalidInput, "destination path has no filename")
     })?;
     let temp = destination.with_file_name(format!("{}.tmp", file_name.to_string_lossy()));
-    std::fs::copy(source, &temp)?;
-    // FlushFileBuffers on Windows requires write access, so open the temp
-    // file for writing before syncing (read-only sync is a no-op on Unix
-    // but fails with AccessDenied on Windows).
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(&temp)?
-        .sync_all()?;
-    std::fs::rename(&temp, destination)?;
-    sync_directory(destination.parent().unwrap_or_else(|| Path::new(".")))
+    let result = (|| {
+        std::fs::copy(source, &temp)?;
+        // FlushFileBuffers on Windows requires write access, so open the temp
+        // file for writing before syncing (read-only sync is a no-op on Unix
+        // but fails with AccessDenied on Windows).
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&temp)?
+            .sync_all()?;
+        std::fs::rename(&temp, destination)?;
+        sync_directory(destination.parent().unwrap_or_else(|| Path::new(".")))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
 }
 
 fn copy_segment_pair(source_segment: &Path, destination_dir: &Path) -> io::Result<()> {
@@ -812,15 +940,19 @@ fn copy_segment_pair(source_segment: &Path, destination_dir: &Path) -> io::Resul
         io::Error::new(io::ErrorKind::InvalidInput, "segment path has no filename")
     })?;
     let destination_segment = destination_dir.join(file_name);
-    copy_atomic(source_segment, &destination_segment)?;
-
     let source_bloom = source_segment.with_extension("bloom");
     let destination_bloom = destination_segment.with_extension("bloom");
-    if source_bloom.exists() {
-        copy_atomic(&source_bloom, &destination_bloom)?;
-    } else if destination_bloom.exists() {
+
+    // Drop the derived sidecar before replacing data. On a crash/failure the
+    // segment then opens with a permissive filter; a stale Bloom paired with
+    // new segment bytes could hide keys (false negatives).
+    if destination_bloom.exists() {
         std::fs::remove_file(&destination_bloom)?;
         sync_directory(destination_dir)?;
+    }
+    copy_atomic(source_segment, &destination_segment)?;
+    if source_bloom.exists() {
+        copy_atomic(&source_bloom, &destination_bloom)?;
     }
 
     validate_segment(&destination_segment)
@@ -841,29 +973,35 @@ fn sync_bloom(source_segment: &Path, destination_segment: &Path) -> io::Result<(
 /// Frame-probe a WAL copy on a temporary clone (never mutates the original):
 /// true when frame recovery succeeds and does not truncate the clone — i.e.
 /// the copy holds only intact frames. A missing or empty file is not valid.
-fn wal_copy_holds_valid_frames(path: &Path) -> bool {
+fn wal_copy_valid_len(path: &Path) -> Option<u64> {
     if !path.exists() {
-        return false;
+        return None;
     }
-    let Ok(meta) = std::fs::metadata(path) else { return false };
+    let meta = std::fs::metadata(path).ok()?;
     if meta.len() == 0 {
-        return false;
+        return None;
     }
-    let tmp = match path.parent() {
-        Some(parent) => parent.join(format!(
-            "{}.probe.tmp",
-            path.file_name().unwrap_or_default().to_string_lossy()
-        )),
-        None => return false,
-    };
+    let tmp = path.parent()?.join(format!(
+        "{}.probe.tmp",
+        path.file_name()?.to_string_lossy()
+    ));
     if std::fs::copy(path, &tmp).is_err() {
-        return false;
+        return None;
     }
     let before = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
     let recovered = WalReader::recover(&tmp).map(|entries| entries.len()).unwrap_or(0);
     let after = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
     let _ = std::fs::remove_file(&tmp);
-    recovered > 0 && after == before
+    if recovered > 0 && after == before {
+        Some(after)
+    } else {
+        None
+    }
+}
+
+#[allow(dead_code)]
+fn wal_copy_holds_valid_frames(path: &Path) -> bool {
+    wal_copy_valid_len(path).is_some()
 }
 
 fn files_equal(left: &Path, right: &Path) -> io::Result<bool> {

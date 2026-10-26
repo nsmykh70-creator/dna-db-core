@@ -226,24 +226,34 @@ pub struct WalParity;
 
 impl WalParity {
     /// Freeze-protect a closed WAL: write the parity sidecar next to it.
+    /// Streams the WAL block-by-block instead of loading it into memory, so a
+    /// multi-gigabyte closed WAL cannot exhaust RAM during rotation.
     pub fn protect(wal_path: &Path, k: usize, m: usize) -> io::Result<()> {
         use crate::reed_solomon::ErasureCodec;
-        let raw = std::fs::read(wal_path)?;
-        if raw.is_empty() {
-            return Ok(());
-        }
         let codec = ErasureCodec::new(k, m)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         let block = 4096usize;
-        let blocks = raw.len().div_ceil(block);
-        let mut data = raw;
-        data.resize(blocks * block, 0);
-
+        let mut wal = File::open(wal_path)?;
+        let len = wal.metadata()?.len() as usize;
+        if len == 0 {
+            return Ok(());
+        }
+        let blocks = len.div_ceil(block);
         let stripes = blocks.div_ceil(k);
+
+        let read_block = |f: &mut File, b: usize| -> io::Result<Vec<u8>> {
+            let mut buf = vec![0u8; block];
+            f.seek(SeekFrom::Start((b * block) as u64))?;
+            let avail = (len - b * block).min(block);
+            f.read_exact(&mut buf[..avail])?;
+            Ok(buf)
+        };
+
         let mut crc_table = Vec::with_capacity(blocks);
         for b in 0..blocks {
+            let data = read_block(&mut wal, b)?;
             let mut h = Hasher::new();
-            h.update(&data[b * block..(b + 1) * block]);
+            h.update(&data);
             crc_table.push(h.finalize());
         }
 
@@ -260,6 +270,8 @@ impl WalParity {
             h.finalize()
         };
         sidecar[20..24].copy_from_slice(&table_crc.to_le_bytes());
+        // [24..28] is the parity-region CRC32 (0 for sidecars written before
+        // this field existed; those are accepted but cannot verify parity).
 
         let parity_path = wal_path.with_extension("wal.parity");
         let tmp_path = wal_path.with_extension("wal.parity.tmp");
@@ -274,26 +286,31 @@ impl WalParity {
             for c in &crc_table {
                 w.write_all(&c.to_le_bytes())?;
             }
+            let mut parity_hasher = Hasher::new();
             for s in 0..stripes {
-                let shards: Vec<Vec<u8>> = (0..k)
-                    .map(|i| {
-                        let b = s * k + i;
-                        if b < blocks {
-                            data[b * block..(b + 1) * block].to_vec()
-                        } else {
-                            vec![0u8; block]
-                        }
-                    })
-                    .collect();
+                let mut shards = Vec::with_capacity(k);
+                for i in 0..k {
+                    let b = s * k + i;
+                    if b < blocks {
+                        shards.push(read_block(&mut wal, b)?);
+                    } else {
+                        shards.push(vec![0u8; block]);
+                    }
+                }
                 let parity = codec
                     .encode(&shards)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
                 for p in parity {
+                    parity_hasher.update(&p);
                     w.write_all(&p)?;
                 }
             }
+            let parity_crc = parity_hasher.finalize();
             w.flush()?;
-            w.into_inner()?.sync_data()?;
+            let mut f = w.into_inner().map_err(|e| e.into_error())?;
+            f.seek(SeekFrom::Start(24))?;
+            f.write_all(&parity_crc.to_le_bytes())?;
+            f.sync_data()?;
         }
         std::fs::rename(&tmp_path, &parity_path)?;
         if let Some(dir) = wal_path.parent() {
@@ -324,12 +341,28 @@ impl WalParity {
         }
         let k = raw[8] as usize;
         let m = raw[9] as usize;
-        let blocks = u64::from_le_bytes(raw[12..20].try_into().unwrap()) as usize;
+        let blocks_u64 = u64::from_le_bytes(raw[12..20].try_into().unwrap());
+        let blocks = usize::try_from(blocks_u64)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "WAL parity block count too large"))?;
         let table_crc = u32::from_le_bytes(raw[20..24].try_into().unwrap());
+        let parity_crc = u32::from_le_bytes(raw[24..28].try_into().unwrap());
         if k == 0 || m == 0 || blocks == 0 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "bad WAL parity geometry"));
         }
-        let table_raw = &raw[4096..4096 + blocks * 4];
+        let table_end = 4096usize
+            .checked_add(
+                blocks
+                    .checked_mul(4)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "WAL parity table overflow"))?,
+            )
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "WAL parity table overflow"))?;
+        if table_end > raw.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "WAL parity CRC table truncated",
+            ));
+        }
+        let table_raw = &raw[4096..table_end];
         let mut th = Hasher::new();
         th.update(table_raw);
         if th.finalize() != table_crc {
@@ -342,14 +375,35 @@ impl WalParity {
 
         let block = 4096usize;
         let stripes = blocks.div_ceil(k);
-        let parity_region = &raw[4096 + blocks * 4..];
-        if parity_region.len() < stripes * m * block {
+        let parity_bytes = stripes
+            .checked_mul(m)
+            .and_then(|n| n.checked_mul(block))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "WAL parity size overflow"))?;
+        let parity_end = table_end
+            .checked_add(parity_bytes)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "WAL parity size overflow"))?;
+        if parity_end > raw.len() {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "WAL parity region truncated"));
+        }
+        let parity_region = &raw[table_end..parity_end];
+        // New sidecars carry a CRC over the parity region. A damaged parity
+        // shard must never be used to "repair" data (that would invent bytes).
+        if parity_crc != 0 {
+            let mut ph = Hasher::new();
+            ph.update(parity_region);
+            if ph.finalize() != parity_crc {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "WAL parity region damaged (CRC mismatch)",
+                ));
+            }
         }
 
         let wal = OpenOptions::new().read(true).write(true).open(wal_path)?;
         let wal_len = wal.metadata()?.len() as usize;
-        let protected_len = blocks * block;
+        let protected_len = blocks
+            .checked_mul(block)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "WAL protected size overflow"))?;
 
         let codec = ErasureCodec::new(k, m)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
@@ -410,6 +464,22 @@ impl WalParity {
             codec
                 .reconstruct(&mut shards)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            // Parity can be stale/wrong even when its own region CRC is valid
+            // (e.g. a sidecar copied from another generation). Only write a
+            // reconstruction that matches the CRC table recorded at protect().
+            for &b in &damaged_data {
+                let shard = shards[b - s * k].as_ref().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "WAL reconstruction missing a shard")
+                })?;
+                let mut h = Hasher::new();
+                h.update(shard);
+                if h.finalize() != crc_table[b] {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("WAL reconstruction failed CRC check for block {b}"),
+                    ));
+                }
+            }
             // Rewrite damaged blocks (and extend the file if the tail was lost).
             {
                 let mut f2 = wal.try_clone()?;

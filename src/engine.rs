@@ -181,6 +181,17 @@ impl Engine {
 
         // 2. Closed WAL segments: RS repair from parity sidecars, then frame
         //    recovery. Cascade: beyond parity → Strand B copy → parity again.
+        // Closed WAL segments: first restore any B-only closed WAL that is
+        // missing from A, then run parity/frame recovery on the primary set.
+        if let Some(mirror) = &mirror {
+            match mirror.heal_primary_closed_wals(&config.dir_path) {
+                Ok(n) if n > 0 => eprintln!(
+                    "[WAL] restored {n} B-only closed segment(s) to Strand A"
+                ),
+                Ok(_) => {}
+                Err(e) => eprintln!("[WAL] Strand A closed-WAL restore failed: {e}"),
+            }
+        }
         let mut closed_wals = std::fs::read_dir(&config.dir_path)?
             .flatten()
             .map(|entry| entry.path())
@@ -703,6 +714,9 @@ impl Engine {
                 // The hook restored this segment from Strand B (new inode);
                 // reopen it, swap it into the reader set and retry once.
                 let fresh = Arc::new(SegmentFile::open(seg.path())?);
+                if let Some(hook) = &self.repair_hook {
+                    fresh.set_hook(hook.clone());
+                }
                 fresh.validate_for_open()?;
                 {
                     let mut g = self.segments.write();
@@ -740,6 +754,9 @@ impl Engine {
             )
         })?;
         let repaired = Arc::new(SegmentFile::open(seg.path())?);
+        if let Some(hook) = &self.repair_hook {
+            repaired.set_hook(hook.clone());
+        }
         repaired.validate_for_open()?;
         let mut segments = self.segments.write();
         if let Some(current) = segments.iter_mut().find(|current| current.path() == seg.path()) {
@@ -786,7 +803,11 @@ impl Engine {
             }
         }
         if let Some(mirror) = &self.mirror {
-            if let Err(e) = mirror.rotate_wal(seq) {
+            if let Err(e) = mirror.rotate_wal(
+                seq,
+                self.config.erasure_k,
+                self.config.erasure_m,
+            ) {
                 eprintln!("[WAL] Strand B rotation failed for seq {seq}: {e}");
             }
         }
@@ -886,12 +907,14 @@ impl Engine {
         let _mutation_gate = self.mutation_gate.write();
         let _guard = self.flush_lock.lock();
         // 1. flush immutable if any
+        let mut flushed = 0usize;
         let imm = self.immutable_memtable.write().take();
         if let Some(imm) = imm {
             if let Err(error) = self.flush_memtable(imm.clone()) {
                 *self.immutable_memtable.write() = Some(imm);
                 return Err(error);
             }
+            flushed += 1;
         }
         // 2. flush active
         let old = {
@@ -904,18 +927,21 @@ impl Engine {
             *self.active_memtable.write() = old;
             return Err(error);
         }
-        // 3. truncate WAL (safe: all data now in segments) and drop the
-        //    closed WAL segments — they are fully absorbed by the segments.
+        flushed += 1;
+        // 3. truncate WAL (safe: all data now in segments) and, only after a
+        //    successful reset, drop the closed WALs absorbed by segments.
         if let Some(ref mirror) = self.mirror {
             mirror.reset_wal()?;
-            mirror.remove_closed_wals(&self.config.dir_path);
         }
-        remove_closed_wals(&self.config.dir_path);
         {
             let mut wal_guard = self.wal.write();
             wal_guard.reset()?;
         }
-        self.stats.flush_count.fetch_add(2, Ordering::Relaxed);
+        if let Some(ref mirror) = self.mirror {
+            mirror.remove_closed_wals(&self.config.dir_path);
+        }
+        remove_closed_wals(&self.config.dir_path);
+        self.stats.flush_count.fetch_add(flushed as u64, Ordering::Relaxed);
         Ok(())
     }
 
@@ -993,13 +1019,25 @@ impl Engine {
                     .file_stem()
                     .and_then(|stem| stem.to_str())
                     .and_then(|stem| stem.parse::<u64>().ok());
-                let _ = std::fs::remove_file(p);
+                match std::fs::remove_file(p) {
+                    Ok(()) => deleted += 1,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => eprintln!(
+                        "[COMPACT] Could not remove superseded segment {:?}: {e}",
+                        p.file_name().unwrap_or_default()
+                    ),
+                }
                 let bloom = p.with_extension("bloom");
                 if bloom.exists() {
-                    let _ = std::fs::remove_file(&bloom);
-                    deleted += 1;
+                    match std::fs::remove_file(&bloom) {
+                        Ok(()) => deleted += 1,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => eprintln!(
+                            "[COMPACT] Could not remove bloom sidecar {:?}: {e}",
+                            bloom.file_name().unwrap_or_default()
+                        ),
+                    }
                 }
-                deleted += 1;
                 if let (Some(mirror), Some(old_id)) = (&self.mirror, old_id) {
                     if let Err(error) = mirror.remove_segment(old_id) {
                         eprintln!(

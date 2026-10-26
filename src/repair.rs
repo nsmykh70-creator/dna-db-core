@@ -231,6 +231,7 @@ impl Default for ScrubConfig {
 /// Handle to stop the scrubber and read its progress.
 pub struct Scrubber {
     stop: Arc<std::sync::atomic::AtomicBool>,
+    wake: Arc<std::sync::atomic::AtomicBool>,
     pub progress: Arc<EngineStats>,
 }
 
@@ -249,6 +250,8 @@ impl Scrubber {
     {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop2 = stop.clone();
+        let wake = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let wake2 = wake.clone();
         let progress = stats.clone();
         std::thread::Builder::new()
             .name("dna-scrubber".into())
@@ -259,6 +262,9 @@ impl Scrubber {
                     while waited < config.interval {
                         if stop2.load(Ordering::Relaxed) {
                             return;
+                        }
+                        if wake2.swap(false, Ordering::Relaxed) {
+                            break; // immediate pass requested
                         }
                         let slice = Duration::from_secs(1).min(config.interval - waited);
                         std::thread::sleep(slice);
@@ -271,14 +277,23 @@ impl Scrubber {
                     // the list closure already returns that order.
                     let segments = list_segments();
                     stats.scrub_runs.fetch_add(1, Ordering::Relaxed);
+                    // Pre-count blocks so progress is meaningful during the
+                    // pass. A segment that cannot be opened is skipped (doctor
+                    // reports it); it contributes zero.
                     let mut total_blocks = 0u64;
+                    for seg in &segments {
+                        if let Ok(reader) = crate::segment_block::BlockSegmentReader::open(seg) {
+                            total_blocks += reader.block_count() as u64;
+                        }
+                    }
+                    stats.scrub_blocks_scanned.store(0, Ordering::Relaxed);
+                    stats.scrub_blocks_total.store(total_blocks, Ordering::Relaxed);
                     for seg in &segments {
                         if stop2.load(Ordering::Relaxed) {
                             return;
                         }
-                        total_blocks += scrub_one_segment(seg, &hook, &stats, config.rate_limit_bytes_per_sec);
+                        scrub_one_segment(seg, &hook, &stats, config.rate_limit_bytes_per_sec);
                     }
-                    stats.scrub_blocks_total.store(total_blocks, Ordering::Relaxed);
                     stats.scrub_last_unix.store(
                         SystemTime::now()
                             .duration_since(UNIX_EPOCH)
@@ -289,11 +304,16 @@ impl Scrubber {
                 }
             })
             .expect("spawn scrubber");
-        Self { stop, progress }
+        Self { stop, wake, progress }
     }
 
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
+    }
+
+    /// Ask the scrubber to start a pass now instead of waiting for its timer.
+    pub fn wake(&self) {
+        self.wake.store(true, Ordering::Relaxed);
     }
 }
 
@@ -397,6 +417,26 @@ pub struct DoctorReport {
     pub migrated: usize,
     pub fixed_blocks: usize,
     pub verdicts: Vec<SegmentVerdict>,
+    /// Non-fatal failures encountered while fixing (doctor continues past
+    /// unrecoverable segments instead of aborting the whole run).
+    #[serde(default)]
+    pub errors: Vec<String>,
+}
+
+/// Recompute aggregate counters from per-segment verdicts. Keeps fix/migrate
+/// reports consistent after verdicts change.
+fn recount(report: &mut DoctorReport) {
+    report.scanned_segments = report.verdicts.len();
+    report.healthy = 0;
+    report.repairable = 0;
+    report.unrecoverable = 0;
+    for v in &report.verdicts {
+        match v.verdict {
+            "HEALTHY" => report.healthy += 1,
+            "REPAIRABLE" => report.repairable += 1,
+            _ => report.unrecoverable += 1,
+        }
+    }
 }
 
 /// Scan every .sst in `dir` (offline, no engine open). Read-only.
@@ -410,6 +450,7 @@ pub fn doctor_scan(dir: &Path) -> io::Result<DoctorReport> {
         migrated: 0,
         fixed_blocks: 0,
         verdicts: Vec::new(),
+        errors: Vec::new(),
     };
     for path in sst_files(dir)? {
         let verdict = scan_one(&path);
@@ -424,7 +465,9 @@ pub fn doctor_scan(dir: &Path) -> io::Result<DoctorReport> {
     Ok(report)
 }
 
-/// Scan + repair every fixable segment.
+/// Scan + repair every fixable segment. A segment that cannot be fixed is
+/// recorded in `errors` and the run continues, so one unrecoverable stripe
+/// does not hide the state of the remaining segments.
 pub fn doctor_fix(dir: &Path) -> io::Result<DoctorReport> {
     let mut report = doctor_scan(dir)?;
     for (i, v) in report.verdicts.clone().iter().enumerate() {
@@ -432,16 +475,21 @@ pub fn doctor_fix(dir: &Path) -> io::Result<DoctorReport> {
             continue;
         }
         let path = dir.join(&v.file);
-        let fixed = fix_segment(&path)?;
-        report.fixed_blocks += fixed;
-        // Re-scan after fix.
-        let after = scan_one(&path);
-        report.verdicts[i] = after.clone();
-        if after.verdict == "HEALTHY" {
-            report.repairable -= 1;
-            report.healthy += 1;
+        match fix_segment(&path) {
+            Ok(fixed) => {
+                report.fixed_blocks += fixed;
+                report.verdicts[i] = scan_one(&path);
+            }
+            Err(e) => {
+                report.errors.push(format!("{}: {}", v.file, e));
+                let mut after = scan_one(&path);
+                after.verdict = "UNREPAIRABLE";
+                after.detail = Some(format!("fix failed: {e}"));
+                report.verdicts[i] = after;
+            }
         }
     }
+    recount(&mut report);
     Ok(report)
 }
 
@@ -455,8 +503,15 @@ pub fn doctor_migrate(dir: &Path, erasure_k: usize, erasure_m: usize) -> io::Res
         if !is_legacy(&path)? {
             continue;
         }
-        let migrated = migrate_legacy_segment(&path, erasure_k, erasure_m)?;
-        report.migrated += migrated;
+        match migrate_legacy_segment(&path, erasure_k, erasure_m) {
+            Ok(migrated) => report.migrated += migrated,
+            Err(e) => {
+                report.errors.push(format!(
+                    "{}: migration failed: {e}",
+                    path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
+                ));
+            }
+        }
         let after = scan_one(&path);
         if let Some(slot) = report
             .verdicts
@@ -466,6 +521,7 @@ pub fn doctor_migrate(dir: &Path, erasure_k: usize, erasure_m: usize) -> io::Res
             *slot = after;
         }
     }
+    recount(&mut report);
     Ok(report)
 }
 
@@ -553,24 +609,31 @@ pub fn doctor_cascade_strands(
         }
     }
 
-    // ---- closed WALs present on both strands ----
+    // ---- closed WALs: handle the union, not only files present on both ----
+    // A closed WAL that exists only on B is real data if its frames validate;
+    // ignoring it made B-only data invisible to A (and to the next startup).
     let a_wals = file_names(dir_a, |n| n.starts_with("wal_") && n.ends_with(".wal"))?;
     let b_wals = file_names(dir_b, |n| n.starts_with("wal_") && n.ends_with(".wal"))?;
-    for name in a_wals.intersection(&b_wals) {
-        let path_a = dir_a.join(name);
-        let path_b = dir_b.join(name);
-        let valid_a = wal_frames_valid(&path_a);
-        let valid_b = wal_frames_valid(&path_b);
-        if valid_a == valid_b {
-            if !valid_a {
-                report.damaged_on_both.push(name.clone());
+    let all_wals: std::collections::BTreeSet<String> =
+        a_wals.union(&b_wals).cloned().collect();
+    for name in all_wals {
+        let path_a = dir_a.join(&name);
+        let path_b = dir_b.join(&name);
+        let exists_a = path_a.exists();
+        let exists_b = path_b.exists();
+        let valid_a = exists_a && wal_frames_valid(&path_a);
+        let valid_b = exists_b && wal_frames_valid(&path_b);
+
+        let (source, dest_dir, dest_strand) = match (valid_a, valid_b) {
+            (true, false) => (&path_a, dir_b, "B"),
+            (false, true) => (&path_b, dir_a, "A"),
+            (true, true) => continue,
+            (false, false) => {
+                if exists_a || exists_b {
+                    report.damaged_on_both.push(name.clone());
+                }
+                continue;
             }
-            continue;
-        }
-        let (source, dest_dir, dest_strand) = if valid_a {
-            (&path_a, dir_b, "B")
-        } else {
-            (&path_b, dir_a, "A")
         };
         if !fix {
             report
@@ -579,7 +642,7 @@ pub fn doctor_cascade_strands(
             continue;
         }
         copy_across_strand(source, dest_dir)?;
-        if !wal_frames_valid(&dest_dir.join(name)) {
+        if !wal_frames_valid(&dest_dir.join(&name)) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("cascade copy of {name} to strand {dest_strand} failed verification"),
@@ -622,24 +685,55 @@ fn copy_across_strand(source: &Path, dest_dir: &Path) -> io::Result<()> {
         io::Error::new(io::ErrorKind::InvalidInput, "source has no filename")
     })?;
     let dest = dest_dir.join(name);
-    let tmp = dest_dir.join(format!("{}.cascade.tmp", name.to_string_lossy()));
-    std::fs::copy(source, &tmp)?;
-    OpenOptions::new().write(true).open(&tmp)?.sync_all()?;
-    std::fs::rename(&tmp, &dest)?;
-
     let sidecar = if source.extension().is_some_and(|e| e == "sst") {
         source.with_extension("bloom")
     } else {
         source.with_extension("wal.parity")
     };
     let dest_sidecar = dest_dir.join(sidecar.file_name().unwrap_or_default());
+    // Remove the derived sidecar BEFORE the data file. If the copy fails
+    // half-way, a missing bloom/parity sidecar is safe (permissive lookup /
+    // no false repair); a stale one paired with new bytes is not.
     if dest_sidecar.exists() {
         std::fs::remove_file(&dest_sidecar)?;
     }
+    let tmp = dest_dir.join(format!("{}.cascade.tmp", name.to_string_lossy()));
+    std::fs::copy(source, &tmp)?;
+    OpenOptions::new().write(true).open(&tmp)?.sync_all()?;
+    std::fs::rename(&tmp, &dest)?;
     if sidecar.exists() {
-        std::fs::copy(&sidecar, &dest_sidecar)?;
+        copy_atomic(&sidecar, &dest_sidecar)?;
     }
-    Ok(())
+    sync_directory(dest_dir)
+}
+
+fn copy_atomic(source: &Path, destination: &Path) -> io::Result<()> {
+    let name = destination.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "destination has no filename")
+    })?;
+    let tmp = destination.with_file_name(format!("{}.cascade.tmp", name.to_string_lossy()));
+    let result = (|| {
+        std::fs::copy(source, &tmp)?;
+        OpenOptions::new().write(true).open(&tmp)?.sync_all()?;
+        std::fs::rename(&tmp, destination)?;
+        sync_directory(destination.parent().unwrap_or_else(|| Path::new(".")))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+fn sync_directory(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
 }
 
 /// Frame-probe a WAL copy on a temporary clone (never mutates the original):
@@ -691,6 +785,48 @@ fn is_legacy(path: &Path) -> io::Result<bool> {
 
 fn scan_one(path: &Path) -> SegmentVerdict {
     let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string();
+    // Legacy segments have per-record CRC but no block parity. Validate them
+    // with the legacy reader; previously they were always reported as
+    // STRUCTURAL_DAMAGE simply because the block reader cannot open them.
+    if is_legacy(path).unwrap_or(false) {
+        return match crate::segment::SegmentReader::open(path) {
+            Ok(r) => match r.validate_all() {
+                Ok(()) => SegmentVerdict {
+                    file: file_name,
+                    format: "DNASST01".into(),
+                    records: r.entry_count as u64,
+                    blocks_total: 0,
+                    damaged_blocks: 0,
+                    affected_stripes: 0,
+                    unrecoverable_stripes: 0,
+                    verdict: "HEALTHY",
+                    detail: None,
+                },
+                Err(e) => SegmentVerdict {
+                    file: file_name,
+                    format: "DNASST01".into(),
+                    records: r.entry_count as u64,
+                    blocks_total: 0,
+                    damaged_blocks: 0,
+                    affected_stripes: 0,
+                    unrecoverable_stripes: 0,
+                    verdict: "STRUCTURAL_DAMAGE",
+                    detail: Some(e.to_string()),
+                },
+            },
+            Err(e) => SegmentVerdict {
+                file: file_name,
+                format: "DNASST01".into(),
+                records: 0,
+                blocks_total: 0,
+                damaged_blocks: 0,
+                affected_stripes: 0,
+                unrecoverable_stripes: 0,
+                verdict: "STRUCTURAL_DAMAGE",
+                detail: Some(e.to_string()),
+            },
+        };
+    }
     match crate::segment_block::BlockSegmentReader::open(path) {
         Ok(r) => match r.scan_lesions() {
             Ok((damaged, affected, unrecoverable_stripes)) => {

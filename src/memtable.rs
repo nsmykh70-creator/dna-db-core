@@ -31,19 +31,32 @@ pub struct MemTable {
     map: Arc<SkipMap<Vec<u8>, EntryValue>>,
     approx_size: AtomicIsize,
     capacity: usize,
+    /// Serializes size accounting. Without it, two concurrent replacements of
+    /// the same key can both subtract the old size, under-counting memory and
+    /// delaying flushes (unbounded memtable growth).
+    accounting: parking_lot::Mutex<()>,
 }
 
 impl MemTable {
     pub fn new(capacity: usize) -> Self {
+        // 0 means "no automatic flush", not a zero-byte table that flushes on
+        // every put. usize::MAX/2 keeps all arithmetic inside isize.
+        let capacity = if capacity == 0 {
+            usize::MAX / 2
+        } else {
+            capacity
+        };
         Self {
             map: Arc::new(SkipMap::new()),
             approx_size: AtomicIsize::new(0),
             capacity,
+            accounting: parking_lot::Mutex::new(()),
         }
     }
 
     /// Insert/update. Returns true when the table reached capacity.
     pub fn put(&self, key: Vec<u8>, value: Vec<u8>) -> bool {
+        let _accounting = self.accounting.lock();
         let mut delta = (key.len() + value.len() + 32) as isize;
         if let Some(old) = self.map.get(&key) {
             match old.value() {
@@ -58,6 +71,7 @@ impl MemTable {
 
     /// Insert tombstone. Returns true when the table reached capacity.
     pub fn delete(&self, key: Vec<u8>) -> bool {
+        let _accounting = self.accounting.lock();
         let mut delta = (key.len() + 32) as isize;
         if let Some(old) = self.map.get(&key) {
             match old.value() {
