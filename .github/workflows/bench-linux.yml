@@ -52,6 +52,7 @@ jobs:
           set -eo pipefail
           # Statements executed by whichever bootstrap method succeeds below.
           sudo tee /tmp/mysql-init.sql >/dev/null <<'SQL'
+          FLUSH PRIVILEGES;
           ALTER USER 'root'@'localhost' IDENTIFIED BY 'bench';
           CREATE USER IF NOT EXISTS 'root'@'127.0.0.1' IDENTIFIED BY 'bench';
           GRANT ALL ON *.* TO 'root'@'127.0.0.1' WITH GRANT OPTION;
@@ -67,47 +68,53 @@ jobs:
           configured=0
 
           # (a) password-less socket login (auth_socket images)
-          if sudo mysql -e "SELECT 1" >/dev/null 2>&1; then
+          if sudo mysql --connect-timeout=5 -e "SELECT 1" >/dev/null 2>&1; then
             echo "socket login works, configuring root directly"
-            sudo mysql < /tmp/mysql-init.sql && configured=1 || true
-          fi
-
-          # (b) Oracle-style temporary password in the error log
-          if [ "$configured" = 0 ] && sudo test -f /var/log/mysql/error.log; then
-            tmp_pw=$(sudo grep -o 'temporary password.*' \
-              /var/log/mysql/error.log | tail -1 | sed 's/.*: //' || true)
-            if [ -n "$tmp_pw" ]; then
-              echo "trying temporary password from error.log"
-              mysql -uroot -p"$tmp_pw" --connect-timeout=5 \
-                < /tmp/mysql-init.sql && configured=1 || true
+            if sudo mysql < /tmp/mysql-init.sql; then
+              configured=1
             fi
           fi
 
-          # (c) authoritative: temporary --skip-grant-tables server, the
-          #     documented MySQL root-password-reset procedure
+          # (b) authoritative: temporary --skip-grant-tables server, the
+          #     documented MySQL root-password-reset procedure. FLUSH PRIVILEGES
+          #     is the FIRST statement of ONE session: it re-loads the grant
+          #     tables, so ALTER/CREATE/GRANT must run in that same already
+          #     authenticated session -- any NEW connection after the FLUSH is
+          #     checked against the re-enabled grant tables again (this is why
+          #     separate mysql invocations used to fail with ERROR 1045).
           if [ "$configured" = 0 ]; then
             echo "resetting root password via a temporary --skip-grant-tables server"
             sudo systemctl stop mysql || true
             sudo mkdir -p /var/run/mysqld
             sudo chown mysql:mysql /var/run/mysqld
-            sudo -u mysql /usr/sbin/mysqld --skip-grant-tables >/dev/null 2>&1 &
+            sock=/var/run/mysqld/mysqld.sock
+            sudo -u mysql /usr/sbin/mysqld --skip-grant-tables \
+              --socket="$sock" >/dev/null 2>&1 &
             ok=0
             for i in $(seq 1 45); do
-              if mysql -e "SELECT 1" >/dev/null 2>&1; then ok=1; break; fi
+              if mysql -uroot --socket="$sock" --connect-timeout=3 \
+                  -e "SELECT 1" >/dev/null 2>&1; then
+                ok=1
+                break
+              fi
               sleep 1
             done
-            if [ "$ok" = 1 ]; then
-              mysql -e "FLUSH PRIVILEGES;"
-              mysql < /tmp/mysql-init.sql && configured=1 || true
-            else
+            if [ "$ok" != 1 ]; then
               echo "temporary server did not come up; error.log:"
               sudo tail -40 /var/log/mysql/error.log || true
+              exit 1
             fi
+            if ! mysql -uroot --socket="$sock" < /tmp/mysql-init.sql; then
+              echo "bootstrap SQL failed; error.log:"
+              sudo tail -40 /var/log/mysql/error.log || true
+              exit 1
+            fi
+            configured=1
             mb_pid=$(pgrep -u mysql -x mysqld | head -1 || true)
             if [ -n "$mb_pid" ]; then
               sudo kill "$mb_pid" 2>/dev/null || true
               for i in $(seq 1 30); do
-                kill -0 "$mb_pid" 2>/dev/null || break
+                sudo kill -0 "$mb_pid" 2>/dev/null || break
                 sleep 1
               done
               sudo kill -9 "$mb_pid" 2>/dev/null || true
