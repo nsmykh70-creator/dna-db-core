@@ -1,7 +1,7 @@
 # DNA-DB Core security model
 
 This document describes the production security controls in DNA-DB Core
-v3.3, the operational assumptions behind them, and the residual risks we have
+v3.4, the operational assumptions behind them, and the residual risks we have
 not eliminated. It is intentionally narrower than a compliance certification:
 DNA-DB is a single-node database, not a managed service.
 
@@ -9,8 +9,9 @@ DNA-DB is a single-node database, not a managed service.
 
 | Version | Security support |
 |---|---|
-| `3.3.x` | current production hardening release (mTLS, key rotation, clean `cargo audit`) |
-| `3.2.x` | previous hardening release; upgrade for mTLS/key rotation |
+| `3.4.x` | current production release (per-table ACL, trusted-proxy SSO, mirror-aware rotation) |
+| `3.3.x` | previous hardening release (mTLS, key rotation, clean `cargo audit`) |
+| `3.2.x` | older hardening release; upgrade for ACL, proxy SSO and mirror rotation |
 | `<= 3.1` | no TLS, SHA-256 password hashing, no at-rest payload encryption — do not expose |
 
 Report vulnerabilities privately via the repository security advisory UI or
@@ -56,9 +57,25 @@ before a fix is available.
   Viewer SQL/DnaQL is accepted only for a conservative read-only allowlist
   (`SELECT`, `SHOW`, `DESCRIBE`, `EXPLAIN`, `PRAGMA`, `ANALYZE`, `FIND`,
   `SEARCH`, `VERIFY`); multi-statement input is rejected.
+* **Per-table ACL.** A non-admin user may carry `allowed_tables` in
+  `users.json`. `None`/`*` means unrestricted (legacy behaviour); an empty list
+  denies every table. The SQL and DnaQL parsers are run before execution and
+  every referenced table is checked, including JOINs, `IN (SELECT ...)`,
+  UPDATE/DELETE predicates and foreign-key targets in `CREATE TABLE`. The
+  panel filters `/api/tables` and checks `/api/browse` and `/api/query`.
+  Restricted users cannot use raw GET/PUT/DELETE/CHECKPOINT because the KV
+  protocol has no table namespace. Schema-wide `SHOW`/`DESCRIBE` is refused for
+  restricted accounts.
+* **Trusted-proxy SSO.** When `--trusted-proxy IP` is configured, only that
+  peer may call `POST /api/login/proxy`. The proxy asserts an authenticated
+  username in `X-Auth-Request-User` (configurable) and may also supply a
+  shared secret (`--proxy-auth-secret`, constant-time comparison). The proxy
+  **must strip any client-supplied identity and secret headers**. This is
+  integration with an external IdP via a trusted proxy, not a built-in OIDC or
+  SAML client.
 * Sessions are 256-bit CSPRNG bearer tokens with a 12-hour TTL. They are
   stored only in process memory and are revoked when the user's password is
-  changed, reset, or the account is disabled.
+  changed, reset, disabled, or the account's table ACL is changed.
 * The panel is a bearer-token SPA. Tokens live in `sessionStorage`, not in
   cookies, so classic cookie CSRF does not apply. The API requires an
   `Authorization: Bearer` header.
@@ -112,10 +129,13 @@ before a fix is available.
   directory with the old key, copies every live logical row into a fresh
   directory encrypted with the new key, preserves `users.json`,
   `security_state.json` and `tls/`, then swaps directories. The old tree is
-  kept as `DATA.pre-rotate-<timestamp>` for rollback. The command is offline:
-  stop the server first, keep the new key outside `DATA`, and delete the
-  rollback tree plus old key after verification. External mirror disks are not
-  migrated automatically; re-seed the mirror after rotation.
+  kept as `DATA.pre-rotate-<timestamp>` for rollback. When `--mirror-dir` is
+  supplied, the external Strand B is rebuilt from the rotated primary,
+  verified, and swapped in; the old mirror is kept as
+  `<mirror>.pre-rotate-<timestamp>`. A mirror rebuild failure rolls the primary
+  back to the old key. The command is offline: stop the server first, keep the
+  new key outside `DATA`, and delete both rollback trees plus the old key after
+  verification.
 * WAL parity sidecars, SST parity shards, and the mirror contain the same
   ciphertext. Bloom sidecars contain keyed membership bits, not values.
 
@@ -131,11 +151,15 @@ before a fix is available.
 * Key rotation is an **offline** copy-and-swap operation, not an online
   re-encryption service. It needs free space for a second copy and RAM for one
   merged scan of the live key space.
-* There is no per-table ACL, audit-log export, or external identity provider
-  (OIDC/SAML) integration. Roles are global (`admin`, `operator`, `viewer`);
-  use a separate database instance or the network layer when table-level
-  isolation is required. mTLS is transport authentication, not application
-  user identity.
+* Per-table ACLs are an allowlist, not row-level security: a user allowed to
+  read a table sees every row, including rows joined from another allowed
+  table. There is no row filtering, column masking, audit-log export, or
+  built-in OIDC/SAML client. SSO requires a correctly configured trusted
+  reverse proxy; a proxy that forwards a client-supplied identity header
+  defeats it. mTLS is transport authentication, not application user identity.
+* The per-table ACL checks parsed table references, not arbitrary code paths
+  inside SQL functions (the engine has no user-defined functions). Keep
+  untrusted users on `viewer` unless they need writes.
 * A self-signed certificate is not identity verification. Use a real CA and
   pass `--tls-ca` to `shell` (or use a normal HTTPS client) for production.
 * `--no-encryption` and `--no-tls` are explicit, documented escapes, not
@@ -148,7 +172,7 @@ before a fix is available.
 
 ## Dependency advisories
 
-`cargo audit` on the v3.3 lockfile reports **zero vulnerabilities and zero
+`cargo audit` on the v3.4 lockfile reports **zero vulnerabilities and zero
 warnings**.
 
 The former `lru 0.7.8` and `instant 0.1.13` warnings came transitively through

@@ -14,6 +14,7 @@
 //! - `doctor` offline scan/fix/migration; repair journal; health API
 
 pub mod admin;
+pub mod access;
 pub mod auth;
 pub mod bio_plugins;
 pub mod bloom;

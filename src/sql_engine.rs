@@ -1216,7 +1216,108 @@ impl SParser {
 // Executor
 // ---------------------------------------------------------------------------
 
+/// Parse a SQL statement and return every table it references, including
+/// tables in JOINs, foreign-key definitions and `IN (SELECT ...)` subqueries.
+/// This is used by the per-user ACL before execution; it never touches storage.
+pub(crate) fn referenced_tables(sql: &str) -> Result<Vec<String>, String> {
+    let toks = stokenize(sql)?;
+    let mut parser = SParser { toks, pos: 0 };
+    let stmt = parser.parse_stmt()?;
+    if parser.peek() != &STok::Eof {
+        return Err(format!(
+            "SQL: unexpected trailing tokens starting at {:?} (unsupported syntax?)",
+            parser.peek()
+        ));
+    }
+    let mut tables = Vec::new();
+    collect_stmt_tables(&stmt, &mut tables)?;
+    tables.sort();
+    tables.dedup();
+    Ok(tables)
+}
+
+fn collect_stmt_tables(stmt: &Stmt, out: &mut Vec<String>) -> Result<(), String> {
+    match stmt {
+        Stmt::Select {
+            projection,
+            from,
+            joins,
+            where_clause,
+            having,
+            ..
+        } => {
+            out.push(from.clone());
+            for join in joins {
+                out.push(join.table.clone());
+            }
+            for item in projection {
+                if let SelectItem::Computed { expr, .. } = item {
+                    collect_expr_tables(expr, out)?;
+                }
+            }
+            if let Some(expr) = where_clause {
+                collect_expr_tables(expr, out)?;
+            }
+            if let Some(expr) = having {
+                collect_expr_tables(expr, out)?;
+            }
+        }
+        Stmt::Insert { table, .. } | Stmt::DropTable { table, .. } => out.push(table.clone()),
+        Stmt::Update {
+            table,
+            where_clause,
+            ..
+        }
+        | Stmt::Delete {
+            table,
+            where_clause,
+            ..
+        } => {
+            out.push(table.clone());
+            if let Some(expr) = where_clause {
+                collect_expr_tables(expr, out)?;
+            }
+        }
+        Stmt::CreateTable { table, .. } => {
+            out.push(table.name.clone());
+            for fk in &table.foreign_keys {
+                out.push(fk.target_chromosome.clone());
+            }
+        }
+        Stmt::CreateIndex { table, .. } => out.push(table.clone()),
+        Stmt::DropIndex { table, .. } => {
+            if let Some(table) = table {
+                out.push(table.clone());
+            }
+        }
+        Stmt::Explain(inner) => collect_stmt_tables(inner, out)?,
+    }
+    Ok(())
+}
+
+fn collect_expr_tables(expr: &Expr, out: &mut Vec<String>) -> Result<(), String> {
+    match expr {
+        Expr::InSubquery { query, .. } => {
+            let nested = referenced_tables(query)?;
+            out.extend(nested);
+        }
+        Expr::Not(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            collect_expr_tables(inner, out)?;
+        }
+        Expr::And(left, right)
+        | Expr::Or(left, right)
+        | Expr::Cmp { left, right, .. }
+        | Expr::Arith { left, right, .. } => {
+            collect_expr_tables(left, out)?;
+            collect_expr_tables(right, out)?;
+        }
+        Expr::Literal(_) | Expr::Column(_) | Expr::InList { .. } => {}
+    }
+    Ok(())
+}
+
 impl SqlEngine {
+
     pub fn new(engine: Arc<Engine>) -> Self {
         let s = Self {
             engine,
@@ -4688,5 +4789,33 @@ mod tests {
             .execute("SELECT id FROM chr_n WHERE tag IS NULL")
             .unwrap();
         assert_eq!(res.rows.len(), 1);
+    }
+}
+#[cfg(test)]
+mod acl_parse_tests {
+    use super::referenced_tables;
+
+    #[test]
+    fn collects_select_join_and_subquery_tables() {
+        let tables = referenced_tables(
+            "SELECT u.username FROM chr_users u JOIN chr_orders o ON u.user_id = o.user_id \
+             WHERE u.user_id IN (SELECT user_id FROM chr_bans)",
+        )
+        .unwrap();
+        assert_eq!(
+            tables,
+            vec!["chr_bans".to_string(), "chr_orders".to_string(), "chr_users".to_string()]
+        );
+    }
+
+    #[test]
+    fn collects_create_table_foreign_keys() {
+        let tables = referenced_tables(
+            "CREATE TABLE chr_orders (id INT, user_id INT, PRIMARY KEY (id), \
+             FOREIGN KEY (user_id) REFERENCES chr_users(user_id))",
+        )
+        .unwrap();
+        assert!(tables.contains(&"chr_orders".to_string()));
+        assert!(tables.contains(&"chr_users".to_string()));
     }
 }

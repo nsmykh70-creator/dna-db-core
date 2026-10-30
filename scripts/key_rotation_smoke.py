@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only
 """End-to-end offline key-rotation smoke test.
 
@@ -34,13 +34,15 @@ def wait_ready(port, cafile, proc, log_path, timeout=20):
     raise RuntimeError("server did not become ready")
 
 
-def start(data, port, key_file, log_path):
+def start(data, port, key_file, log_path, mirror=None):
     log = open(log_path, "ab")
     cmd = [find_binary(), "serve", "--data-dir", str(data),
            "--port", str(port), "--bind", "127.0.0.1",
            "--admin-port", "0", "--admin-pass", "rotate-pass",
            "--encryption-key-file", str(key_file),
            "--no-scrub"]
+    if mirror is not None:
+        cmd += ["--mirror-dir", str(mirror)]
     return subprocess.Popen(cmd, stdout=log, stderr=log, cwd=str(PROJECT)), log
 
 
@@ -58,13 +60,14 @@ def stop(proc, log):
 def main():
     tmp = Path(tempfile.mkdtemp(prefix="dna_rotate_e2e_"))
     data = tmp / "data"
+    mirror = tmp / "mirror"
     new_key = tmp / "new.key"
     log_path = tmp / "server.log"
     proc = None
     log = None
     try:
         port = free_port()
-        proc, log = start(data, port, data / ".dna-db.key", log_path)
+        proc, log = start(data, port, data / ".dna-db.key", log_path, mirror)
         wait_ready(port, data / "tls" / "cert.pem", proc, log_path)
         c = DnaDbClient("127.0.0.1", port, "admin", "rotate-pass",
                         cafile=str(data / "tls" / "cert.pem"))
@@ -75,7 +78,7 @@ def main():
 
         proc = subprocess.run(
             [find_binary(), "rotate-key", "--data-dir", str(data),
-             "--new-key-file", str(new_key)],
+             "--new-key-file", str(new_key), "--mirror-dir", str(mirror)],
             cwd=str(PROJECT), capture_output=True, text=True, timeout=300,
         )
         if proc.returncode != 0:
@@ -85,10 +88,14 @@ def main():
         backups = list(tmp.glob("data.pre-rotate-*"))
         if not backups:
             raise RuntimeError("rollback backup was not created")
-        print("PASS: rotate-key completed; backup %s" % backups[0].name)
+        mirror_backups = list(tmp.glob("mirror.pre-rotate-*"))
+        if not mirror_backups:
+            raise RuntimeError("mirror rollback backup was not created")
+        print("PASS: rotate-key completed; backup %s, mirror backup %s"
+              % (backups[0].name, mirror_backups[0].name))
 
         port = free_port()
-        proc, log = start(data, port, new_key, log_path)
+        proc, log = start(data, port, new_key, log_path, mirror)
         wait_ready(port, data / "tls" / "cert.pem", proc, log_path)
         c = DnaDbClient("127.0.0.1", port, "admin", "rotate-pass",
                         cafile=str(data / "tls" / "cert.pem"))

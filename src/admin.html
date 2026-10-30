@@ -234,6 +234,7 @@
             <option value="operator">operator</option>
             <option value="admin">admin</option>
           </select>
+          <input class="txt" id="nu-tables" placeholder="таблицы: chr_users,chr_orders (пусто = все)" style="width:250px">
           <label style="color:var(--muted);font-size:12px"><input type="checkbox" id="nu-change" checked> сменить пароль при входе</label>
           <button class="act" id="nu-create">Создать пользователя</button>
         </div>
@@ -291,7 +292,7 @@ let BROWSE_ROWS = [], RM_ROW = null, RM_COLS = null, RM_PK = null;
 async function api(path, opts = {}) {
   opts.headers = Object.assign({ "Authorization": "Bearer " + TOKEN }, opts.headers || {});
   const res = await fetch(path, opts);
-  if (res.status === 401 && !path.endsWith("/api/login")) { showLogin(); throw new Error("unauthorized"); }
+  if (res.status === 401 && !path.endsWith("/api/login") && !path.endsWith("/api/login/proxy")) { showLogin(); throw new Error("unauthorized"); }
   let body = null;
   try { body = await res.json(); } catch (_) {}
   return { ok: res.ok, status: res.status, body };
@@ -330,6 +331,23 @@ $("#login-form").addEventListener("submit", async e => {
     errBox.classList.remove("hidden");
   }
 });
+async function tryProxyLogin() {
+  try {
+    const res = await fetch("/api/login/proxy", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: "{}"
+    });
+    if (!res.ok) { showLogin(); return; }
+    const body = await res.json();
+    if (body && body.token) {
+      TOKEN = body.token; sessionStorage.setItem("dnadb_token", TOKEN);
+      showApp(body.user, body.role, false); boot();
+    } else {
+      showLogin();
+    }
+  } catch (_) {
+    showLogin();
+  }
+}
 $("#logout").addEventListener("click", async () => {
   try { await api("/api/logout", { method: "POST" }); } catch (_) {}
   showLogin();
@@ -675,24 +693,37 @@ async function loadUsers() {
   }
   const users = (r.body && r.body.users) || [];
   $("#users-badge").textContent = users.length + " учётных записей";
-  let h = "<thead><tr><th>Логин</th><th>Роль</th><th>Статус</th><th>Смена пароля</th><th>Создан</th><th>Действия</th></tr></thead><tbody>";
+  let h = "<thead><tr><th>Логин</th><th>Роль</th><th>Таблицы</th><th>Статус</th><th>Смена пароля</th><th>Создан</th><th>Действия</th></tr></thead><tbody>";
   for (const u of users) {
     const created = u.created_at ? new Date(u.created_at * 1000).toLocaleString("ru-RU") : "—";
-    h += "<tr><td class='mono'>" + esc(u.username) + "</td><td>" + esc(u.role) + "</td><td>" +
+    const tables = u.allowed_tables ? (u.allowed_tables.length ? u.allowed_tables.join(", ") : "нет доступа") : "все";
+    h += "<tr><td class='mono'>" + esc(u.username) + "</td><td>" + esc(u.role) + "</td><td class='mono'>" + esc(tables) + "</td><td>" +
       (u.disabled ? '<span class="badge err">disabled</span>' : '<span class="badge ok">active</span>') +
       "</td><td>" + (u.must_change ? "да" : "нет") + "</td><td>" + esc(created) + "</td><td>" +
+      '<button class="act ghost" data-user-action="access" data-user="' + esc(u.username) + '" data-tables="' + esc(u.allowed_tables ? u.allowed_tables.join(",") : "*") + '">Доступ</button> ' +
       '<button class="act ghost" data-user-action="reset" data-user="' + esc(u.username) + '">Пароль</button> ' +
       '<button class="act ghost" data-user-action="toggle" data-user="' + esc(u.username) + '" data-disabled="' + (u.disabled ? "1" : "0") + '">' +
       (u.disabled ? "Включить" : "Отключить") + "</button> " +
       '<button class="act danger" data-user-action="delete" data-user="' + esc(u.username) + '">Удалить</button>' +
       "</td></tr>";
   }
-  if (!users.length) h += '<tr><td colspan="6" style="color:var(--muted)">Нет пользователей</td></tr>';
+  if (!users.length) h += '<tr><td colspan="7" style="color:var(--muted)">Нет пользователей</td></tr>';
   el.innerHTML = h + "</tbody>";
   el.querySelectorAll("button[data-user-action]").forEach(btn => btn.addEventListener("click", async () => {
     const user = btn.dataset.user, action = btn.dataset.userAction;
     usersMsg("", true);
-    if (action === "reset") {
+    if (action === "access") {
+      const current = btn.dataset.tables || "*";
+      const value = prompt(
+        "Таблицы для " + user + " через запятую.\n" +
+        "* или пусто = все таблицы; - = запретить все.", current);
+      if (value === null) return;
+      const r = await api("/api/users/access", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ user, allowed_tables: value.trim() === "-" ? [] : value })
+      });
+      usersMsg(r.ok ? "Доступ обновлён; сессии пользователя отозваны." : (r.body && r.body.error) || "Ошибка", r.ok);
+    } else if (action === "reset") {
       const pass = prompt("Новый пароль для " + user + " (мин. 8 символов):");
       if (!pass) return;
       const r = await api("/api/users/password", {
@@ -725,12 +756,14 @@ $("#nu-create").addEventListener("click", async () => {
     role: $("#nu-role").value,
     must_change: $("#nu-change").checked
   };
+  const tables = $("#nu-tables").value.trim();
+  if (tables) payload.allowed_tables = tables;
   if (!payload.user || !payload.pass) { usersMsg("Укажите логин и пароль", false); return; }
   const r = await api("/api/users", {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload)
   });
   if (r.ok) {
-    $("#nu-user").value = ""; $("#nu-pass").value = "";
+    $("#nu-user").value = ""; $("#nu-pass").value = ""; $("#nu-tables").value = "";
     usersMsg("Пользователь создан.", true);
     loadUsers();
   } else {
@@ -774,6 +807,8 @@ if (TOKEN) {
       showLogin();
     }
   }).catch(() => showLogin());
+} else {
+  tryProxyLogin();
 }
 </script>
 </body>

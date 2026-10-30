@@ -115,6 +115,19 @@ enum Command {
         /// 0 disables the panel. Binds to --bind (loopback by default).
         #[arg(long, default_value_t = 8080)]
         admin_port: u16,
+        /// Trust this reverse-proxy IP for header-based SSO (repeatable).
+        /// The proxy must strip client-supplied identity headers.
+        #[arg(long = "trusted-proxy", value_name = "IP")]
+        trusted_proxy: Vec<std::net::IpAddr>,
+        /// Header injected by the trusted proxy with the authenticated username.
+        #[arg(long = "proxy-auth-header", default_value = "X-Auth-Request-User")]
+        proxy_auth_header: String,
+        /// Shared-secret header name checked in addition to the peer IP.
+        #[arg(long = "proxy-auth-secret-header", default_value = "X-Proxy-Auth-Secret")]
+        proxy_auth_secret_header: String,
+        /// Optional shared secret value; also via DNA_DB_PROXY_AUTH_SECRET.
+        #[arg(long = "proxy-auth-secret")]
+        proxy_auth_secret: Option<String>,
     },
     /// Run real throughput/latency benchmarks and print results
     Bench {
@@ -198,6 +211,10 @@ enum Command {
         erasure_m: usize,
         #[arg(long, default_value_t = 64)]
         wal_rotate_mb: u64,
+        /// Rebuild this external Strand B directory with the new key.
+        /// The previous mirror is retained as `<mirror>.pre-rotate-<stamp>`.
+        #[arg(long)]
+        mirror_dir: Option<String>,
     },
 }
 
@@ -231,6 +248,10 @@ fn main() {
             scrub_rate_mib,
             wal_rotate_mb,
             admin_port,
+            trusted_proxy,
+            proxy_auth_header,
+            proxy_auth_secret_header,
+            proxy_auth_secret,
         } => {
             let admin_pass = admin_pass
                 .clone()
@@ -244,6 +265,25 @@ fn main() {
                     );
                     "password".to_string()
                 });
+            let proxy_secret = proxy_auth_secret
+                .clone()
+                .or_else(|| std::env::var("DNA_DB_PROXY_AUTH_SECRET").ok());
+            let proxy = if trusted_proxy.is_empty() {
+                None
+            } else {
+                match build_proxy_auth(
+                    trusted_proxy,
+                    proxy_auth_header,
+                    proxy_auth_secret_header,
+                    proxy_secret,
+                ) {
+                    Ok(config) => Some(config),
+                    Err(message) => {
+                        eprintln!("[FATAL] invalid trusted-proxy configuration: {message}");
+                        std::process::exit(2);
+                    }
+                }
+            };
             run_server(
                 data_dir,
                 *port,
@@ -267,6 +307,7 @@ fn main() {
                 tls_client_ca.as_deref(),
                 *no_encryption,
                 encryption_key_file.as_deref(),
+                proxy,
             )
         }
         Command::Bench { data_dir, ops } => run_bench(data_dir, *ops),
@@ -321,6 +362,7 @@ fn main() {
             erasure_k,
             erasure_m,
             wal_rotate_mb,
+            mirror_dir,
         } => run_rotate_key(
             data_dir,
             old_key_file.as_deref(),
@@ -329,6 +371,7 @@ fn main() {
             *erasure_k,
             *erasure_m,
             *wal_rotate_mb,
+            mirror_dir.as_deref(),
         ),
     };
     std::process::exit(code);
@@ -388,6 +431,40 @@ fn run_sql2dnaql(data_dir: &str, sql: Option<&str>) -> i32 {
     }
 }
 
+fn valid_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+}
+
+fn build_proxy_auth(
+    trusted_ips: &[std::net::IpAddr],
+    user_header: &str,
+    secret_header: &str,
+    secret: Option<String>,
+) -> Result<dna_db_core::admin::ProxyAuthConfig, String> {
+    if !valid_header_name(user_header) {
+        return Err("--proxy-auth-header must be a valid HTTP header name".into());
+    }
+    if !valid_header_name(secret_header) {
+        return Err("--proxy-auth-secret-header must be a valid HTTP header name".into());
+    }
+    let secret = secret.filter(|value| !value.is_empty());
+    if let Some(value) = &secret {
+        if value.len() < 16 {
+            return Err("--proxy-auth-secret must be at least 16 characters".into());
+        }
+    }
+    Ok(dna_db_core::admin::ProxyAuthConfig {
+        trusted_ips: trusted_ips.to_vec(),
+        user_header: user_header.to_string(),
+        secret_header: secret_header.to_string(),
+        secret,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_server(
     data_dir: &str,
@@ -412,6 +489,7 @@ fn run_server(
     tls_client_ca: Option<&str>,
     no_encryption: bool,
     encryption_key_file: Option<&str>,
+    proxy_auth: Option<dna_db_core::admin::ProxyAuthConfig>,
 ) -> i32 {
     let data_path = std::path::Path::new(data_dir);
     if let Err(e) = std::fs::create_dir_all(data_path) {
@@ -521,6 +599,7 @@ fn run_server(
             dnaql.clone(),
             security.clone(),
             tls.clone(),
+            proxy_auth.clone(),
         );
         let scheme = if tls.is_some() { "https" } else { "http" };
         eprintln!("[ADMIN] open {scheme}://{bind_address}:{admin_port}/ (default admin/password on first start)");
@@ -871,6 +950,7 @@ fn run_rotate_key(
     erasure_k: usize,
     erasure_m: usize,
     wal_rotate_mb: u64,
+    mirror_dir: Option<&str>,
 ) -> i32 {
     let data_path = std::path::Path::new(data_dir);
     let data_abs = match std::fs::canonicalize(data_path) {
@@ -934,6 +1014,7 @@ fn run_rotate_key(
         erasure_k,
         erasure_m,
         wal_segment_capacity: wal_rotate_mb * 1024 * 1024,
+        mirror_dir: mirror_dir.map(std::path::PathBuf::from),
     };
     match dna_db_core::rotate::rotate_key(data_path, old_crypto, new_crypto, options) {
         Ok(report) => {
@@ -942,11 +1023,21 @@ fn run_rotate_key(
                 report.keys, report.plaintext_bytes, report.new_fingerprint
             );
             println!("[ROTATE] rollback copy: {:?}", report.backup_dir);
+            if report.mirror_rebuilt {
+                match &report.mirror_backup_dir {
+                    Some(backup) => println!(
+                        "[ROTATE] external mirror rebuilt; previous mirror: {:?}",
+                        backup
+                    ),
+                    None => println!("[ROTATE] external mirror created and seeded"),
+                }
+            }
             println!("[ROTATE] verify the server, then delete the rollback copy and the old key");
             0
         }
         Err(e) => {
-            if created {
+            let message = e.to_string();
+            if created && !message.contains("rollback failed") {
                 let _ = std::fs::remove_file(new_path);
             }
             eprintln!("[FATAL] key rotation failed: {e}");

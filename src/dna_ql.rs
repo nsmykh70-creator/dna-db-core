@@ -1163,6 +1163,53 @@ pub(crate) fn float_token(f: &f64) -> String {
 // Engine (parser + executor)
 // ---------------------------------------------------------------------------
 
+/// Parse a DnaQL query and return every chromosome/table it references. Used
+/// by the per-user ACL before execution; this does not touch storage.
+pub fn referenced_tables(query: &str) -> Result<Vec<String>, String> {
+    let toks = tokenize(query)?;
+    let mut parser = Parser::new(toks);
+    let ast = parser.parse_query()?;
+    let mut tables = Vec::new();
+    collect_ast_tables(&ast, &mut tables);
+    tables.sort();
+    tables.dedup();
+    Ok(tables)
+}
+
+fn collect_ast_tables(ast: &DnaQlAst, out: &mut Vec<String>) {
+    match ast {
+        DnaQlAst::PatternSearch {
+            chromosome, link, ..
+        } => {
+            out.push(chromosome.clone());
+            if let Some(link) = link {
+                out.push(link.chromosome.clone());
+            }
+        }
+        DnaQlAst::PipelineQuery { source, stages } => {
+            out.push(source.clone());
+            for stage in stages {
+                if let PipelineStage::Link(Some(link)) = stage {
+                    out.push(link.chromosome.clone());
+                }
+            }
+        }
+        DnaQlAst::Tx { statements } => {
+            for statement in statements {
+                match statement {
+                    TxStmt::Mutate { table, .. }
+                    | TxStmt::Append { table, .. }
+                    | TxStmt::DropLocus { table, .. } => out.push(table.clone()),
+                }
+            }
+        }
+        DnaQlAst::BioAnalysis { .. } => {}
+        DnaQlAst::HealthCheck { chromosome, .. } => out.push(chromosome.clone()),
+        DnaQlAst::CreateChromosome { table, .. }
+        | DnaQlAst::DropChromosome { table, .. } => out.push(table.clone()),
+    }
+}
+
 pub struct DnaQlEngine {
     pub engine: Arc<Engine>,
     pub tx: TransactionCoordinator,
@@ -2022,5 +2069,24 @@ mod tests {
         .unwrap();
         assert!(e2.get(b"chr_variants:3").unwrap().is_none());
         assert!(e2.get(b"chr_variants:1").unwrap().is_some());
+    }
+}
+#[cfg(test)]
+mod acl_parse_tests {
+    use super::referenced_tables;
+
+    #[test]
+    fn collects_pipeline_and_link_tables() {
+        let tables = referenced_tables(
+            "FROM chr_users |> LINK chr_orders VIA COMPLEMENT(user_id)",
+        )
+        .unwrap();
+        assert_eq!(tables, vec!["chr_orders".to_string(), "chr_users".to_string()]);
+    }
+
+    #[test]
+    fn collects_transaction_tables() {
+        let tables = referenced_tables("TX { chr_variants += { id: 1 } }").unwrap();
+        assert_eq!(tables, vec!["chr_variants".to_string()]);
     }
 }

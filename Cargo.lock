@@ -292,7 +292,7 @@ dependencies = [
 
 [[package]]
 name = "dna-db-core"
-version = "3.3.0"
+version = "3.4.0"
 dependencies = [
  "argon2",
  "bytes",

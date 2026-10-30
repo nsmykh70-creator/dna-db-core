@@ -5,6 +5,9 @@
 Поднимает реальный сервер (release-сборка, strict fsync), прогоняет все
 opcode протокола и проверяет recovery после жёсткой остановки процесса.
 
+Сервер стартует с --no-tls: здесь проверяется сам протокол, а TLS/mTLS
+покрыты отдельно (scripts/tls_smoke.py, scripts/mtls_smoke.py).
+
 Checks:
   1. auth_ok / auth_bad      — 0x01 AUTH (верный и неверный пароль)
   2. preauth_guard           — неавторизованный запрос отклоняется
@@ -87,7 +90,7 @@ def start_server(data_dir, log):
         [find_binary(), "serve",
          "--data-dir", data_dir, "--port", str(PORT),
          "--bind", "127.0.0.1", "--admin-pass", PASS,
-         "--sync", "strict", "--no-scrub"],
+         "--sync", "strict", "--no-scrub", "--no-tls"],
         stdout=log, stderr=log, cwd=PROJECT)
     deadline = time.time() + 20
     while time.time() < deadline:

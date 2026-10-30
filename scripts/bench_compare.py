@@ -291,7 +291,7 @@ class DnaDbAdapter:
         self.port = port
         self.cafile = cafile
         self.mode = mode
-        self.version = ("dna-db-core 3.3.0 (%s, strict fsync)" % mode)
+        self.version = ("dna-db-core 3.4.0 (%s, strict fsync)" % mode)
 
     def connect(self):
         return DnaDbClient("127.0.0.1", self.port, "admin", "bench-pass",

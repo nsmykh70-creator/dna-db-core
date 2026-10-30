@@ -34,6 +34,10 @@ static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub struct UserRecord {
     pub username: String,
     pub role: String,
+    /// `None` = unrestricted (legacy default). `Some(list)` restricts a
+    /// non-admin user to these tables; see `crate::access`.
+    #[serde(default)]
+    pub allowed_tables: Option<Vec<String>>,
     /// Argon2id PHC string (`$argon2id$v=19$...`).
     pub password_hash: String,
     pub disabled: bool,
@@ -46,6 +50,7 @@ pub struct UserRecord {
 pub struct UserView {
     pub username: String,
     pub role: String,
+    pub allowed_tables: Option<Vec<String>>,
     pub disabled: bool,
     pub must_change: bool,
     pub created_at: u64,
@@ -120,6 +125,7 @@ impl UserStore {
         let record = UserRecord {
             username: username.to_string(),
             role: "admin".into(),
+            allowed_tables: None,
             password_hash: hash_password(password)?,
             disabled: false,
             must_change: false,
@@ -237,9 +243,23 @@ impl UserStore {
         role: &str,
         must_change: bool,
     ) -> Result<(), String> {
+        self.create_user_with_tables(username, password, role, must_change, None)
+    }
+
+    /// Create a user with an optional per-table allowlist. `None` preserves the
+    /// legacy unrestricted behaviour; `Some([])` denies every table.
+    pub fn create_user_with_tables(
+        &self,
+        username: &str,
+        password: &str,
+        role: &str,
+        must_change: bool,
+        allowed_tables: Option<Vec<String>>,
+    ) -> Result<(), String> {
         validate_username(username)?;
         validate_password(password)?;
         validate_role(role)?;
+        let allowed_tables = crate::access::normalize_tables(allowed_tables)?;
         if self.users.read().contains_key(username) {
             return Err("user already exists".into());
         }
@@ -255,6 +275,7 @@ impl UserStore {
                 UserRecord {
                     username: username.to_string(),
                     role: role.to_string(),
+                    allowed_tables,
                     password_hash: hash,
                     disabled: false,
                     must_change,
@@ -264,6 +285,35 @@ impl UserStore {
             );
         }
         self.persist()
+    }
+
+    /// Replace the table allowlist for an existing user. Admin handlers revoke
+    /// that user's sessions after this call.
+    pub fn set_allowed_tables(
+        &self,
+        username: &str,
+        allowed_tables: Option<Vec<String>>,
+    ) -> Result<(), String> {
+        let allowed_tables = crate::access::normalize_tables(allowed_tables)?;
+        {
+            let mut users = self.users.write();
+            let record = users
+                .get_mut(username)
+                .ok_or_else(|| "user not found".to_string())?;
+            record.allowed_tables = allowed_tables;
+            record.updated_at = unix_now();
+        }
+        self.persist()
+    }
+
+    /// Resolve an already-authenticated external identity (trusted reverse
+    /// proxy) to the local account. Disabled users are refused.
+    pub fn identity(&self, username: &str) -> Option<UserView> {
+        self.users
+            .read()
+            .get(username)
+            .filter(|record| !record.disabled)
+            .map(UserRecord::view)
     }
 
     pub fn set_disabled(&self, username: &str, disabled: bool) -> Result<(), String> {
@@ -315,6 +365,7 @@ impl UserRecord {
         UserView {
             username: self.username.clone(),
             role: self.role.clone(),
+            allowed_tables: self.allowed_tables.clone(),
             disabled: self.disabled,
             must_change: self.must_change,
             created_at: self.created_at,

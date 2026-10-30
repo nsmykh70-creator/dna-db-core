@@ -1,10 +1,10 @@
-# DNA-DB Core v3.3 «Paneldb Security» (production hardening)
+# DNA-DB Core v3.4 «Granular Access» (per-table ACL, proxy SSO, mirror-aware rotation)
 
 > **English:** [README.md](README.md) · здесь — [русская версия](README_RU.md)
 
 Высокопроизводительный встраиваемый и клиент-серверный движок баз данных на Rust с архитектурой LSM-Tree, 2-битной компрессией нуклеотидов, двухнитевым зеркалированием дисков, языком **DnaQL**, **полноценным SQL-подмножеством** (агрегаты, GROUP BY/HAVING, ORDER BY, IN/подзапросы, **secondary- и диапазонные индексы**), встроенной **веб-панелью управления** (phpMyAdmin-подобной) и самовосстановлением при повреждении секторов.
 
-## 0.2. Production-безопасность (v3.3)
+## 0.2. Production-безопасность (v3.4)
 
 | Контроль | Реализация |
 |---|---|
@@ -13,10 +13,12 @@
 | Mutual TLS | `--tls-client-ca CA.pem` требует клиентский сертификат, подписанный этим CA, на TCP и HTTPS; в shell — `--tls-client-cert/--tls-client-key` |
 | Пароли | **Argon2id** PHC-хеши в `DATA/users.json`, соль на пользователя, выравнивание времени для несуществующих пользователей |
 | Пользователи | bootstrap `admin` / `password`, затем создание/отключение/удаление пользователей и сброс/смена пароля в панели; роли `admin`, `operator`, `viewer`; последнего активного администратора удалить нельзя |
-| Сессии | 256-битные CSPRNG bearer-токены, TTL 12 ч, отзыв при смене пароля/отключении |
+| Per-table ACL | необязательный список `allowed_tables` у пользователя (пустой = запрет всех, отсутствует/`*` = без ограничений). Проверяется по AST SQL и DnaQL (SELECT/JOIN/подзапросы/DDL), в browse/query панели; raw KV для ограниченных пользователей отключён |
+| Внешний IdP | SSO через доверенный reverse proxy (`--trusted-proxy IP`, заголовок `X-Auth-Request-User`, опциональный shared secret). Совместимо с oauth2-proxy, Authentik, nginx `auth_request`; proxy обязан вырезать клиентский заголовок. Встроенного OIDC/SAML по-прежнему нет |
+| Сессии | 256-битные CSPRNG bearer-токены, TTL 12 ч, отзыв при смене пароля/отключении/изменении ACL |
 | Brute force | персистентный **lockout по IP и по логину** (5 ошибок / 60 с), глобальный throttle, последовательный Argon2 (ограниченная память) |
 | Шифрование at rest | XChaCha20-Poly1305 AEAD для значения до записи в WAL/SST/зеркало; ключ из `DNA_DB_ENCRYPTION_KEY`, `--encryption-key-file` или `DATA/.dna-db.key`; старые plaintext-строки читаются |
-| Ротация ключа | offline `rotate-key` копирует все живые строки в новый каталог с новым ключом, сохраняет users/TLS и оставляет rollback-копию |
+| Ротация ключа | offline `rotate-key` копирует все живые строки в новый каталог с новым ключом, сохраняет users/TLS и оставляет rollback-копию; `--mirror-dir` пересоздаёт и проверяет внешнее зеркало Strand B, сохраняя обе rollback-копии |
 | Supply chain | `cargo audit` чист (0 уязвимостей, 0 warning); vendored byte-compatible Reed–Solomon убирает `lru`/`instant` advisories |
 | Защита панели | CSP с SHA-256-хешем inline-скрипта SPA (без `unsafe-inline` для скриптов), `X-Frame-Options: DENY`, `nosniff`, `no-referrer`, ограничивающий `Permissions-Policy` |
 | Pre-auth DoS | лимит pre-auth кадра 64 KiB (вместо 128 × 16 MiB), 10 с таймаут до аутентификации, 64 одновременных соединения панели, 128 TCP-соединений |
@@ -49,6 +51,18 @@
 ./target/release/dna-db-core rotate-key \
   --data-dir ./dna_data --new-key-file /secure/dna-new.key
 
+# ротация с пересозданием внешнего зеркала Strand B:
+./target/release/dna-db-core rotate-key \
+  --data-dir ./dna_data --new-key-file /secure/dna-new.key \
+  --mirror-dir /mnt/dna_mirror
+
+# SSO через доверенный reverse proxy (oauth2-proxy / Authentik / nginx auth_request).
+# Proxy обязан перезаписывать, а не пробрасывать клиентский identity-заголовок.
+./target/release/dna-db-core serve --data-dir ./dna_data \
+  --trusted-proxy 127.0.0.1 \
+  --proxy-auth-header X-Auth-Request-User \
+  --proxy-auth-secret "$DNA_DB_PROXY_AUTH_SECRET"
+
 # только для локальной диагностики (не на недоверенной сети):
 #   --no-tls   --no-encryption
 ```
@@ -56,9 +70,9 @@
 > **Храните ключ шифрования отдельно от каталога данных.** Без ключа значения
 > не восстановить. Ключи записей и их количество остаются видимыми в WAL/SST
 > by design; AEAD защищает значения приложения, а не ключевое пространство LSM.
-> Per-table ACL и внешнего IdP нет; роли глобальные. Модель угроз, процедура
-> ротации и остаточные ограничения — в [SECURITY.md](SECURITY.md) и
-> [SECURITY_RU.md](SECURITY_RU.md).
+> Per-table ACL и SSO через reverse proxy реализованы; встроенных OIDC/SAML и
+> HSM/KMS-ключей нет. Модель угроз, процедура ротации и остаточные ограничения —
+> в [SECURITY.md](SECURITY.md) и [SECURITY_RU.md](SECURITY_RU.md).
 
 ## 0.1. Новое в v3.1 — SQL и веб-панель
 
@@ -112,7 +126,7 @@
 Доказательства (все — исполняемые):
 
 - **Chaos-тест**: `python3 scripts/chaos_test.py` — 100 000 ключей → порча 80 секторов (bit-flip/zero-fill) → `doctor --fix` → 100 % восстановление; live-режим (порча на работающем сервере); over-damage (честный отказ за границей гарантии). Результаты: [docs/CHAOS_REPORT.md](docs/CHAOS_REPORT.md).
-- **Тесты**: 174 зелёных (`cargo test --release`) — 159 lib + 15 integration, включая RS-кодек, репарацию, карантин, миграцию, ротацию WAL, parity закрытых WAL и encryption integration.
+- **Тесты**: 186 зелёных (`cargo test --release`) — 171 lib + 15 integration, включая RS-кодек, репарацию, карантин, миграцию, ротацию WAL, parity закрытых WAL, ACL-парсинг и encryption integration.
 - **Формат**: DNASST02 задокументирован в [docs/PROTOCOL.md](docs/PROTOCOL.md); DNASST01 читается, миграция — вручную `doctor --migrate` (приоритет — надёжность).
 
 Быстрый старт самовосстановления:
@@ -308,7 +322,7 @@ INSERT поддерживает две формы: позиционную `(cols
 ## 7. Тесты и бенчмарки
 
 ```bash
-cargo test --release                # 174 тестов (159 lib + 15 integration)
+cargo test --release                # 186 тестов (171 lib + 15 integration)
 python3 scripts/kill9_test.py       # kill -9 durability (нужен собранный release-бинарник)
 python3 scripts/chaos_test.py       # порча секторов -> doctor --fix -> 100% восстановление
 ./target/release/dna-db-core bench  # реальные замеры (см. docs/BENCHMARKS.md)

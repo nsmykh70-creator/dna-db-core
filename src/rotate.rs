@@ -33,6 +33,10 @@ pub struct RotateOptions {
     pub erasure_k: usize,
     pub erasure_m: usize,
     pub wal_segment_capacity: u64,
+    /// Optional external Strand B directory (the server's `--mirror-dir`).
+    /// When set, rotation rebuilds it from the rotated primary before the
+    /// operation reports success, so the mirror can never keep old-key data.
+    pub mirror_dir: Option<PathBuf>,
 }
 
 impl Default for RotateOptions {
@@ -42,6 +46,7 @@ impl Default for RotateOptions {
             erasure_k: 4,
             erasure_m: 2,
             wal_segment_capacity: 64 * 1024 * 1024,
+            mirror_dir: None,
         }
     }
 }
@@ -52,6 +57,8 @@ pub struct RotateReport {
     pub plaintext_bytes: u64,
     pub backup_dir: PathBuf,
     pub new_fingerprint: String,
+    pub mirror_backup_dir: Option<PathBuf>,
+    pub mirror_rebuilt: bool,
 }
 
 fn engine_config(dir: &Path, crypto: Option<Arc<Crypto>>, options: &RotateOptions) -> EngineConfig {
@@ -116,6 +123,65 @@ pub fn rotate_key(
             "rotation staging/backup directory already exists",
         ));
     }
+
+    // Resolve an optional external mirror before touching the primary. The
+    // mirror must not be the data directory or nested inside it (the atomic
+    // directory swap would move it into the rollback backup).
+    let mirror_layout = if let Some(mirror) = options.mirror_dir.as_ref() {
+        if mirror.as_os_str().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "mirror directory is empty",
+            ));
+        }
+        let mirror_parent = mirror
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(mirror_parent)?;
+        let mirror_name = mirror
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "mirror directory must end in a normal path component",
+                )
+            })?;
+        let canonical_data = data_dir.canonicalize()?;
+        let canonical_mirror = if mirror.exists() {
+            mirror.canonicalize()?
+        } else {
+            mirror_parent.canonicalize()?.join(mirror_name)
+        };
+        if canonical_data == canonical_mirror
+            || canonical_mirror.starts_with(&canonical_data)
+            || canonical_data.starts_with(&canonical_mirror)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "mirror directory must be outside the data directory",
+            ));
+        }
+        if mirror.exists() && !mirror.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "mirror path exists but is not a directory",
+            ));
+        }
+        let mirror_staging = mirror_parent.join(format!(".{mirror_name}.rotate-{stamp}"));
+        let mirror_backup = mirror_parent.join(format!("{mirror_name}.pre-rotate-{stamp}"));
+        if mirror_staging.exists() || mirror_backup.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "mirror staging/backup directory already exists",
+            ));
+        }
+        Some((mirror.clone(), mirror_staging, mirror_backup))
+    } else {
+        None
+    };
+
     fs::create_dir(&staging)?;
 
     let result = (|| -> io::Result<(usize, u64)> {
@@ -188,12 +254,128 @@ pub fn rotate_key(
         return Err(e);
     }
 
+    let mut mirror_backup_dir = None;
+    let mut mirror_rebuilt = false;
+    if let Some((mirror, mirror_staging, mirror_backup)) = mirror_layout {
+        match rebuild_mirror(
+            data_dir,
+            &mirror,
+            &mirror_staging,
+            &mirror_backup,
+            &new_crypto,
+            &options,
+        ) {
+            Ok(had_old_mirror) => {
+                mirror_rebuilt = true;
+                if had_old_mirror {
+                    mirror_backup_dir = Some(mirror_backup);
+                }
+            }
+            Err(mirror_error) => {
+                // The primary is already new-key. Put the old primary back so
+                // the operator never ends up with a new primary beside an
+                // old-key mirror that looks like a valid rollback point.
+                let rollback = rollback_primary(data_dir, &backup, &stamp);
+                let _ = fs::remove_dir_all(&mirror_staging);
+                return Err(match rollback {
+                    Ok(()) => io::Error::new(
+                        mirror_error.kind(),
+                        format!(
+                            "mirror rebuild failed ({mirror_error}); primary rotation rolled back"
+                        ),
+                    ),
+                    Err(rollback_error) => io::Error::new(
+                        io::ErrorKind::Other,
+                        format!(
+                            "mirror rebuild failed ({mirror_error}) and primary rollback failed \
+                             ({rollback_error}); old primary is at {:?}",
+                            backup
+                        ),
+                    ),
+                });
+            }
+        }
+    }
+
     Ok(RotateReport {
         keys,
         plaintext_bytes,
         backup_dir: backup,
         new_fingerprint: new_crypto.fingerprint(),
+        mirror_backup_dir,
+        mirror_rebuilt,
     })
+}
+
+/// Rebuild an external Strand B from the already-rotated primary. The new
+/// mirror is assembled in a staging directory, then swapped into place; the
+/// previous mirror is retained for rollback.
+fn rebuild_mirror(
+    data_dir: &Path,
+    mirror: &Path,
+    mirror_staging: &Path,
+    mirror_backup: &Path,
+    new_crypto: &Arc<Crypto>,
+    options: &RotateOptions,
+) -> io::Result<bool> {
+    let result = (|| -> io::Result<()> {
+        let mut config = engine_config(data_dir, Some(new_crypto.clone()), options);
+        config.mirror_disk_path = Some(mirror_staging.to_path_buf());
+        let engine = Engine::open(config)?;
+        engine.flush()?;
+        engine.checkpoint()?;
+        drop(engine);
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_dir_all(mirror_staging);
+        return Err(error);
+    }
+
+    let had_old = mirror.exists();
+    if had_old {
+        if mirror_backup.exists() {
+            let _ = fs::remove_dir_all(mirror_staging);
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("mirror backup {:?} already exists", mirror_backup),
+            ));
+        }
+        fs::rename(mirror, mirror_backup)?;
+    }
+    if let Err(error) = fs::rename(mirror_staging, mirror) {
+        if had_old {
+            let _ = fs::rename(mirror_backup, mirror);
+        }
+        let _ = fs::remove_dir_all(mirror_staging);
+        return Err(error);
+    }
+    Ok(had_old)
+}
+
+fn rollback_primary(data_dir: &Path, backup: &Path, stamp: &str) -> io::Result<()> {
+    let parent = data_dir
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = data_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("dna_data");
+    let failed = parent.join(format!(".{name}.rotate-failed-{stamp}"));
+    fs::rename(data_dir, &failed)?;
+    match fs::rename(backup, data_dir) {
+        Ok(()) => {
+            let _ = fs::remove_dir_all(&failed);
+            Ok(())
+        }
+        Err(error) => {
+            // Try to leave the newly rotated tree at the canonical path rather
+            // than hiding both versions behind a non-canonical name.
+            let _ = fs::rename(&failed, data_dir);
+            Err(error)
+        }
+    }
 }
 
 fn copy_dir_all(src: &Path, dst: &Path) -> io::Result<()> {
@@ -284,6 +466,51 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&report.backup_dir);
+    }
+
+    #[test]
+    fn rotates_with_external_mirror_and_rebuilds_it() {
+        let dir = temp_dir("mirror");
+        let mirror = temp_dir("mirror_b");
+        let old = Arc::new(Crypto::from_key([3u8; 32]));
+        let new = Arc::new(Crypto::from_key([4u8; 32]));
+        {
+            let mut config = engine_config(&dir, Some(old.clone()), &RotateOptions::default());
+            config.mirror_disk_path = Some(mirror.clone());
+            let engine = Engine::open(config).unwrap();
+            engine.put(b"chr1:1", b"mirrored-secret").unwrap();
+            engine.flush().unwrap();
+            engine.checkpoint().unwrap();
+        }
+
+        let options = RotateOptions {
+            mirror_dir: Some(mirror.clone()),
+            ..RotateOptions::default()
+        };
+        let report = rotate_key(&dir, Some(old.clone()), new.clone(), options).unwrap();
+        assert!(report.mirror_rebuilt);
+        assert!(report.mirror_backup_dir.clone().unwrap().is_dir());
+
+        let mut config = engine_config(&dir, Some(new.clone()), &RotateOptions::default());
+        config.mirror_disk_path = Some(mirror.clone());
+        let engine = Engine::open(config).unwrap();
+        assert_eq!(
+            engine.get(b"chr1:1").unwrap().as_deref(),
+            Some(b"mirrored-secret".as_slice())
+        );
+        drop(engine);
+
+        let old_engine = Engine::open(engine_config(&dir, Some(old), &RotateOptions::default()));
+        if let Ok(old_engine) = old_engine {
+            assert!(old_engine.get(b"chr1:1").is_err());
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&mirror);
+        let _ = fs::remove_dir_all(report.backup_dir);
+        if let Some(backup) = report.mirror_backup_dir {
+            let _ = fs::remove_dir_all(backup);
+        }
     }
 
     #[test]

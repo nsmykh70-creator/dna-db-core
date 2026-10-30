@@ -1,10 +1,10 @@
-# DNA-DB Core v3.3 «Paneldb Security» (production hardening)
+# DNA-DB Core v3.4 «Granular Access» (per-table ACL, proxy SSO, mirror-aware rotation)
 
 > This repository is bilingual: **English** (this file) · [Русский](README_RU.md)
 
 A high-performance embeddable and client/server database engine written in Rust, featuring an LSM-Tree architecture, 2-bit nucleotide compression, dual-strand disk mirroring, the **DnaQL** query language, a **full SQL subset** (aggregates, GROUP BY/HAVING, ORDER BY, IN/subqueries, **secondary and range indexes**), a built-in **web admin panel** (phpMyAdmin-style) and self-healing on sector corruption.
 
-## 0.2. Production security (v3.3)
+## 0.2. Production security (v3.4)
 
 | Control | Implementation |
 |---|---|
@@ -13,10 +13,12 @@ A high-performance embeddable and client/server database engine written in Rust,
 | Mutual TLS | `--tls-client-ca CA.pem` requires a CA-signed client certificate on TCP and HTTPS; `shell --tls-client-cert/--tls-client-key` for the CLI |
 | Passwords | **Argon2id** PHC hashes in `DATA/users.json`, per-user salt, timing-equalised unknown users |
 | Users | bootstrap `admin` / `password`, then create/disable/delete users and reset/change passwords in the panel; roles `admin`, `operator`, `viewer`; the last active admin cannot be removed |
-| Sessions | 256-bit CSPRNG bearer tokens, 12 h TTL, revoked on password change/disable |
+| Per-table ACL | optional `allowed_tables` list per user (empty = deny all, absent/`*` = unrestricted). Enforced on SQL and DnaQL ASTs (SELECT/JOIN/subquery/DDL), panel table browse/query, and by disabling raw KV for restricted accounts |
+| External IdP | trusted reverse-proxy SSO (`--trusted-proxy IP`, `X-Auth-Request-User`, optional shared secret). Works with oauth2-proxy, Authentik, nginx `auth_request`, etc.; the proxy must strip client-supplied identity headers. Built-in OIDC/SAML is still not included |
+| Sessions | 256-bit CSPRNG bearer tokens, 12 h TTL, revoked on password change/disable or ACL change |
 | Brute force | persistent **per-IP and per-username lockout** (5 failures / 60 s), global failure throttle, serialised Argon2 (bounded memory) |
 | Encryption at rest | XChaCha20-Poly1305 AEAD per value before WAL/SST/mirror writes; key from `DNA_DB_ENCRYPTION_KEY`, `--encryption-key-file` or `DATA/.dna-db.key`; legacy plaintext rows remain readable |
-| Key rotation | offline `rotate-key` copy-and-swap re-encrypts every live row under a new key and preserves users/TLS state; rollback tree is retained |
+| Key rotation | offline `rotate-key` copy-and-swap re-encrypts every live row under a new key and preserves users/TLS state; `--mirror-dir` rebuilds and verifies external Strand B from the rotated primary, retaining both rollback trees |
 | Supply chain | `cargo audit` clean (0 vulnerabilities, 0 warnings); vendored byte-compatible Reed–Solomon crate removes the `lru`/`instant` advisories |
 | Panel hardening | CSP with SHA-256 hash for the inline SPA script (no `unsafe-inline` for scripts), `X-Frame-Options: DENY`, `nosniff`, `no-referrer`, restrictive `Permissions-Policy` |
 | Pre-auth DoS | 64 KiB pre-auth frame cap (instead of 128 × 16 MiB allocation), 10 s pre-auth read timeout, 64 concurrent panel connections, 128 TCP connections |
@@ -49,6 +51,18 @@ A high-performance embeddable and client/server database engine written in Rust,
 ./target/release/dna-db-core rotate-key \
   --data-dir ./dna_data --new-key-file /secure/dna-new.key
 
+# rotate and rebuild the external Strand B mirror too:
+./target/release/dna-db-core rotate-key \
+  --data-dir ./dna_data --new-key-file /secure/dna-new.key \
+  --mirror-dir /mnt/dna_mirror
+
+# trusted reverse-proxy SSO (oauth2-proxy / Authentik / nginx auth_request).
+# The proxy must overwrite, never forward, a client-supplied identity header.
+./target/release/dna-db-core serve --data-dir ./dna_data \
+  --trusted-proxy 127.0.0.1 \
+  --proxy-auth-header X-Auth-Request-User \
+  --proxy-auth-secret "$DNA_DB_PROXY_AUTH_SECRET"
+
 # development-only escapes (never on an untrusted network):
 #   --no-tls   --no-encryption
 ```
@@ -56,9 +70,10 @@ A high-performance embeddable and client/server database engine written in Rust,
 > **Back up the encryption key separately from the data directory.** Without the
 > key the values are unrecoverable. Record keys and row counts remain visible
 > in WAL/SST indexes by design; the AEAD envelope protects application values,
-> not the LSM key space. There is no per-table ACL or external IdP; roles are
-> global. See [SECURITY.md](SECURITY.md) for the threat model, rotation
-> procedure and residual limitations.
+> not the LSM key space. Per-table ACLs and reverse-proxy IdP integration are
+> available, but built-in OIDC/SAML and HSM/KMS-backed keys are not. See
+> [SECURITY.md](SECURITY.md) for the threat model, rotation procedure and
+> residual limitations.
 
 ## 0.1. What's new in v3.1 — SQL and the web panel
 
@@ -112,7 +127,7 @@ DNA → engineering analogy:
 Proofs (all executable):
 
 - **Chaos test**: `python3 scripts/chaos_test.py` — 100,000 keys → 80 sectors corrupted (bit-flip/zero-fill) → `doctor --fix` → 100 % recovery; live mode (corruption on a running server); over-damage (honest failure beyond the guarantee). Results: [docs/CHAOS_REPORT.md](docs/CHAOS_REPORT.md).
-- **Tests**: 174 green (`cargo test --release`) — 159 library + 15 integration; includes RS codec against every loss pattern, interleaving, repair pipeline, quarantine, migration, WAL rotation, closed-WAL parity and encryption integration.
+- **Tests**: 186 green (`cargo test --release`) - 171 library + 15 integration; includes RS codec against every loss pattern, interleaving, repair pipeline, quarantine, migration, WAL rotation, closed-WAL parity, ACL parsing and encryption integration.
 - **Format**: DNASST02 is documented in [docs/PROTOCOL.md](docs/PROTOCOL.md); DNASST01 is readable, migration is manual via `doctor --migrate` (reliability first).
 
 Self-healing quick start:
@@ -305,7 +320,7 @@ Full format description: [PROTOCOL.md](docs/PROTOCOL.md).
 ## 7. Tests and benchmarks
 
 ```bash
-cargo test --release                # 174 tests (159 lib + 15 integration)
+cargo test --release                # 186 tests (171 lib + 15 integration)
 python3 scripts/kill9_test.py       # kill -9 durability (requires a built release binary)
 python3 scripts/chaos_test.py       # sector corruption -> doctor --fix -> 100% recovery
 ./target/release/dna-db-core bench  # real measurements (see docs/BENCHMARKS.md)

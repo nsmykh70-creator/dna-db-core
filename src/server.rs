@@ -102,6 +102,7 @@ impl Default for ServerConfig {
 pub struct AuthenticatedUser {
     pub username: String,
     pub role: String,
+    pub allowed_tables: Option<Vec<String>>,
     pub must_change: bool,
 }
 
@@ -238,6 +239,7 @@ impl SecurityManager {
                 Ok(AuthenticatedUser {
                     username: view.username,
                     role: view.role,
+                    allowed_tables: view.allowed_tables,
                     must_change: view.must_change,
                 })
             }
@@ -254,6 +256,22 @@ impl SecurityManager {
                 }
             }
         }
+    }
+
+    /// Resolve an identity already authenticated by a trusted reverse proxy.
+    /// No password or lockout accounting is involved: the proxy is the
+    /// authentication boundary and must strip client-supplied headers.
+    pub fn verify_trusted_identity(&self, username: &str) -> Result<AuthenticatedUser, AuthError> {
+        let view = self
+            .users
+            .identity(username)
+            .ok_or(AuthError::InvalidCredentials)?;
+        Ok(AuthenticatedUser {
+            username: view.username,
+            role: view.role,
+            allowed_tables: view.allowed_tables,
+            must_change: false,
+        })
     }
 
     fn lock_message(&self, key: &str) -> Option<String> {
@@ -543,6 +561,7 @@ fn handle_connection(
     let ip = addr.ip().to_string();
     let mut authenticated = false;
     let mut role = String::new();
+    let mut allowed_tables: Option<Vec<String>> = None;
 
     while let Some(payload) = read_frame_limited(
         &mut *stream,
@@ -565,6 +584,7 @@ fn handle_connection(
                 Ok(identity) => {
                     authenticated = true;
                     role = identity.role;
+                    allowed_tables = identity.allowed_tables;
                     stream.set_read_timeout(Some(AUTHENTICATED_TIMEOUT)).ok();
                     write_raw(&mut *stream, b"OK")?;
                 }
@@ -594,6 +614,13 @@ fn handle_connection(
                 )?;
             }
             Request::Put { key, value } => {
+                if !crate::access::raw_kv_allowed(&role, &allowed_tables) {
+                    write_frame(
+                        &mut *stream,
+                        b"ERR: raw key/value access is disabled for table-restricted users",
+                    )?;
+                    continue;
+                }
                 if role == "viewer" {
                     write_frame(&mut *stream, b"ERR: viewer role is read-only")?;
                     continue;
@@ -603,12 +630,28 @@ fn handle_connection(
                     Err(e) => write_frame(&mut *stream, format!("ERR: {}", e).as_bytes())?,
                 }
             }
-            Request::Get { key } => match engine.get(&key) {
-                Ok(Some(value)) => write_frame(&mut *stream, &value)?,
-                Ok(None) => write_frame(&mut *stream, &[])?,
-                Err(e) => write_frame(&mut *stream, format!("ERR: {}", e).as_bytes())?,
-            },
+            Request::Get { key } => {
+                if !crate::access::raw_kv_allowed(&role, &allowed_tables) {
+                    write_frame(
+                        &mut *stream,
+                        b"ERR: raw key/value access is disabled for table-restricted users",
+                    )?;
+                    continue;
+                }
+                match engine.get(&key) {
+                    Ok(Some(value)) => write_frame(&mut *stream, &value)?,
+                    Ok(None) => write_frame(&mut *stream, &[])?,
+                    Err(e) => write_frame(&mut *stream, format!("ERR: {}", e).as_bytes())?,
+                }
+            }
             Request::Delete { key } => {
+                if !crate::access::raw_kv_allowed(&role, &allowed_tables) {
+                    write_frame(
+                        &mut *stream,
+                        b"ERR: raw key/value access is disabled for table-restricted users",
+                    )?;
+                    continue;
+                }
                 if role == "viewer" {
                     write_frame(&mut *stream, b"ERR: viewer role is read-only")?;
                     continue;
@@ -619,8 +662,8 @@ fn handle_connection(
                 }
             }
             Request::Checkpoint => {
-                if role == "viewer" {
-                    write_frame(&mut *stream, b"ERR: viewer role is read-only")?;
+                if role == "viewer" || !crate::access::raw_kv_allowed(&role, &allowed_tables) {
+                    write_frame(&mut *stream, b"ERR: administrator role required")?;
                     continue;
                 }
                 match engine.checkpoint() {
@@ -629,6 +672,24 @@ fn handle_connection(
                 }
             }
             Request::DnaQlQuery { query } => {
+                if role != "admin" && allowed_tables.is_some() {
+                    match crate::dna_ql::referenced_tables(&query) {
+                        Ok(tables) => {
+                            if let Err(message) = crate::access::authorize_tables(
+                                &role,
+                                &allowed_tables,
+                                &tables,
+                            ) {
+                                write_frame(&mut *stream, format!("ERR: {message}").as_bytes())?;
+                                continue;
+                            }
+                        }
+                        Err(message) => {
+                            write_frame(&mut *stream, format!("ERR: {message}").as_bytes())?;
+                            continue;
+                        }
+                    }
+                }
                 if role == "viewer" && !is_read_only_query(&query) {
                     write_frame(&mut *stream, b"ERR: viewer role is read-only")?;
                     continue;
@@ -642,6 +703,32 @@ fn handle_connection(
                 }
             }
             Request::SqlQuery { query } => {
+                if role != "admin" && allowed_tables.is_some() {
+                    let upper = query.trim_start().to_ascii_uppercase();
+                    if upper.starts_with("SHOW") || upper.starts_with("DESCRIBE") {
+                        write_frame(
+                            &mut *stream,
+                            b"ERR: schema-wide queries are not available to table-restricted users",
+                        )?;
+                        continue;
+                    }
+                    match crate::sql_engine::referenced_tables(&query) {
+                        Ok(tables) => {
+                            if let Err(message) = crate::access::authorize_tables(
+                                &role,
+                                &allowed_tables,
+                                &tables,
+                            ) {
+                                write_frame(&mut *stream, format!("ERR: {message}").as_bytes())?;
+                                continue;
+                            }
+                        }
+                        Err(message) => {
+                            write_frame(&mut *stream, format!("ERR: {message}").as_bytes())?;
+                            continue;
+                        }
+                    }
+                }
                 if role == "viewer" && !is_read_only_query(&query) {
                     write_frame(&mut *stream, b"ERR: viewer role is read-only")?;
                     continue;

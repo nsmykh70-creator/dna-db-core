@@ -21,6 +21,7 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use serde_json::{json, Value as J};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 use crate::dna_ql::{DnaQlEngine, DnaQlRow};
 use crate::engine::Engine;
@@ -36,8 +37,22 @@ const MAX_BODY: usize = 4 * 1024 * 1024; // 4 MiB request bodies
 struct Session {
     user: String,
     role: String,
+    allowed_tables: Option<Vec<String>>,
     must_change: bool,
     issued: Instant,
+}
+
+/// Authentication delegated to a reverse proxy (oauth2-proxy, Authentik,
+/// nginx `auth_request`, ...). The proxy terminates the user-facing login,
+/// strips any client-supplied identity header, and injects the authenticated
+/// username. Only requests from an explicitly trusted peer IP are accepted;
+/// an optional shared secret makes a misconfigured proxy fail closed.
+#[derive(Clone, Debug)]
+pub struct ProxyAuthConfig {
+    pub trusted_ips: Vec<IpAddr>,
+    pub user_header: String,
+    pub secret_header: String,
+    pub secret: Option<String>,
 }
 
 pub struct AdminPanel {
@@ -46,6 +61,7 @@ pub struct AdminPanel {
     dnaql: Arc<DnaQlEngine>,
     security: Arc<SecurityManager>,
     tls: Option<Arc<rustls::ServerConfig>>,
+    proxy: Option<ProxyAuthConfig>,
     /// token -> session
     tokens: Mutex<HashMap<String, Session>>,
     active: Arc<AtomicUsize>,
@@ -65,6 +81,7 @@ pub fn spawn(
     dnaql: Arc<DnaQlEngine>,
     security: Arc<SecurityManager>,
     tls: Option<Arc<rustls::ServerConfig>>,
+    proxy: Option<ProxyAuthConfig>,
 ) {
     let listener = match TcpListener::bind((bind, port)) {
         Ok(l) => l,
@@ -80,6 +97,7 @@ pub fn spawn(
         dnaql,
         security,
         tls,
+        proxy,
         tokens: Mutex::new(HashMap::new()),
         active: Arc::new(AtomicUsize::new(0)),
     });
@@ -162,6 +180,9 @@ impl AdminPanel {
         if req.method == "POST" && req.path == "/api/login" {
             return self.api_login(ip, req);
         }
+        if req.method == "POST" && req.path == "/api/login/proxy" {
+            return self.api_login_proxy(ip, req);
+        }
         if req.method == "GET" && req.path == "/api/csrf" {
             return Response::json(200, &json!({"token": "not-required-bearer-only"}));
         }
@@ -185,14 +206,15 @@ impl AdminPanel {
 
         match (req.method.as_str(), req.path.as_str()) {
             ("GET", "/api/health") => self.api_health(),
-            ("GET", "/api/tables") => self.api_tables(),
-            ("GET", "/api/browse") => self.api_browse(req),
+            ("GET", "/api/tables") => self.api_tables(&session),
+            ("GET", "/api/browse") => self.api_browse(req, &session),
             ("POST", "/api/query") => self.api_query(&session, req),
             ("GET", "/api/me") => Response::json(
                 200,
                 &json!({
                     "user": session.user,
                     "role": session.role,
+                    "allowed_tables": session.allowed_tables,
                     "must_change": session.must_change,
                 }),
             ),
@@ -205,6 +227,7 @@ impl AdminPanel {
             ("POST", "/api/users") => self.api_create_user(&session, req),
             ("POST", "/api/users/password") => self.api_reset_password(&session, req),
             ("POST", "/api/users/disable") => self.api_disable_user(&session, req),
+            ("POST", "/api/users/access") => self.api_set_access(&session, req),
             ("POST", "/api/users/delete") => self.api_delete_user(&session, req),
             _ => Response::json(404, &json!({"error": format!("no route {}", req.path)})),
         }
@@ -238,6 +261,63 @@ impl AdminPanel {
             Err(AuthError::Locked(msg)) | Err(AuthError::Internal(msg)) => {
                 Response::json(423, &json!({"error": msg}))
             }
+        }
+    }
+
+    fn api_login_proxy(&self, ip: &str, req: &Request) -> Response {
+        let Some(config) = &self.proxy else {
+            return Response::json(403, &json!({"error": "trusted proxy authentication is not enabled"}));
+        };
+        let peer = match ip.parse::<IpAddr>() {
+            Ok(peer) => normalize_ip(peer),
+            Err(_) => {
+                return Response::json(403, &json!({"error": "untrusted proxy peer"}));
+            }
+        };
+        if !config
+            .trusted_ips
+            .iter()
+            .any(|trusted| normalize_ip(*trusted) == peer)
+        {
+            return Response::json(403, &json!({"error": "untrusted proxy peer"}));
+        }
+        if let Some(expected) = &config.secret {
+            let supplied = req
+                .headers
+                .get(&config.secret_header.to_ascii_lowercase())
+                .map(String::as_str)
+                .unwrap_or("");
+            if !secret_matches(expected, supplied) {
+                return Response::json(403, &json!({"error": "invalid proxy authentication secret"}));
+            }
+        }
+        let user = req
+            .headers
+            .get(&config.user_header.to_ascii_lowercase())
+            .map(|value| value.trim())
+            .unwrap_or("");
+        if user.is_empty() {
+            return Response::json(401, &json!({"error": "proxy did not supply an authenticated user"}));
+        }
+        match self.security.verify_trusted_identity(user) {
+            Ok(identity) => {
+                let token = self.issue_token(&identity);
+                eprintln!(
+                    "[ADMIN] trusted-proxy login user={} peer={}",
+                    identity.username, peer
+                );
+                Response::json(
+                    200,
+                    &json!({
+                        "token": token,
+                        "user": identity.username,
+                        "role": identity.role,
+                        "allowed_tables": identity.allowed_tables,
+                        "must_change": false,
+                    }),
+                )
+            }
+            Err(_) => Response::json(401, &json!({"error": "proxy user is unknown or disabled"})),
         }
     }
 
@@ -291,12 +371,68 @@ impl AdminPanel {
         let pass = body["pass"].as_str().unwrap_or("");
         let role = body["role"].as_str().unwrap_or("viewer");
         let must_change = body["must_change"].as_bool().unwrap_or(true);
+        let allowed_tables = match body.get("allowed_tables") {
+            None | Some(J::Null) => None,
+            Some(J::Array(values)) => Some(
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_string))
+                    .collect(),
+            ),
+            Some(J::String(csv)) => match crate::access::normalize_csv(csv) {
+                Ok(tables) => tables,
+                Err(e) => return Response::json(400, &json!({"error": e})),
+            },
+            Some(_) => {
+                return Response::json(
+                    400,
+                    &json!({"error": "allowed_tables must be an array of strings"}),
+                );
+            }
+        };
         match self
             .security
             .users
-            .create_user(user, pass, role, must_change)
+            .create_user_with_tables(user, pass, role, must_change, allowed_tables)
         {
             Ok(()) => Response::json(201, &json!({"ok": true, "user": user, "role": role})),
+            Err(e) => Response::json(400, &json!({"error": e})),
+        }
+    }
+
+    fn api_set_access(&self, session: &Session, req: &Request) -> Response {
+        if let Some(response) = self.require_admin(session) {
+            return response;
+        }
+        let body: J = match req.json_body() {
+            Some(b) => b,
+            None => return Response::json(400, &json!({"error": "invalid JSON body"})),
+        };
+        let user = body["user"].as_str().unwrap_or("");
+        let allowed_tables = match body.get("allowed_tables") {
+            None | Some(J::Null) => None,
+            Some(J::Array(values)) => Some(
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_string))
+                    .collect(),
+            ),
+            Some(J::String(csv)) => match crate::access::normalize_csv(csv) {
+                Ok(tables) => tables,
+                Err(e) => return Response::json(400, &json!({"error": e})),
+            },
+            Some(_) => {
+                return Response::json(
+                    400,
+                    &json!({"error": "allowed_tables must be an array of strings"}),
+                );
+            }
+        };
+        match self.security.users.set_allowed_tables(user, allowed_tables) {
+            Ok(()) => {
+                self.revoke_user_tokens(user);
+                Response::json(200, &json!({"ok": true}))
+            }
             Err(e) => Response::json(400, &json!({"error": e})),
         }
     }
@@ -386,11 +522,14 @@ impl AdminPanel {
         )
     }
 
-    fn api_tables(&self) -> Response {
+    fn api_tables(&self, session: &Session) -> Response {
         let tables: Vec<J> = self
             .sql
             .list_tables()
             .into_iter()
+            .filter(|name| {
+                crate::access::denied_table(&session.role, &session.allowed_tables, name).is_none()
+            })
             .filter_map(|name| {
                 let schema = self.sql.get_schema(&name)?;
                 Some(json!({
@@ -405,13 +544,21 @@ impl AdminPanel {
         Response::json(200, &json!({"tables": tables}))
     }
 
-    fn api_browse(&self, req: &Request) -> Response {
+    fn api_browse(&self, req: &Request, session: &Session) -> Response {
         let name = match req.query_param("table") {
             Some(n) => n,
             None => return Response::json(400, &json!({"error": "missing ?table="})),
         };
         if !is_safe_ident(&name) {
             return Response::json(400, &json!({"error": "invalid table name"}));
+        }
+        if let Some(denied) =
+            crate::access::denied_table(&session.role, &session.allowed_tables, &name)
+        {
+            return Response::json(
+                403,
+                &json!({"error": format!("access denied for table '{denied}'")}),
+            );
         }
         if self.sql.get_schema(&name).is_none() {
             return Response::json(
@@ -479,6 +626,31 @@ impl AdminPanel {
             return Response::json(400, &json!({"error": "empty query"}));
         }
         let kind = body["kind"].as_str().unwrap_or("sql");
+        if session.role != "admin" && session.allowed_tables.is_some() {
+            let upper = query.trim_start().to_ascii_uppercase();
+            if kind != "dnaql" && (upper.starts_with("SHOW") || upper.starts_with("DESCRIBE")) {
+                return Response::json(
+                    403,
+                    &json!({"error": "schema-wide queries are not available to table-restricted users"}),
+                );
+            }
+            let tables = match kind {
+                "dnaql" => crate::dna_ql::referenced_tables(&query),
+                _ => crate::sql_engine::referenced_tables(&query),
+            };
+            match tables {
+                Ok(tables) => {
+                    if let Err(message) = crate::access::authorize_tables(
+                        &session.role,
+                        &session.allowed_tables,
+                        &tables,
+                    ) {
+                        return Response::json(403, &json!({"error": message}));
+                    }
+                }
+                Err(message) => return Response::json(400, &json!({"error": message})),
+            }
+        }
         match kind {
             "dnaql" => match self.dnaql.execute(&query) {
                 Ok(res) => {
@@ -522,6 +694,7 @@ impl AdminPanel {
             Session {
                 user: identity.username.clone(),
                 role: identity.role.clone(),
+                allowed_tables: identity.allowed_tables.clone(),
                 must_change: identity.must_change,
                 issued: Instant::now(),
             },
@@ -573,6 +746,18 @@ impl Request {
     fn json_body(&self) -> Option<J> {
         serde_json::from_slice(&self.body).ok()
     }
+}
+
+fn normalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        IpAddr::V4(_) => ip,
+    }
+}
+
+fn secret_matches(expected: &str, supplied: &str) -> bool {
+    expected.len() == supplied.len()
+        && bool::from(expected.as_bytes().ct_eq(supplied.as_bytes()))
 }
 
 fn read_request<R: Read + ?Sized>(stream: &mut R) -> std::io::Result<Option<Request>> {
@@ -886,6 +1071,7 @@ mod tests {
             dnaql,
             security: Arc::new(SecurityManager::new("admin", "s3cret-panel")),
             tls: None,
+            proxy: None,
             tokens: Mutex::new(HashMap::new()),
             active: Arc::new(AtomicUsize::new(0)),
         });
