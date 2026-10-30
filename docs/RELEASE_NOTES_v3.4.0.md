@@ -112,8 +112,12 @@ ACL smoke проверяет: список таблиц в панели, зап�
 ## Артефакты
 
 - `dna-db-core-v3.4.0-windows-x86_64.zip`
-- `dna-db-core-v3.4.0-windows-x86_64.zip.sha256` — SHA-256 архива
+- SHA-256: `002f6bce1403e041a0759e1abd7b99076b40aa947e2d8f357b8368c08da9276e`
+- `dna-db-core-v3.4.0-windows-x86_64.zip.sha256` — тот же SHA для `sha256sum -c`
 - `BENCHMARK_REPORT_2026-10-26_RU.md`
 - `security_results_2026-10-30_public_v3.4.0.json`
 
-SHA-256 архива продублирован в тексте релиза и в `docs/RELEASE_NOTES_v3.4.0.md` после публикации.
+Опубликовано: https://github.com/nsmykh70-creator/dna-db-core/releases/tag/v3.4.0
+В самом архиве лежит эта же копия без строки SHA-256: файл не может
+содержать контрольную сумму архива, в который он упакован. Проверяйте
+скачанный архив по `.sha256` рядом с ним.
