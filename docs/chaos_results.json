@@ -1,5 +1,8 @@
 {
-  "results": [
+  "date": "2026-10-31",
+  "version": "3.5.0",
+  "seed": 20261021,
+  "scenarios": [
     {
       "scenario": "offline",
       "keys": 100000,
@@ -8,9 +11,9 @@
       "missing": 0,
       "corrupted": 0,
       "verdict": "PASS",
-      "load_secs": 94.5,
-      "doctor_secs": 1.4,
-      "verify_secs": 21.2
+      "load_secs": 2.8,
+      "doctor_secs": 0.2,
+      "verify_secs": 3.3
     },
     {
       "scenario": "live",
@@ -19,7 +22,7 @@
       "missing": 0,
       "corrupted": 0,
       "verdict": "PASS",
-      "verify_secs": 21.9,
+      "verify_secs": 3.3,
       "lesions_repaired": 45
     },
     {
@@ -31,7 +34,5 @@
       "unreadable_keys": 483,
       "verdict": "PASS"
     }
-  ],
-  "chaos": "PASS",
-  "seed": 20261021
+  ]
 }

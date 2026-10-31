@@ -177,6 +177,12 @@ impl AdminPanel {
         if req.method == "GET" && (req.path == "/" || req.path.is_empty()) {
             return Response::html(ADMIN_HTML);
         }
+        // v4.0: Prometheus scrape endpoint — intentionally UNAUTHENTICATED
+        // but bound to the admin interface only (loopback by default), the
+        // standard deployment shape for the metrics port behind a firewall.
+        if req.method == "GET" && req.path == "/metrics" {
+            return self.prometheus_metrics();
+        }
         if req.method == "POST" && req.path == "/api/login" {
             return self.api_login(ip, req);
         }
@@ -495,6 +501,68 @@ impl AdminPanel {
         }
     }
 
+    /// v4.0: Prometheus text format (0.0.4) endpoint. Real counters from the
+    /// engine — no fabricated values.
+    fn prometheus_metrics(&self) -> Response {
+        let health = self.engine.health();
+        let lesions = &health["lesions"];
+        let mut body = String::new();
+        let health_val = |k: &str| -> u64 {
+            lesions
+                .get(k)
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+        };
+        body.push_str("# HELP dnadb_engine_health_status Engine health (1=GREEN).
+# TYPE dnadb_engine_health_status gauge
+dnadb_engine_health_status ");
+        body.push_str(&(if health["status"] == "GREEN" { 1 } else { 0 }).to_string());
+        body.push_str("\n");
+        body.push_str("# HELP dnadb_lesions_found_total Lesions detected by scrubber/on-read checks.
+# TYPE dnadb_lesions_found_total counter
+dnadb_lesions_found_total ");
+        body.push_str(&health_val("found").to_string());
+        body.push_str("\n");
+        body.push_str("# HELP dnadb_lesions_repaired_total Lesions repaired in-band (RS parity / mirror).
+# TYPE dnadb_lesions_repaired_total counter
+dnadb_lesions_repaired_total ");
+        body.push_str(&health_val("repaired").to_string());
+        body.push_str("\n");
+        body.push_str("# HELP dnadb_lesions_unrecoverable_total Lesions beyond repair (quarantined).
+# TYPE dnadb_lesions_unrecoverable_total counter
+dnadb_lesions_unrecoverable_total ");
+        body.push_str(&health_val("unrecoverable").to_string());
+        body.push_str("\n");
+        body.push_str("# HELP dnadb_memtable_bytes Active MemTable size in bytes.
+# TYPE dnadb_memtable_bytes gauge
+dnadb_memtable_bytes ");
+        body.push_str(&self.engine.memtable_size().to_string());
+        body.push_str("\n");
+        body.push_str("# HELP dnadb_segments_count On-disk DNASST02 segments.
+# TYPE dnadb_segments_count gauge
+dnadb_segments_count ");
+        body.push_str(&self.engine.segment_count().to_string());
+        body.push_str("\n");
+        // Flat engine stats (puts/gets/deletes/wal_bytes/...) as gauges.
+        for pair in self.engine.stats.summary().split_whitespace() {
+            if let Some((k, v)) = pair.split_once('=') {
+                if let Ok(n) = v.parse::<f64>() {
+                    let key = k.trim_start_matches("__").replace('-', "_");
+                    body.push_str(&format!(
+                        "# TYPE dnadb_stat_{key} gauge
+dnadb_stat_{key} {n}
+"
+                    ));
+                }
+            }
+        }
+        Response {
+            status: 200,
+            content_type: "text/plain; version=0.0.4; charset=utf-8",
+            body,
+        }
+    }
+
     fn api_health(&self) -> Response {
         let health = self.engine.health();
         // Parse the flat stats summary into an object for the dashboard.
@@ -652,34 +720,44 @@ impl AdminPanel {
             }
         }
         match kind {
-            "dnaql" => match self.dnaql.execute(&query) {
-                Ok(res) => {
-                    let mut columns: Vec<String> = Vec::new();
-                    for row in &res.rows {
-                        for k in row.fields.keys() {
-                            if !columns.contains(k) {
-                                columns.push(k.clone());
+            "dnaql" => {
+                // Fault guard (same rationale as the TCP path): a panic in
+                // the query engine must not kill the whole panel process.
+                match crate::server::catch_request_panic("panel:dnaql", || {
+                    self.dnaql.execute(&query)
+                }) {
+                    Ok(Ok(res)) => {
+                        let mut columns: Vec<String> = Vec::new();
+                        for row in &res.rows {
+                            for k in row.fields.keys() {
+                                if !columns.contains(k) {
+                                    columns.push(k.clone());
+                                }
                             }
                         }
+                        Response::json(
+                            200,
+                            &json!({
+                                "kind": "dnaql",
+                                "columns": columns,
+                                "rows": dnaql_rows_json(&res.rows),
+                                "plan": res.ast_summary,
+                                "note": res.engine_note,
+                                "time_us": res.execution_time_us,
+                            }),
+                        )
                     }
-                    Response::json(
-                        200,
-                        &json!({
-                            "kind": "dnaql",
-                            "columns": columns,
-                            "rows": dnaql_rows_json(&res.rows),
-                            "plan": res.ast_summary,
-                            "note": res.engine_note,
-                            "time_us": res.execution_time_us,
-                        }),
-                    )
+                    Ok(Err(e)) => Response::json(400, &json!({"error": e})),
+                    Err(e) => Response::json(500, &json!({"error": e})),
                 }
-                Err(e) => Response::json(400, &json!({"error": e})),
-            },
-            _ => match self.sql.execute(&query) {
-                Ok(res) => Response::json(200, &sql_result_json(&res)),
-                Err(e) => Response::json(400, &json!({"error": e})),
-            },
+            }
+            _ => {
+                match crate::server::catch_request_panic("panel:sql", || self.sql.execute(&query)) {
+                    Ok(Ok(res)) => Response::json(200, &sql_result_json(&res)),
+                    Ok(Err(e)) => Response::json(400, &json!({"error": e})),
+                    Err(e) => Response::json(500, &json!({"error": e})),
+                }
+            }
         }
     }
 

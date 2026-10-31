@@ -166,10 +166,16 @@ impl TransactionCoordinator {
         }
     }
 
-    /// Atomic commit: for Serializable, first re-validate every first-touch
-    /// baseline while holding the commit lock (validate→write is one atomic
-    /// interval against rival commits); then encode all mutations and flush
-    /// them as one WAL batch frame.
+    /// Atomic commit: the commit lock is taken for EVERY commit (not only
+    /// Serializable ones), then — for Serializable — every first-touch
+    /// baseline is re-validated while still holding the lock, and finally all
+    /// mutations are flushed as one WAL batch frame.
+    ///
+    /// Holding the lock across ALL commits matters: previously a ReadCommitted
+    /// rival could land a write between a Serializable transaction's baseline
+    /// validation and its batch, so the "serializable" guarantee silently
+    /// degraded to last-writer-wins whenever any concurrent writer used the
+    /// cheaper isolation level.
     pub fn commit(&self, session: &mut TransactionSession) -> Result<u64, String> {
         if session.status != TxStatus::Active {
             return Err(format!("transaction is {:?}, not Active", session.status));
@@ -180,10 +186,8 @@ impl TransactionCoordinator {
             return Ok(self.global_lsn.load(Ordering::SeqCst));
         }
 
-        // Serializable: hold the commit lock across validate + write so no
-        // rival commit can slip between the baseline check and our batch.
-        let _serial_guard =
-            (session.isolation == TxIsolationLevel::Serializable).then(|| self.commit_lock.lock());
+        // Serialize validate -> write against EVERY rival commit.
+        let _commit_guard = self.commit_lock.lock();
         if session.isolation == TxIsolationLevel::Serializable {
             for (key, base) in &session.baseline {
                 let cur = self
@@ -332,5 +336,60 @@ mod tests {
         let mut tx = coord.begin(TxIsolationLevel::ReadCommitted);
         coord.commit(&mut tx).unwrap();
         assert!(coord.commit(&mut tx).is_err());
+    }
+}
+
+/// Regression test for the v3.5.0 fix: the commit lock now covers ALL
+/// commits, so a Serializable transaction cannot be interleaved by a
+/// ReadCommitted rival between its baseline validation and its batch.
+#[cfg(test)]
+mod isolation_regression_tests {
+    use super::*;
+    use crate::engine::EngineConfig;
+    use crate::relational::RowCodec;
+
+    fn tempdir(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("dna_tx_iso_{}_{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn serializable_detects_readcommitted_interleaving() {
+        let dir = tempdir("isolation");
+        let engine = Engine::open(EngineConfig {
+            dir_path: dir,
+            ..Default::default()
+        })
+        .unwrap();
+        let coord = TransactionCoordinator::new(engine.clone());
+
+        // Serializable session records the (absent) baseline of chr_x:1.
+        let mut serial = coord.begin(TxIsolationLevel::Serializable);
+        assert!(serial.read_row("chr_x:1").unwrap().is_none());
+
+        // A ReadCommitted rival commits a change to the same key.
+        let mut rc = coord.begin(TxIsolationLevel::ReadCommitted);
+        let mut row = BTreeMap::new();
+        row.insert("v".to_string(), Value::Int(1));
+        rc.put_row(b"chr_x:1".to_vec(), row);
+        coord.commit(&mut rc).unwrap();
+
+        // The Serializable commit must abort with a conflict instead of
+        // silently landing on top of the rival write.
+        let mut conflict_row = BTreeMap::new();
+        conflict_row.insert("v".to_string(), Value::Int(2));
+        serial.put_row(b"chr_x:1".to_vec(), conflict_row);
+        let err = coord.commit(&mut serial).unwrap_err();
+        assert!(
+            err.contains("serialization conflict"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(serial.status, TxStatus::Aborted);
+        // The rival value survives.
+        let raw = engine.get(b"chr_x:1").unwrap().unwrap();
+        let fields = RowCodec::decode(&raw).unwrap();
+        assert_eq!(fields[0].1, Value::Int(1));
     }
 }

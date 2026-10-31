@@ -1,0 +1,24 @@
+[TEST] Starting DNA-DB kill -9 crash durability test...
+[SECURITY] --admin-pass is the well-known default 'password'; the bootstrap account is seeded with must_change = true. Change it immediately.
+[AUTH] user database "./target/dna_test_data/users.json" (Argon2id, persistent IP+username lockout)
+[CRYPTO] WARNING: payload encryption at rest is disabled
+[TLS] WARNING: TLS disabled by --no-tls
+[ADMIN] cannot bind admin panel on 127.0.0.1:8080: Address already in use (os error 98) (panel disabled)
+[ADMIN] open http://127.0.0.1:8080/ (log in with the bootstrap admin; the one-time password is in the [SECURITY] line above)
+[SERVER] DNA-DB listening on 127.0.0.1:9999 (cleartext, data dir: "./target/dna_test_data")
+[TEST] Sending SIGKILL (kill -9) to PID 13909...
+[TEST] Total acknowledged writes before crash: 123406
+[TEST] Restarting DNA-DB server to trigger WAL replay and torn-write auto-recovery...
+[SECURITY] --admin-pass is the well-known default 'password'; the bootstrap account is seeded with must_change = true. Change it immediately.
+[AUTH] user database "./target/dna_test_data/users.json" (Argon2id, persistent IP+username lockout)
+[CRYPTO] WARNING: payload encryption at rest is disabled
+[TLS] WARNING: TLS disabled by --no-tls
+[ADMIN] cannot bind admin panel on 127.0.0.1:8080: Address already in use (os error 98) (panel disabled)
+[ADMIN] open http://127.0.0.1:8080/ (log in with the bootstrap admin; the one-time password is in the [SECURITY] line above)
+[SERVER] DNA-DB listening on 127.0.0.1:9999 (cleartext, data dir: "./target/dna_test_data")
+[RESULT] Verification complete:
+  - Total checked: 123408
+  - Missing: 0
+  - Corrupt: 0
+>>> SUCCESS: 100% DURABILITY VERIFIED UNDER SIGKILL (kill -9) <<<
+[SERVER] shutdown complete

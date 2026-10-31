@@ -7,6 +7,47 @@
 
 ---
 
+## 0. Прогон проверки v3.5.0 — 2026-10-31 (нативный Linux, актуальный релиз)
+
+> Ниже — исторические прогоны v3.0–v3.4.
+
+* **Платформа:** Debian 13 (trixie), x86_64, 2 vCPU, 4 ГБ RAM, профиль release (`panic = "unwind"`)
+* **Инструментарий:** rustc/cargo 1.99.1, Python 3.12.16
+* **Соперники:** MySQL 8.4.6 (официальный minimal-билд, `innodb_flush_log_at_trx_commit=1`, по умолчанию) и PostgreSQL 17.11 (`synchronous_commit=on`, по умолчанию) — все три системы на одной машине
+
+### Полная батарея тестов
+
+| # | Проверка | Команда | Результат |
+|---|---|---|---|
+| 1 | Сборка release | `cargo build --release` | **PASS** — 0 ошибок |
+| 2 | Все Rust-тесты | `cargo test --release` | **PASS — 197 passed, 0 failed** (182 unit + 2 encryption + 13 recovery, включая 11 новых регрессионных тестов на аудиторские фиксы) |
+| 3 | Линт | `cargo clippy --release --all-targets` | **PASS** — 0 ошибок, 35 предупреждений (стиль/сложность) |
+| 4 | Живой smoke протокола | `python scripts/smoke_test.py` | **PASS — 15/15** |
+| 5 | Security smoke (закалка v3.5) | `python scripts/security_smoke.py` | **PASS — 12/12** (случайный bootstrap, лимит глубины парсера, slowloris-дедлайн, блокировка doctor, …) |
+| 6 | Долговечность под SIGKILL | `python scripts/kill9_test.py` | **PASS — 123 408 подтверждённых записей, 0 потеряно, 0 испорчено** (strict fsync, 8 потоков) |
+| 7 | Chaos / самовосстановление | `python scripts/chaos_test.py` | **PASS — 3/3 сценария, 300 000 проверок ключей** (ремонт RS(4+2), живой on-read repair, честный UNREPAIRABLE) |
+| 8 | Сравнительный бенчмарк с MySQL/PostgreSQL | `python scripts/bench_compare.py` | **PASS** — таблица ниже, сырые данные в [bench_compare_results_v350_linux.json](bench_compare_results_v350_linux.json) |
+| 9 | Соответствие SQL (3 системы, 32 проверки) | `python scripts/sql_feature_test.py` | **PASS** — DNA-DB **25/32 поддерживается, 0 неверных результатов**; MySQL 31/32; PostgreSQL 32/32 ([sql_feature_results_v350_linux.json](sql_feature_results_v350_linux.json)) |
+
+### Соответствие SQL (один и тот же SQL-текст на трёх системах)
+
+| Система | Поддерживается и корректно | Не поддерживается (отклонено) | **Неверный результат** | Неожиданная ошибка |
+|---|---:|---:|---:|---:|
+| **DNA-DB v3.5.0** | **25 / 32** | 7 | **0** | 0 |
+| **MySQL 8.4.6** | **31 / 32** | 1 (FULL OUTER JOIN) | **0** | 0 |
+| **PostgreSQL 17.11** | **32 / 32** | 0 | **0** | 0 |
+
+![SQL feature conformance](charts/v350/sql_features.png)
+
+Отставание от MySQL/PostgreSQL — это покрытие фич (RIGHT/FULL OUTER JOIN,
+скалярные подзапросы, UNION, SHOW TABLES, EXPLAIN, явный rollback транзакции),
+а не корректность: всё, что DNA-DB принимает, возвращает эталонные строки.
+v3.5.0 добавил регрессионные тесты, фиксирующие исправленную семантику
+hash join (NULL/числовые типы).
+
+---
+
+
 ## 1. Результат в двух словах
 
 32 проверки фич выполнены **с одним и тем же текстом SQL** на всех трёх системах, и каждый

@@ -1,10 +1,14 @@
-# DNA-DB Core v3.4 «Granular Access» (per-table ACL, proxy SSO, mirror-aware rotation)
+# DNA-DB Core v4.0.0-GA
+
 
 > This repository is bilingual: **English** (this file) · [Русский](README_RU.md)
 
 A high-performance embeddable and client/server database engine written in Rust, featuring an LSM-Tree architecture, 2-bit nucleotide compression, dual-strand disk mirroring, the **DnaQL** query language, a **full SQL subset** (aggregates, GROUP BY/HAVING, ORDER BY, IN/subqueries, **secondary and range indexes**), a built-in **web admin panel** (phpMyAdmin-style) and self-healing on sector corruption.
 
-## 0.2. Production security (v3.4)
+> 🌐 **Landing page:** [landing/index.html](landing/index.html) — features, benchmarks vs MySQL/PostgreSQL, test results and screenshots in one page.
+> 🧪 **v3.5.0 verification:** 197/197 Rust tests · 15/15 smoke · 12/12 security smoke · 123 408 acknowledged writes survived `kill -9` (0 lost) · chaos 3/3 · details in [docs/TEST_RESULTS.md](docs/TEST_RESULTS.md) and [docs/RELEASE_NOTES_v3.5.0.md](docs/RELEASE_NOTES_v3.5.0.md).
+
+## 0.2. Production security (v3.5)
 
 | Control | Implementation |
 |---|---|
@@ -12,7 +16,7 @@ A high-performance embeddable and client/server database engine written in Rust,
 | Certificates | `--tls-cert/--tls-key` PEM pair; a self-signed localhost pair is generated under `DATA/tls/` on first start (development only) |
 | Mutual TLS | `--tls-client-ca CA.pem` requires a CA-signed client certificate on TCP and HTTPS; `shell --tls-client-cert/--tls-client-key` for the CLI |
 | Passwords | **Argon2id** PHC hashes in `DATA/users.json`, per-user salt, timing-equalised unknown users |
-| Users | bootstrap `admin` / `password`, then create/disable/delete users and reset/change passwords in the panel; roles `admin`, `operator`, `viewer`; the last active admin cannot be removed |
+| Users | no default password: a random 24-symbol bootstrap password is generated on first start, printed **once** to stderr and seeded with `must_change = true`; then create/disable/delete users and reset/change passwords in the panel; roles `admin`, `operator`, `viewer`; the last active admin cannot be removed |
 | Per-table ACL | optional `allowed_tables` list per user (empty = deny all, absent/`*` = unrestricted). Enforced on SQL and DnaQL ASTs (SELECT/JOIN/subquery/DDL), panel table browse/query, and by disabling raw KV for restricted accounts |
 | External IdP | trusted reverse-proxy SSO (`--trusted-proxy IP`, `X-Auth-Request-User`, optional shared secret). Works with oauth2-proxy, Authentik, nginx `auth_request`, etc.; the proxy must strip client-supplied identity headers. Built-in OIDC/SAML is still not included |
 | Sessions | 256-bit CSPRNG bearer tokens, 12 h TTL, revoked on password change/disable or ACL change |
@@ -26,7 +30,8 @@ A high-performance embeddable and client/server database engine written in Rust,
 
 ```bash
 # production-ish start: TLS + encryption are on by default.
-# The first start creates admin/password — change it in the panel immediately.
+# Without --admin-pass a RANDOM bootstrap password is generated and printed
+# once to stderr (the account is seeded with must_change = true):
 ./target/release/dna-db-core serve --data-dir ./dna_data --port 9999 --admin-port 8080
 # https://127.0.0.1:8080/  (self-signed cert: pass DATA/tls/cert.pem to clients)
 
@@ -75,6 +80,14 @@ A high-performance embeddable and client/server database engine written in Rust,
 > [SECURITY.md](SECURITY.md) for the threat model, rotation procedure and
 > residual limitations.
 
+## Screenshots (v3.5.0 admin panel)
+
+| | |
+|---|---|
+| ![Login](docs/screenshots/panel-01-login.png) | ![Dashboard](docs/screenshots/panel-02-dashboard.png) |
+| ![Tables](docs/screenshots/panel-03-tables.png) | ![SQL console](docs/screenshots/panel-04-sql-console.png) |
+| ![DnaQL console](docs/screenshots/panel-05-dnaql.png) | ![Row editor](docs/screenshots/panel-06-row-editor.png) |
+
 ## 0.1. What's new in v3.1 — SQL and the web panel
 
 | Feature | Details | Verification |
@@ -116,7 +129,7 @@ DNA → engineering analogy:
 | Mechanism in DNA | Implementation in DNA-DB |
 |---|---|
 | Genome redundancy | Reed–Solomon GF(2^8) inside every segment: k=4 data + m=2 parity, 4 KiB blocks (format `DNASST02`) |
-| Damage sensors (checkpoint kinases) | CRC32C per 4 KiB block (SSE4.2), duplicated CRC table, redundant superblock/footer |
+| Damage sensors (checkpoint kinases) | CRC-32 (IEEE, `crc32fast`) per 4 KiB block, duplicated CRC table, redundant superblock/footer |
 | Excision repair (BER/NER) | on-read repair: CRC miss → stripe reconstruction from surviving shards → rewrite → journal |
 | Scanner enzymes | background scrubber (on by default: 24 h, 32 MiB/s, configurable) |
 | Homologous recombination | cascade: parity → segment copy on Strand B; auto-resync after repair |
@@ -182,12 +195,13 @@ cargo build --release
 ./target/release/dna-db-core serve \
   --data-dir ./dna_data \
   --port 9999 \
-  --admin-pass password \
+  --admin-pass 'change-me-now' \
   --admin-port 8080 \
   --sync strict \
   --demo-data          # optional: demo tables chr_users/chr_orders/chr_patients/chr_variants
 ```
-A password is required (`--admin-pass` or the `DNA_DB_ADMIN_PASS` variable) — there is no default password.
+There is NO default password: pass `--admin-pass` / `DNA_DB_ADMIN_PASS`, or let the server
+generate a random one on first start (printed once to stderr, `must_change` is set).
 Once running, open **https://127.0.0.1:8080/** (the generated certificate is self-signed; pass `DATA/tls/cert.pem` to clients or use a real certificate).
 `--admin-port 0` disables the panel; the panel listens on the same interface as `--bind` (loopback by default).
 

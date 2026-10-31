@@ -147,6 +147,12 @@ pub struct SecurityManager {
 const GLOBAL_FAILURE_WINDOW: Duration = Duration::from_secs(60);
 const GLOBAL_FAILURE_LIMIT: usize = 2_000;
 const PRE_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+/// Absolute wall-clock budget for the whole pre-auth phase. The per-read
+/// timeout alone allowed a slowloris client to hold a connection forever by
+/// drip-feeding one byte every 9 seconds; with this deadline an
+/// unauthenticated connection is dropped after 30 s no matter how slowly it
+/// sends.
+const PRE_AUTH_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const AUTHENTICATED_TIMEOUT: Duration = Duration::from_secs(300);
 static TEMP_FILE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Unauthenticated clients may only send an AUTH frame. Capping it at 64 KiB
@@ -163,10 +169,22 @@ impl SecurityManager {
 
     /// Open the persistent user database and lockout state under `data_dir`.
     pub fn open(data_dir: &Path, admin_user: &str, admin_pass: &str) -> io::Result<Self> {
-        let users = UserStore::open(
+        Self::open_with_policy(data_dir, admin_user, admin_pass, false)
+    }
+
+    /// Same as `open`, but a freshly seeded bootstrap admin is created with
+    /// `must_change = true` when requested (see `UserStore::open_with_policy`).
+    pub fn open_with_policy(
+        data_dir: &Path,
+        admin_user: &str,
+        admin_pass: &str,
+        bootstrap_must_change: bool,
+    ) -> io::Result<Self> {
+        let users = UserStore::open_with_policy(
             &crate::auth::user_store_path(data_dir),
             admin_user,
             admin_pass,
+            bootstrap_must_change,
         )
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let state_path = data_dir.join("security_state.json");
@@ -559,9 +577,12 @@ fn handle_connection(
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
     stream.set_nodelay(true).ok();
     let ip = addr.ip().to_string();
+    let started_at = std::time::Instant::now();
     let mut authenticated = false;
     let mut role = String::new();
     let mut allowed_tables: Option<Vec<String>> = None;
+    // v3.6: per-session SQL transaction (BEGIN ... COMMIT/ROLLBACK).
+    let mut sql_tx: Option<crate::sql_engine::SqlTxBuffer> = None;
 
     while let Some(payload) = read_frame_limited(
         &mut *stream,
@@ -571,6 +592,11 @@ fn handle_connection(
             PRE_AUTH_MAX_FRAME_SIZE
         },
     )? {
+        // Slowloris guard: absolute deadline for the unauthenticated phase.
+        if !authenticated && started_at.elapsed() > PRE_AUTH_TOTAL_TIMEOUT {
+            write_frame(&mut *stream, b"ERR: authentication deadline exceeded")?;
+            return Ok(());
+        }
         let req = match parse_payload(&payload) {
             Ok(r) => r,
             Err(e) => {
@@ -694,12 +720,19 @@ fn handle_connection(
                     write_frame(&mut *stream, b"ERR: viewer role is read-only")?;
                     continue;
                 }
-                match dnaql.execute(&query) {
-                    Ok(res) => {
+                // Fault guard: a panic inside the query engine (parser bug,
+                // unexpected codec state) costs this one request, not the
+                // whole server. Requires panic = unwind (see Cargo.toml).
+                let result = catch_request_panic("dnaql", || dnaql.execute(&query));
+                match result {
+                    Ok(Ok(res)) => {
                         let json = format_dnaql_result(&res);
                         write_frame(&mut *stream, json.as_bytes())?;
                     }
-                    Err(e) => write_frame(&mut *stream, format!("ERR: {}", e).as_bytes())?,
+                    Ok(Err(e)) => write_frame(&mut *stream, format!("ERR: {}", e).as_bytes())?,
+                    Err(message) => {
+                        write_frame(&mut *stream, format!("ERR: {}", message).as_bytes())?
+                    }
                 }
             }
             Request::SqlQuery { query } => {
@@ -733,17 +766,48 @@ fn handle_connection(
                     write_frame(&mut *stream, b"ERR: viewer role is read-only")?;
                     continue;
                 }
-                match sql.execute(&query) {
-                    Ok(res) => {
+                // Fault guard, same as the DnaQL path above.
+                let result = catch_request_panic("sql", || sql.execute_in_tx(&query, &mut sql_tx));
+                match result {
+                    Ok(Ok(res)) => {
                         let json = format_sql_result(&res);
                         write_frame(&mut *stream, json.as_bytes())?;
                     }
-                    Err(e) => write_frame(&mut *stream, format!("ERR: {}", e).as_bytes())?,
+                    Ok(Err(e)) => {
+                        // A failed statement must not poison the session:
+                        // v3.6 auto-aborts a broken transaction buffer the way
+                        // a serializable conflict aborts a tx session.
+                        sql_tx = None;
+                        write_frame(&mut *stream, format!("ERR: {}", e).as_bytes())?;
+                    }
+                    Err(message) => {
+                        sql_tx = None;
+                        write_frame(&mut *stream, format!("ERR: {}", message).as_bytes())?
+                    }
                 }
             }
         }
     }
     Ok(())
+}
+
+/// Run a request handler, converting a panic into an ERR response.
+/// With `panic = unwind` a bug must cost one request, not the whole server
+/// (the release profile used to be `panic = abort`: any parser/eval panic
+/// killed every connected client at once).
+pub(crate) fn catch_request_panic<T>(
+    label: &str,
+    f: impl FnOnce() -> T,
+) -> Result<T, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|panic| {
+        let detail = panic
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic".to_string());
+        eprintln!("[PANIC] {} handler: {}", label, detail);
+        "internal error: request aborted by the fault guard".to_string()
+    })
 }
 
 fn format_dnaql_result(res: &crate::dna_ql::DnaQlResult) -> String {
@@ -778,6 +842,9 @@ pub fn is_read_only_query(query: &str) -> bool {
     let Some(first) = trimmed.split_whitespace().next() else {
         return false;
     };
+    // v3.6: BEGIN/COMMIT/ROLLBACK control statements do not mutate data
+    // themselves (buffered DML is blocked separately by the viewer path —
+    // INSERT/UPDATE/DELETE are not in this list), so they stay allowed.
     matches!(
         first.to_ascii_uppercase().as_str(),
         "SELECT"
@@ -790,6 +857,11 @@ pub fn is_read_only_query(query: &str) -> bool {
             | "FIND"
             | "SEARCH"
             | "VERIFY"
+            | "BEGIN"
+            | "START"
+            | "COMMIT"
+            | "END"
+            | "ROLLBACK"
     )
 }
 

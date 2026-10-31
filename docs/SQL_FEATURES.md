@@ -7,6 +7,47 @@
 
 ---
 
+## 0. v3.5.0 verification run — 2026-10-31 (native Linux, latest)
+
+> This is the current release. The sections below are the historical v3.0–v3.4 runs.
+
+* **Platform:** Debian 13 (trixie) sandbox, x86_64, 2 vCPU, 4 GB RAM, release profile (`panic = "unwind"`)
+* **Toolchain:** rustc/cargo 1.99.1, Python 3.12.16
+* **Rivals:** MySQL 8.4.6 (official minimal build, `innodb_flush_log_at_trx_commit=1`, default) and PostgreSQL 17.11 (`synchronous_commit=on`, default) — same machine for all three systems
+
+### Full test battery
+
+| # | Check | Command | Result |
+|---|---|---|---|
+| 1 | Release build | `cargo build --release` | **PASS** — 0 errors |
+| 2 | All Rust tests | `cargo test --release` | **PASS — 197 passed, 0 failed** (182 unit + 2 encryption + 13 recovery, incl. 11 new regression tests for the audit fixes) |
+| 3 | Lint | `cargo clippy --release --all-targets` | **PASS** — 0 errors, 35 warnings (style/complexity) |
+| 4 | Live protocol smoke | `python scripts/smoke_test.py` | **PASS — 15/15** |
+| 5 | Security smoke (v3.5 hardening) | `python scripts/security_smoke.py` | **PASS — 12/12** (random bootstrap, parser depth limit, slowloris deadline, doctor lock, …) |
+| 6 | Durability under SIGKILL | `python scripts/kill9_test.py` | **PASS — 123 408 acknowledged writes, 0 missing, 0 corrupt** (strict fsync, 8 threads) |
+| 7 | Chaos / self-healing | `python scripts/chaos_test.py` | **PASS — 3/3 scenarios, 300 000 key verifications** (RS(4+2) repair, live on-read repair, honest UNREPAIRABLE) |
+| 8 | Three-way benchmark vs MySQL/PostgreSQL | `python scripts/bench_compare.py` | **PASS** — table below, raw JSON in [bench_compare_results_v350_linux.json](bench_compare_results_v350_linux.json) |
+| 9 | SQL feature conformance (3-way, 32 checks) | `python scripts/sql_feature_test.py` | **PASS** — DNA-DB **25/32 supported, 0 wrong results**; MySQL 31/32; PostgreSQL 32/32 ([sql_feature_results_v350_linux.json](sql_feature_results_v350_linux.json)) |
+
+### SQL feature conformance (same SQL text on all three systems)
+
+| System | Supported & correct | Not supported (rejected) | **Wrong result** | Unexpected error |
+|---|---:|---:|---:|---:|
+| **DNA-DB v3.5.0** | **25 / 32** | 7 | **0** | 0 |
+| **MySQL 8.4.6** | **31 / 32** | 1 (FULL OUTER JOIN) | **0** | 0 |
+| **PostgreSQL 17.11** | **32 / 32** | 0 | **0** | 0 |
+
+![SQL feature conformance](charts/v350/sql_features.png)
+
+The gap to MySQL/PostgreSQL is feature **coverage** (RIGHT/FULL OUTER JOIN,
+scalar subqueries, UNION, SHOW TABLES, EXPLAIN, explicit transaction
+rollback), never correctness: every statement DNA-DB accepts returns the
+reference rows. v3.5.0 added the regression tests that lock the previously
+broken hash-join NULL/numeric semantics.
+
+---
+
+
 ## 1. Result at a glance
 
 32 feature checks were executed **with the same SQL text** against all three systems and every

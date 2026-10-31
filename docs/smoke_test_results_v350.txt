@@ -1,0 +1,18 @@
+  [PASS] auth_ok
+  [PASS] auth_bad — wrong password -> b'NO'
+  [PASS] preauth_guard — b'ERR: not authenticated'
+  [PASS] ping — status=ok
+  [PASS] put_get — ack=b'OK' len=140
+  [PASS] get_miss — empty frame on miss
+  [PASS] delete
+  [PASS] big_value — 1 MiB roundtrip, 1048576 bytes
+  [PASS] sql_create — b'{"columns":["status"],"plan":"CreateTable(smoke_t) cols=3 fks=0","rows":[{"statu'
+  [PASS] sql_insert — b'{"columns":["inserted_key","pk"],"plan":"BatchInsert(smoke_t) rows=1 via single '
+  [PASS] sql_select — 1 row(s)
+  [PASS] dnaql_analyze — b'{"ast":"\\"BioAnalysis { functions: [\\\\\\"GC_CONTENT\\\\\\"] }\\"","note":"real bio-analysis of 10 bp","ro'
+  [PASS] checkpoint
+  [PASS] bad_opcode — b'ERR: unknown opcode 0x7F'
+  [PASS] restart_recovery — after hard kill + WAL replay: b'DO-NOT-LOSE'
+
+15 checks, 0 failed
+JSON: /home/z/my-project/workspace/dna-db-core-main/docs/smoke_test_results.json

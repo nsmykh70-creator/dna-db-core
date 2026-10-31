@@ -1,5 +1,8 @@
 name: CI
 
+# Прогон, на который ссылаются docs/TEST_RESULTS.md и README:
+# cargo test --release + clippy + проверка Python-скриптов.
+
 on:
   push:
     branches: [main]
@@ -8,66 +11,27 @@ on:
 
 jobs:
   test:
-    name: cargo test (release)
+    name: cargo test --release + clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        run: rustup default stable
-
-      - name: Cache cargo
-        uses: actions/cache@v4
+      - name: Установка Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          components: clippy
 
-      - name: Build (release)
+      - name: Кэш cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Сборка release
         run: cargo build --release
 
-      - name: Unit + integration tests
-        run: cargo test --release 2>&1 | tee cargo_test_output.txt
+      - name: Все Rust-тесты
+        run: cargo test --release
 
-      - name: Publish test summary
-        run: |
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          grep -E "^running [0-9]+ tests|^test result" cargo_test_output.txt >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+      - name: Линт (clippy, release, все таргеты)
+        run: cargo clippy --release --all-targets
 
-      - name: Python scripts syntax check
+      - name: Синтаксис Python-скриптов
         run: python3 -m py_compile scripts/*.py
-
-      - name: Upload raw test log
-        uses: actions/upload-artifact@v4
-        with:
-          name: cargo-test-output
-          path: cargo_test_output.txt
-
-  clippy:
-    name: cargo clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        run: rustup default stable
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Clippy
-        run: cargo clippy --release --all-targets 2>&1 | tee clippy.log; exit ${PIPESTATUS[0]}
-
-      - name: Clippy summary
-        if: always()
-        run: |
-          echo "clippy warnings: $(grep -c '^warning' clippy.log || true)" >> "$GITHUB_STEP_SUMMARY"

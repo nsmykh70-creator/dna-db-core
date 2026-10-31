@@ -72,8 +72,11 @@ def main():
     shutil.rmtree(DATA_DIR, ignore_errors=True)
     os.makedirs(DATA_DIR, exist_ok=True)
 
-    # 1. Start server
-    proc = subprocess.Popen([SERVER_BIN, "serve", "--data-dir", DATA_DIR, "--port", str(SERVER_PORT), "--admin-pass", "password"])
+    # 1. Start server (plaintext + no at-rest encryption: this test speaks the
+    #    raw TCP protocol itself; strict fsync so every ack is durable)
+    proc = subprocess.Popen([SERVER_BIN, "serve", "--data-dir", DATA_DIR, "--port", str(SERVER_PORT),
+                             "--bind", "127.0.0.1", "--admin-pass", "password",
+                             "--sync", "strict", "--no-tls", "--no-encryption"])
     time.sleep(1)
 
     # 2. Launch 8 concurrent write threads
@@ -91,10 +94,16 @@ def main():
     proc.wait()
 
     print(f"[TEST] Total acknowledged writes before crash: {len(acknowledged_writes)}")
+    if len(acknowledged_writes) < 100:
+        print(">>> FAILURE: the write load never reached the server "
+              f"({len(acknowledged_writes)} acks) — cannot claim durability <<<")
+        sys.exit(2)
 
     # 4. Restart server and verify WAL replay
     print("[TEST] Restarting DNA-DB server to trigger WAL replay and torn-write auto-recovery...")
-    proc2 = subprocess.Popen([SERVER_BIN, "serve", "--data-dir", DATA_DIR, "--port", str(SERVER_PORT), "--admin-pass", "password"])
+    proc2 = subprocess.Popen([SERVER_BIN, "serve", "--data-dir", DATA_DIR, "--port", str(SERVER_PORT),
+                              "--bind", "127.0.0.1", "--admin-pass", "password",
+                              "--sync", "strict", "--no-tls", "--no-encryption"])
     time.sleep(2)
 
     try:

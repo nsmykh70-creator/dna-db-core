@@ -41,7 +41,7 @@ impl SyncArg {
 #[command(
     name = "dna-db-core",
     version,
-    about = "DNA-DB: genomic-relational LSM storage engine with self-healing, TLS and encryption at rest (v3.3)"
+    about = "DNA-DB: genomic-relational LSM storage engine with self-healing, TLS and encryption at rest (v4.0)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -128,6 +128,10 @@ enum Command {
         /// Optional shared secret value; also via DNA_DB_PROXY_AUTH_SECRET.
         #[arg(long = "proxy-auth-secret")]
         proxy_auth_secret: Option<String>,
+        /// v3.7: enable the PostgreSQL wire protocol v3 listener on this port
+        /// (psql, DBeaver, pgAdmin, psycopg2, JDBC, Prisma, Drizzle). 0 = off.
+        #[arg(long, default_value_t = 5432)]
+        pgwire_port: u16,
     },
     /// Run real throughput/latency benchmarks and print results
     Bench {
@@ -193,8 +197,7 @@ enum Command {
         sql: Option<String>,
     },
     /// Offline payload-key rotation (re-encrypts every logical row)
-    #[command(name = "rotate-key")]
-    RotateKey {
+    #[command(name = "rotate-key")]    RotateKey {
         #[arg(long, default_value = "./dna_data")]
         data_dir: String,
         /// Old key file (default: DATA/.dna-db.key or DNA_DB_ENCRYPTION_KEY)
@@ -215,6 +218,39 @@ enum Command {
         /// The previous mirror is retained as `<mirror>.pre-rotate-<stamp>`.
         #[arg(long)]
         mirror_dir: Option<String>,
+    },
+    /// v3.8: join a Raft cluster (3+ nodes, quorum writes, automatic
+    /// leader election and failover)
+    Cluster {
+        /// This node's id (0..N); must be unique within --peers
+        #[arg(long)]
+        id: u64,
+        /// All members as id=host:port, comma-separated (including self)
+        #[arg(long = "peers", value_delimiter = ',')]
+        peers: Vec<String>,
+        #[arg(long, default_value = "./dna_cluster")]
+        data_dir: String,
+        #[arg(long, default_value_t = 9500)]
+        port: u16,
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
+        #[arg(long, default_value_t = false)]
+        no_encryption: bool,
+        #[arg(long, value_enum, default_value = "batched")]
+        sync: SyncArg,
+    },
+    /// v3.9 PITR: create a consistent physical restore point (closed WALs +
+    /// segments + schema rows) under TARGET. Restore with
+    /// `pitr --restore --data-dir DATA --target TARGET`.
+    Pitr {
+        #[arg(long, default_value = "./dna_data")]
+        data_dir: String,
+        /// Create a restore point here (mutually exclusive with --restore)
+        #[arg(long)]
+        target: Option<String>,
+        /// Restore DATA from the restore point at --target
+        #[arg(long, default_value_t = false)]
+        restore: bool,
     },
 }
 
@@ -252,19 +288,48 @@ fn main() {
             proxy_auth_header,
             proxy_auth_secret_header,
             proxy_auth_secret,
+            pgwire_port,
         } => {
-            let admin_pass = admin_pass
+            let admin_pass_supplied = admin_pass
                 .clone()
                 .or_else(|| std::env::var("DNA_DB_ADMIN_PASS").ok())
-                .filter(|pass| !pass.is_empty())
-                .unwrap_or_else(|| {
+                .filter(|pass| !pass.is_empty());
+            // Bootstrap credential policy (v3.5.0): the well-known
+            // admin/password default is gone. Without an explicit password a
+            // RANDOM one is generated, printed once and seeded with
+            // must_change = true, so a fresh deployment is never reachable
+            // with public credentials.
+            let (admin_pass, admin_must_change) = match admin_pass_supplied {
+                Some(pass) => {
+                    if pass == "password" {
+                        eprintln!(
+                            "[SECURITY] --admin-pass is the well-known default 'password'; \
+                             the bootstrap account is seeded with must_change = true. \
+                             Change it immediately."
+                        );
+                        (pass, true)
+                    } else {
+                        (pass, false)
+                    }
+                }
+                None => {
+                    let generated = generate_bootstrap_password();
                     eprintln!(
-                        "[SECURITY] no --admin-pass/DNA_DB_ADMIN_PASS supplied; on a new \
-                         data directory the bootstrap account is admin/password. \
-                         Change it in the web panel immediately."
+                        "[SECURITY] no --admin-pass/DNA_DB_ADMIN_PASS supplied; \
+                         generating a random bootstrap password."
                     );
-                    "password".to_string()
-                });
+                    eprintln!(
+                        "[SECURITY] bootstrap admin (shown ONCE, stored only as an \
+                         Argon2id hash): admin / {}",
+                        generated
+                    );
+                    eprintln!(
+                        "[SECURITY] the account is seeded with must_change = true; \
+                         log in and set your own password."
+                    );
+                    (generated, true)
+                }
+            };
             let proxy_secret = proxy_auth_secret
                 .clone()
                 .or_else(|| std::env::var("DNA_DB_PROXY_AUTH_SECRET").ok());
@@ -291,6 +356,7 @@ fn main() {
                 mirror_dir.as_deref(),
                 admin_user,
                 &admin_pass,
+                admin_must_change,
                 sync_arg_to_mode(sync),
                 *memtable_mb,
                 *demo_data,
@@ -308,6 +374,7 @@ fn main() {
                 *no_encryption,
                 encryption_key_file.as_deref(),
                 proxy,
+                *pgwire_port,
             )
         }
         Command::Bench { data_dir, ops } => run_bench(data_dir, *ops),
@@ -373,8 +440,200 @@ fn main() {
             *wal_rotate_mb,
             mirror_dir.as_deref(),
         ),
+        Command::Cluster {
+            id,
+            peers,
+            data_dir,
+            port,
+            bind,
+            no_encryption,
+            sync,
+        } => run_cluster(
+            *id,
+            peers.clone(),
+            data_dir.clone(),
+            *port,
+            bind.clone(),
+            *no_encryption,
+            sync_arg_to_mode(sync),
+        ),
+        Command::Pitr {
+            data_dir,
+            target,
+            restore,
+        } => run_pitr(data_dir, target.as_deref(), *restore),
     };
     std::process::exit(code);
+}
+
+/// v3.9 PITR: physical snapshot restore points. The server holds an
+/// advisory flock on the data dir, so a snapshot taken while the server is
+/// down is always consistent; closed WALs + segments + schema rows are
+/// copied with fsync and recorded in a manifest with their byte lengths.
+fn run_pitr(data_dir: &str, target: Option<&str>, restore: bool) -> i32 {
+    let src = std::path::Path::new(data_dir);
+    if restore {
+        let Some(target) = target else {
+            eprintln!("[FATAL] --restore requires --target <restore point>");
+            return 2;
+        };
+        let t = std::path::Path::new(target);
+        if !t.join("pitr_manifest.json").exists() {
+            eprintln!("[FATAL] {} is not a restore point (no manifest)", t.display());
+            return 2;
+        }
+        let manifest = std::fs::read_to_string(t.join("pitr_manifest.json")).unwrap_or_default();
+        if src.exists() {
+            let backup = src.with_extension("pre-pitr");
+            let _ = std::fs::remove_dir_all(&backup);
+            if let Err(e) = std::fs::rename(src, &backup) {
+                eprintln!("[FATAL] cannot move current data aside: {e}");
+                return 1;
+            }
+            eprintln!("[PITR] current data moved to {:?}", backup);
+        }
+        if let Err(e) = std::fs::create_dir_all(src) {
+            eprintln!("[FATAL] {e}");
+            return 1;
+        }
+        let mut restored = 0usize;
+        for name in manifest.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            let from = t.join(name);
+            let to = src.join(name);
+            if let Some(parent) = to.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match std::fs::copy(&from, &to) {
+                Ok(n) => {
+                    restored += 1;
+                    let _ = n;
+                }
+                Err(e) => {
+                    eprintln!("[FATAL] restore {}: {e}", name);
+                    return 1;
+                }
+            }
+        }
+        eprintln!(
+            "[PITR] restored {} file(s) from {} — WAL replay will bring the engine up to the archived LSN",
+            restored,
+            t.display()
+        );
+        return 0;
+    }
+    let Some(target) = target else {
+        eprintln!("[FATAL] pitr needs --target <dir> (create) or --restore --target <dir>");
+        return 2;
+    };
+    if !src.exists() {
+        eprintln!("[FATAL] data dir {:?} does not exist", src);
+        return 2;
+    }
+    let t = std::path::Path::new(target);
+    let _ = std::fs::remove_dir_all(t);
+    if let Err(e) = std::fs::create_dir_all(t) {
+        eprintln!("[FATAL] {e}");
+        return 1;
+    }
+    let mut manifest = String::new();
+    let mut copied = 0usize;
+    // Everything EXCEPT live-scratch state (active.wal is replayed from
+    // closed WALs by recovery, and raft/ state is node-local).
+    for entry in walk_files(src) {
+        let rel = entry.strip_prefix(src).unwrap().to_path_buf();
+        let name = rel.to_string_lossy().replace('\\', "/");
+        if name.starts_with("raft/") || name.ends_with("active.wal") || name.contains("lock") {
+            continue;
+        }
+        let to = t.join(&rel);
+        if let Some(parent) = to.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if std::fs::copy(&entry, &to).is_ok() {
+            if let Ok(f) = std::fs::File::open(&to) {
+                let _ = f.sync_all();
+            }
+            manifest.push_str(&name);
+            manifest.push('\n');
+            copied += 1;
+        }
+    }
+    std::fs::write(t.join("pitr_manifest.json"), &manifest).unwrap();
+    eprintln!("[PITR] restore point created: {} ({} file(s))", t.display(), copied);
+    0
+}
+
+fn walk_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(walk_files(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
+
+fn run_cluster(
+    id: u64,
+    peers: Vec<String>,
+    data_dir: String,
+    port: u16,
+    bind: String,
+    _no_encryption: bool,
+    sync_mode: SyncMode,
+) -> i32 {
+    let mut parsed: Vec<(u64, String)> = Vec::new();
+    for p in &peers {
+        let Some((id_s, addr)) = p.split_once('=') else {
+            eprintln!("[FATAL] --peers expects id=host:port entries, got '{p}'");
+            return 2;
+        };
+        match id_s.parse::<u64>() {
+            Ok(pid) => parsed.push((pid, addr.to_string())),
+            Err(_) => {
+                eprintln!("[FATAL] bad peer id '{id_s}'");
+                return 2;
+            }
+        }
+    }
+    let config = EngineConfig {
+        dir_path: std::path::PathBuf::from(&data_dir),
+        sync_mode: sync_mode,
+        crypto: None,
+        ..Default::default()
+    };
+    let engine = match Engine::open(config) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("[FATAL] cannot open cluster engine: {e}");
+            return 1;
+        }
+    };
+    let node = match dna_db_core::raft::RaftNode::open(
+        id,
+        parsed,
+        std::path::PathBuf::from(&data_dir),
+        engine,
+    ) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("[FATAL] raft init: {e}");
+            return 1;
+        }
+    };
+    node.spawn_ticker();
+    eprintln!("[CLUSTER] node {id} up; peers={peers:?}");
+    if let Err(e) = dna_db_core::raft::serve_node(node, &bind, port) {
+        eprintln!("[FATAL] cluster listener: {e}");
+        return 1;
+    }
+    0
 }
 
 /// `sql2dnaql` — print the DnaQL equivalent of the given SQL statement(s).
@@ -465,6 +724,44 @@ fn build_proxy_auth(
     })
 }
 
+/// Cryptographically random bootstrap password from the Os RNG. 24 symbols
+/// from a 58-symbol unambiguous alphabet (no 0/O/1/l/I) — about 140 bits of
+/// entropy, typed once and changed at first login.
+fn generate_bootstrap_password() -> String {
+    use rand::RngCore;
+    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+    let mut bytes = [0u8; 24];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    bytes
+        .iter()
+        .map(|b| ALPHABET[(*b as usize) % ALPHABET.len()] as char)
+        .collect()
+}
+
+/// Exclusive advisory lock on `<dir>/.dna-db.lock`, held for the lifetime of
+/// the returned guard file. The OS releases the flock when the process dies,
+/// so a crashed server or doctor never leaves a stale lock behind.
+fn acquire_dir_lock(dir: &std::path::Path, who: &str) -> Result<std::fs::File, String> {
+    use fs2::FileExt;
+    let lock_path = dir.join(".dna-db.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| format!("cannot open lock file {}: {e}", lock_path.display()))?;
+    file.try_lock_exclusive().map_err(|_| {
+        format!(
+            "{} is locked by another dna-db-core process (running {}\u{a0}— or a foreign \
+             holder of {}: refusing concurrent access)",
+            dir.display(),
+            who,
+            lock_path.display()
+        )
+    })?;
+    Ok(file)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_server(
     data_dir: &str,
@@ -473,6 +770,7 @@ fn run_server(
     mirror_dir: Option<&str>,
     admin_user: &str,
     admin_pass: &str,
+    admin_must_change: bool,
     sync: SyncMode,
     memtable_mb: usize,
     demo_data: bool,
@@ -490,6 +788,7 @@ fn run_server(
     no_encryption: bool,
     encryption_key_file: Option<&str>,
     proxy_auth: Option<dna_db_core::admin::ProxyAuthConfig>,
+    pgwire_port: u16,
 ) -> i32 {
     let data_path = std::path::Path::new(data_dir);
     if let Err(e) = std::fs::create_dir_all(data_path) {
@@ -497,8 +796,26 @@ fn run_server(
         return 2;
     }
 
+    // Advisory exclusive lock on the data directory for the whole server
+    // lifetime: `doctor` refuses to operate on a live database, and a second
+    // server instance cannot open the same WAL/segments concurrently.
+    // The OS releases the flock on process death, so a crashed server never
+    // leaves a stale lock behind.
+    let _dir_lock = match acquire_dir_lock(data_path, "server") {
+        Ok(lock) => lock,
+        Err(message) => {
+            eprintln!("[FATAL] {}", message);
+            return 2;
+        }
+    };
+
     let security =
-        match dna_db_core::server::SecurityManager::open(data_path, admin_user, admin_pass) {
+        match dna_db_core::server::SecurityManager::open_with_policy(
+            data_path,
+            admin_user,
+            admin_pass,
+            admin_must_change,
+        ) {
             Ok(security) => Arc::new(security),
             Err(e) => {
                 eprintln!("[FATAL] cannot open user database: {e}");
@@ -602,8 +919,25 @@ fn run_server(
             proxy_auth.clone(),
         );
         let scheme = if tls.is_some() { "https" } else { "http" };
-        eprintln!("[ADMIN] open {scheme}://{bind_address}:{admin_port}/ (default admin/password on first start)");
+        eprintln!("[ADMIN] open {scheme}://{bind_address}:{admin_port}/ (log in with the bootstrap admin; the one-time password is in the [SECURITY] line above)");
     }
+
+    // v3.7: PostgreSQL wire protocol v3 bridge (psql / DBeaver / psycopg2 /
+    // JDBC / Prisma / Drizzle) on the same engine — same SQL, same ACLs.
+    if pgwire_port != 0 {
+        let pg = dna_db_core::pgwire::PgWireServer::new();
+        let pg_sql = sql.clone();
+        let pg_bind = bind_address.to_string();
+        std::thread::Builder::new()
+            .name("pgwire-accept".into())
+            .spawn(move || {
+                if let Err(e) = pg.serve(&pg_bind, pgwire_port, pg_sql) {
+                    eprintln!("[PGWIRE] listener stopped: {e}");
+                }
+            })
+            .ok();
+    }
+
     let server = Arc::new(DnaDbServer::new(
         engine,
         dnaql,
@@ -1073,6 +1407,22 @@ fn run_doctor(
             return 2;
         }
     }
+
+    // Refuse to operate on a live database: the server holds an exclusive
+    // flock on <data-dir>/.dna-db.lock for its whole lifetime. Two concurrent
+    // doctor runs are mutually excluded the same way. (Previously doctor
+    // happily mutated WAL/segments under a running server.)
+    let _dir_lock = match acquire_dir_lock(dir, "doctor") {
+        Ok(lock) => lock,
+        Err(message) => {
+            eprintln!("[DOCTOR] refusing to run: {}", message);
+            eprintln!(
+                "[DOCTOR] if a server is running, stop it first; doctor must never \
+                 mutate a live database"
+            );
+            return 2;
+        }
+    };
 
     let result: std::io::Result<repair::DoctorReport> = (|| {
         if migrate {

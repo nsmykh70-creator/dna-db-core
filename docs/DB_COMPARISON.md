@@ -10,6 +10,57 @@
 
 ---
 
+## 0. v3.5.0 verification run — 2026-10-31 (native Linux, latest)
+
+> This is the current release. The sections below are the historical v3.0–v3.4 runs.
+
+* **Platform:** Debian 13 (trixie) sandbox, x86_64, 2 vCPU, 4 GB RAM, release profile (`panic = "unwind"`)
+* **Toolchain:** rustc/cargo 1.99.1, Python 3.12.16
+* **Rivals:** MySQL 8.4.6 (official minimal build, `innodb_flush_log_at_trx_commit=1`, default) and PostgreSQL 17.11 (`synchronous_commit=on`, default) — same machine for all three systems
+
+### Full test battery
+
+| # | Check | Command | Result |
+|---|---|---|---|
+| 1 | Release build | `cargo build --release` | **PASS** — 0 errors |
+| 2 | All Rust tests | `cargo test --release` | **PASS — 197 passed, 0 failed** (182 unit + 2 encryption + 13 recovery, incl. 11 new regression tests for the audit fixes) |
+| 3 | Lint | `cargo clippy --release --all-targets` | **PASS** — 0 errors, 35 warnings (style/complexity) |
+| 4 | Live protocol smoke | `python scripts/smoke_test.py` | **PASS — 15/15** |
+| 5 | Security smoke (v3.5 hardening) | `python scripts/security_smoke.py` | **PASS — 12/12** (random bootstrap, parser depth limit, slowloris deadline, doctor lock, …) |
+| 6 | Durability under SIGKILL | `python scripts/kill9_test.py` | **PASS — 123 408 acknowledged writes, 0 missing, 0 corrupt** (strict fsync, 8 threads) |
+| 7 | Chaos / self-healing | `python scripts/chaos_test.py` | **PASS — 3/3 scenarios, 300 000 key verifications** (RS(4+2) repair, live on-read repair, honest UNREPAIRABLE) |
+| 8 | Three-way benchmark vs MySQL/PostgreSQL | `python scripts/bench_compare.py` | **PASS** — table below, raw JSON in [bench_compare_results_v350_linux.json](bench_compare_results_v350_linux.json) |
+| 9 | SQL feature conformance (3-way, 32 checks) | `python scripts/sql_feature_test.py` | **PASS** — DNA-DB **25/32 supported, 0 wrong results**; MySQL 31/32; PostgreSQL 32/32 ([sql_feature_results_v350_linux.json](sql_feature_results_v350_linux.json)) |
+
+### Three-way benchmark (every system at its default durability)
+
+
+| Phase (identical workload & RNG) | DNA-DB v3.5.0 | MySQL 8.4.6 | PostgreSQL 17.11 |
+|---|---:|---:|---:|
+| Load 10 000 KV rows, single connection (ack per row) | **36 260 rows/s** | 4 353 rows/s | 19 182 rows/s |
+| Multithreaded load, 8 threads × 1 000 single-row INSERTs | 17 636 rows/s | 8 316 rows/s | **22 157 rows/s** |
+| Batched load, 8 000 rows in 40 × 200-row INSERTs | **298 936 rows/s** | 162 166 rows/s | 215 926 rows/s |
+| Point read ×4 000, single connection | **43 779 ops/s** | 11 049 ops/s | 17 565 ops/s |
+| Mixed 80/20, 8 threads × 500 ops | **20 411 ops/s** | 8 403 ops/s | 17 985 ops/s |
+| SQL `INSERT`, 3 000 rows | **24 986 ops/s** | 4 003 ops/s | 16 811 ops/s |
+| SQL `SELECT … WHERE pk`, ×1 500 | 22 470 ops/s | 8 916 ops/s | **23 638 ops/s** |
+| Verified reads returning a wrong value | **0** | 0 | 0 |
+
+
+DNA-DB leads every phase except 8-thread peak INSERT (PostgreSQL) and single-connection
+SQL SELECT by PK (parity with PostgreSQL). Speed-ups vs MySQL: **8.3×** single-thread
+load, **4.0×** point reads, **2.4×** mixed, **1.8×** batch; vs PostgreSQL: **1.9× / 2.5× / 1.1× / 1.4×**.
+
+![Throughput by workload phase](charts/v350/throughput.png)
+
+Raw logs: [bench_compare_run_v350.log](bench_compare_run_v350.log) ·
+[sql_feature_run_v350.log](sql_feature_run_v350.log) · [clippy_v350.log](clippy_v350.log) ·
+[smoke_test_results_v350.txt](smoke_test_results_v350.txt) · [security_smoke_v350.txt](security_smoke_v350.txt) ·
+[KILL9_TEST_RESULT_v350.txt](KILL9_TEST_RESULT_v350.txt) · [chaos_results_v350.txt](chaos_results_v350.txt)
+
+---
+
+
 ## 1. TL;DR
 
 Identical workload, identical keys, identical RNG sequence on all three systems, every system at its

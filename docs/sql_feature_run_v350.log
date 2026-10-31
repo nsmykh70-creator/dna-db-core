@@ -1,0 +1,39 @@
+[run_with_dbs] MySQL ready
+[run_with_dbs] PostgreSQL ready
+[run_with_dbs] running: python3 scripts/sql_feature_test.py --json-out docs/sql_feature_results_v350_linux.json
+  create_tables            dnad=ok          mysq=ok          post=ok         
+  pk_unique                dnad=ok          mysq=ok          post=ok         
+  fk_violation             dnad=ok          mysq=ok          post=ok         
+  select_order_by          dnad=ok          mysq=ok          post=ok         
+  projection_alias         dnad=ok          mysq=ok          post=ok         
+  where_in_list            dnad=ok          mysq=ok          post=ok         
+  where_and_or             dnad=ok          mysq=ok          post=ok         
+  order_limit_offset       dnad=ok          mysq=ok          post=ok         
+  is_null                  dnad=ok          mysq=ok          post=ok         
+  is_not_null              dnad=ok          mysq=ok          post=ok         
+  computed_projection      dnad=ok          mysq=ok          post=ok         
+  qualified_order_by       dnad=ok          mysq=ok          post=ok         
+  join_inner               dnad=ok          mysq=ok          post=ok         
+  join_left                dnad=ok          mysq=ok          post=ok         
+  join_right               dnad=unsupported mysq=ok          post=ok         
+  join_full                dnad=unsupported mysq=unsupported post=ok         
+  agg_functions            dnad=ok          mysq=ok          post=ok         
+  group_by                 dnad=ok          mysq=ok          post=ok         
+  having                   dnad=ok          mysq=ok          post=ok         
+  order_by_aggregate       dnad=ok          mysq=ok          post=ok         
+  agg_null_skip            dnad=ok          mysq=ok          post=ok         
+  in_subquery              dnad=ok          mysq=ok          post=ok         
+  scalar_subquery          dnad=unsupported mysq=ok          post=ok         
+  index_create             dnad=ok          mysq=ok          post=ok         
+  index_plan_equality      dnad=ok          mysq=ok          post=ok         
+  index_plan_range         dnad=ok          mysq=ok          post=ok         
+  index_dml                dnad=ok          mysq=ok          post=ok         
+  index_drop               dnad=ok          mysq=ok          post=ok         
+  transaction_rollback     dnad=unsupported mysq=ok          post=ok         
+  union                    dnad=unsupported mysq=ok          post=ok         
+  show_tables              dnad=unsupported mysq=ok          post=ok         
+  explain_statement        dnad=unsupported mysq=ok          post=ok         
+
+JSON: docs/sql_feature_results_v350_linux.json
+summary: {"dnadb": {"ok": 25, "unsupported": 7, "mismatch": 0, "error": 0, "n/a": 0}, "mysql": {"ok": 31, "unsupported": 1, "mismatch": 0, "error": 0, "n/a": 0}, "postgres": {"ok": 32, "unsupported": 0, "mismatch": 0, "error": 0, "n/a": 0}}
+[run_with_dbs] servers stopped

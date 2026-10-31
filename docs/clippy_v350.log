@@ -1,0 +1,1016 @@
+    Checking cfg-if v1.0.5
+    Checking libc v0.2.191
+    Checking typenum v1.20.1
+    Checking generic-array v0.14.7
+    Checking getrandom v0.2.17
+    Checking rand_core v0.6.4
+    Checking subtle v2.6.1
+    Checking crypto-common v0.1.7
+    Checking zeroize v1.9.1
+    Checking cpufeatures v0.2.17
+    Checking zerocopy v0.8.63
+    Checking rustls-pki-types v1.15.1
+    Checking block-buffer v0.10.4
+    Checking utf8parse v0.2.2
+    Checking untrusted v0.9.0
+    Checking ring v0.17.14
+    Checking anstyle-parse v1.0.0
+    Checking digest v0.10.7
+    Checking inout v0.1.4
+    Checking num-conv v0.2.2
+    Checking foldhash v0.2.0
+    Checking smallvec v1.16.3
+    Checking deranged v0.5.9
+    Checking ppv-lite86 v0.2.21
+    Checking bytemuck v1.25.2
+    Checking is_terminal_polyfill v1.70.2
+    Checking scopeguard v1.2.0
+    Checking colorchoice v1.0.5
+    Checking anstyle-query v1.1.5
+    Checking anstyle v1.0.14
+    Checking time-core v0.1.9
+    Checking powerfmt v0.2.1
+    Checking anstream v1.0.0
+    Checking time v0.3.55
+    Checking lock_api v0.4.14
+    Checking safe_arch v0.7.4
+    Checking rand_chacha v0.3.1
+    Checking parking_lot_core v0.9.12
+    Checking hashbrown v0.17.1
+    Checking cipher v0.4.4
+    Checking serde_core v1.0.229
+    Checking crossbeam-utils v0.8.23
+    Checking universal-hash v0.5.1
+    Checking base64ct v1.8.3
+    Checking base64 v0.22.1
+    Checking opaque-debug v0.3.1
+    Checking strsim v0.11.1
+    Checking clap_lex v1.1.1
+    Checking clap_builder v4.6.7
+    Checking poly1305 v0.8.0
+    Checking pem v3.0.6
+    Checking password-hash v0.5.0
+    Checking crossbeam-epoch v0.9.21
+    Checking lru v0.19.0
+    Checking chacha20 v0.9.1
+    Checking parking_lot v0.12.5
+    Checking rand v0.8.8
+    Checking wide v0.7.33
+    Checking yasna v0.5.2
+    Checking libm v0.2.16
+    Checking zmij v1.0.23
+    Checking blake2 v0.10.6
+    Checking rustls-webpki v0.103.16
+    Checking aead v0.5.2
+    Checking once_cell v1.21.4
+    Checking itoa v1.0.18
+    Checking siphasher v1.0.4
+    Checking memchr v2.8.3
+    Checking spin v0.9.9
+    Checking reed-solomon-erasure v6.0.0 (/home/z/my-project/workspace/dna-db-core-main/vendor/reed-solomon-erasure)
+    Checking serde_json v1.0.154
+    Checking rustls v0.23.46
+    Checking fastbloom v0.8.0
+    Checking chacha20poly1305 v0.10.1
+    Checking serde v1.0.229
+    Checking argon2 v0.5.3
+    Checking rcgen v0.13.2
+    Checking clap v4.6.7
+    Checking crossbeam-skiplist v0.1.3
+    Checking thiserror v1.0.69
+    Checking crc32fast v1.5.3
+    Checking sha2 v0.10.9
+    Checking webpki-roots v1.0.11
+    Checking fs2 v0.4.3
+    Checking bytes v1.12.1
+    Checking dna-db-core v3.5.0 (/home/z/my-project/workspace/dna-db-core-main)
+warning: empty line after doc comment
+   --> src/wal.rs:260:1
+    |
+260 | / /// ---------------------------------------------------------------------------
+261 | |
+    | |_^
+262 |   pub const WAL_PARITY_MAGIC: &[u8; 8] = b"DNAWLP01";
+    |   -------------------------- the comment documents this constant item
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#empty_line_after_doc_comments
+    = note: `#[warn(clippy::empty_line_after_doc_comments)]` on by default
+    = help: if the empty line is unintentional, remove it
+
+warning: this function has too many arguments (8/7)
+  --> src/admin.rs:76:1
+   |
+76 | / pub fn spawn(
+77 | |     bind: IpAddr,
+78 | |     port: u16,
+79 | |     engine: Arc<Engine>,
+...  |
+84 | |     proxy: Option<ProxyAuthConfig>,
+85 | | ) {
+   | |_^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#too_many_arguments
+   = note: `#[warn(clippy::too_many_arguments)]` on by default
+
+warning: doc list item without indentation
+  --> src/bio_plugins.rs:11:5
+   |
+11 | //! Registration is runtime-extensible via BioPluginFn (planned: WASM modules
+   |     ^
+   |
+   = help: if this is supposed to be its own paragraph, add a blank line
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#doc_lazy_continuation
+   = note: `#[warn(clippy::doc_lazy_continuation)]` on by default
+help: indent this line
+   |
+11 | //!     Registration is runtime-extensible via BioPluginFn (planned: WASM modules
+   |     ++++
+
+warning: doc list item without indentation
+  --> src/bio_plugins.rs:12:5
+   |
+12 | //! in a future release, see ROADMAP).
+   |     ^
+   |
+   = help: if this is supposed to be its own paragraph, add a blank line
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#doc_lazy_continuation
+help: indent this line
+   |
+12 | //!     in a future release, see ROADMAP).
+   |     ++++
+
+warning: manually reimplementing `div_ceil`
+  --> src/dna.rs:39:43
+   |
+39 |         let mut data = Vec::with_capacity((len + 3) / 4);
+   |                                           ^^^^^^^^^^^^^ help: consider using `.div_ceil()`: `len.div_ceil(4)`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#manual_div_ceil
+   = note: `#[warn(clippy::manual_div_ceil)]` on by default
+
+warning: manual implementation of `.is_multiple_of()`
+  --> src/dna.rs:60:12
+   |
+60 |         if len % 4 != 0 {
+   |            ^^^^^^^^^^^^ help: replace with: `!len.is_multiple_of(4)`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#manual_is_multiple_of
+   = note: `#[warn(clippy::manual_is_multiple_of)]` on by default
+
+warning: manual implementation of `.is_multiple_of()`
+   --> src/dna.rs:111:12
+    |
+111 |         if self.len % 4 == 0 {
+    |            ^^^^^^^^^^^^^^^^^ help: replace with: `self.len.is_multiple_of(4)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#manual_is_multiple_of
+
+warning: using `chunks_exact` with a constant chunk size
+   --> src/dna.rs:176:28
+    |
+176 |         for chunk in bytes.chunks_exact(3) {
+    |                            ^^^^^^^^^^^^^^^ help: consider using `as_chunks` instead: `as_chunks::<3>().0`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#chunks_exact_to_as_chunks
+    = note: `#[warn(clippy::chunks_exact_to_as_chunks)]` on by default
+
+warning: called `unwrap` on `mirror` after checking its variant with `is_some`
+   --> src/engine.rs:247:23
+    |
+246 |             if (a_lost_frames || !parity_ok) && mirror.is_some() {
+    |                                                 ---------------- the check is happening here
+247 |                 match mirror.as_ref().unwrap().restore_closed_wal_better(
+    |                       ^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: try using `match`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#unnecessary_unwrap
+    = note: `#[warn(clippy::unnecessary_unwrap)]` on by default
+
+warning: called `unwrap` on `mirror` after checking its variant with `is_some`
+   --> src/engine.rs:285:25
+    |
+284 |               if (rs_repaired > 0 || a_lost_frames || restored_from_b) && mirror.is_some() {
+    |                                                                           ---------------- the check is happening here
+285 |                   let _ = mirror
+    |  _________________________^
+286 | |                     .as_ref()
+287 | |                     .unwrap()
+    | |_____________________________^
+    |
+    = help: try using `match`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#unnecessary_unwrap
+
+warning: consider using `sort_by_key`
+   --> src/engine.rs:184:9
+    |
+184 |         readers.sort_by(|a, b| b.0.cmp(&a.0));
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#unnecessary_sort_by
+    = note: `#[warn(clippy::unnecessary_sort_by)]` on by default
+help: try
+    |
+184 -         readers.sort_by(|a, b| b.0.cmp(&a.0));
+184 +         readers.sort_by_key(|a| std::cmp::Reverse(a.0));
+    |
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+   --> src/engine.rs:557:14
+    |
+557 |         ops: &[(WalOp, Vec<u8>, Option<Vec<u8>>)],
+    |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#type_complexity
+    = note: `#[warn(clippy::type_complexity)]` on by default
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+   --> src/engine.rs:581:19
+    |
+581 |         let refs: Vec<(&WalOp, &[u8], Option<&[u8]>)> = stored_ops
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#type_complexity
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+   --> src/engine.rs:723:10
+    |
+723 |     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, std::io::Error> {
+    |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#type_complexity
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+   --> src/engine.rs:736:49
+    |
+736 |     pub fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, std::io::Error> {
+    |                                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#type_complexity
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+   --> src/engine.rs:795:10
+    |
+795 |     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, std::io::Error> {
+    |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#type_complexity
+
+warning: casting to the same type is unnecessary (`isize` -> `isize`)
+  --> src/memtable.rs:68:24
+   |
+68 |         let new_size = self.approx_size.fetch_add(delta, Ordering::Relaxed) as isize + delta;
+   |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `self.approx_size.fetch_add(delta, Ordering::Relaxed)`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#unnecessary_cast
+   = note: `#[warn(clippy::unnecessary_cast)]` on by default
+
+warning: casting to the same type is unnecessary (`isize` -> `isize`)
+  --> src/memtable.rs:83:24
+   |
+83 |         let new_size = self.approx_size.fetch_add(delta, Ordering::Relaxed) as isize + delta;
+   |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `self.approx_size.fetch_add(delta, Ordering::Relaxed)`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#unnecessary_cast
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+   --> src/mirror.rs:157:37
+    |
+157 |     pub fn mirror_batch(&self, ops: &[(&WalOp, &[u8], Option<&[u8]>)]) -> io::Result<()> {
+    |                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#type_complexity
+
+warning: this `if` has identical blocks
+   --> src/mirror.rs:639:45
+    |
+639 |                   if name_str == "active.wal" {
+    |  _____________________________________________^
+640 | |                     copy_atomic(&source, &new_disk_path.join(&name))?;
+641 | |                     primary_files.insert(name_str.to_string());
+642 | |                 } else if name_str == MANIFEST_FILE {
+    | |_________________^
+    |
+note: same as this
+   --> src/mirror.rs:642:53
+    |
+642 |                   } else if name_str == MANIFEST_FILE {
+    |  _____________________________________________________^
+643 | |                     copy_atomic(&source, &new_disk_path.join(&name))?;
+644 | |                     primary_files.insert(name_str.to_string());
+645 | |                 } else if name_str.starts_with("wal_")
+    | |_________________^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#if_same_then_else
+    = note: `#[warn(clippy::if_same_then_else)]` on by default
+
+warning: using `chunks_exact` with a constant chunk size
+   --> src/mirror.rs:783:48
+    |
+783 |     for id_bytes in bytes[20..checksum_offset].chunks_exact(8) {
+    |                                                ^^^^^^^^^^^^^^^ help: consider using `as_chunks` instead: `as_chunks::<8>().0`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#chunks_exact_to_as_chunks
+
+warning: this `impl` can be derived
+  --> src/repair.rs:47:1
+   |
+47 | / impl Default for RepairPolicy {
+48 | |     fn default() -> Self {
+49 | |         RepairPolicy::RepairOnRead
+50 | |     }
+51 | | }
+   | |_^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#derivable_impls
+   = note: `#[warn(clippy::derivable_impls)]` on by default
+help: replace the manual implementation with a derive attribute and mark the default variant
+   |
+37 + #[derive(Default)]
+38 | pub enum RepairPolicy {
+39 |     /// Detect on read, reconstruct from parity, rewrite, then serve the
+40 |     /// value (strict semantics: the client never sees damaged data).
+41 ~     #[default]
+42 ~     RepairOnRead,
+   |
+
+warning: `flatten()` will run forever if the iterator repeatedly produces an `Err`
+   --> src/repair.rs:114:55
+    |
+114 |             for line in io::BufReader::new(f).lines().flatten() {
+    |                                                       ^^^^^^^^^ help: replace with: `map_while(Result::ok)`
+    |
+note: this expression returning a `std::io::Lines` may produce an infinite number of `Err` in case of a read error
+   --> src/repair.rs:114:25
+    |
+114 |             for line in io::BufReader::new(f).lines().flatten() {
+    |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#lines_filter_map_ok
+    = note: `#[warn(clippy::lines_filter_map_ok)]` on by default
+
+warning: manual checked division
+   --> src/repair.rs:366:30
+    |
+366 |     let per_block_delay = if rate_limit == 0 {
+    |                              ^^^^^^^^^^^^^^^ check performed here
+...
+369 |         Duration::from_nanos((BLOCK_SIZE as u64) * 1_000_000_000 / rate_limit)
+    |                              ------------------------------------------------ division performed here
+    |
+    = help: consider using `checked_div`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#manual_checked_ops
+    = note: `#[warn(clippy::manual_checked_ops)]` on by default
+
+warning: this can be `std::io::Error::other(_)`
+   --> src/rotate.rs:287:44
+    |
+287 |                       Err(rollback_error) => io::Error::new(
+    |  ____________________________________________^
+288 | |                         io::ErrorKind::Other,
+289 | |                         format!(
+290 | |                             "mirror rebuild failed ({mirror_error}) and primary rollback failed \
+...   |
+293 | |                         ),
+294 | |                     ),
+    | |_____________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#io_other_error
+    = note: `#[warn(clippy::io_other_error)]` on by default
+help: use `std::io::Error::other`
+    |
+287 ~                     Err(rollback_error) => io::Error::other(
+288 ~                         format!(
+    |
+
+warning: manual implementation of `.is_multiple_of()`
+   --> src/segment.rs:441:16
+    |
+441 |             if record_index % SPARSE_EVERY == 0 {
+    |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: replace with: `record_index.is_multiple_of(SPARSE_EVERY)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#manual_is_multiple_of
+
+warning: casting to the same type is unnecessary (`u64` -> `u64`)
+   --> src/segment.rs:585:36
+    |
+585 |                         seek_off + scanned as u64
+    |                                    ^^^^^^^^^^^^^^ help: try: `scanned`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#unnecessary_cast
+
+warning: large size difference between variants
+   --> src/segment.rs:613:1
+    |
+613 | / pub enum SegmentFile {
+614 | |     /// DNASST01 — v2.1 record layout (readable, not repairable by parity).
+615 | |     Legacy(SegmentReader),
+    | |     --------------------- the second-largest variant contains at least 104 bytes
+616 | |     /// DNASST02 — v3.0 block layout with RS stripes (self-healing).
+617 | |     Block(BlockSegmentReader),
+    | |     ------------------------- the largest variant contains at least 1488 bytes
+618 | | }
+    | |_^ the entire enum is at least 1488 bytes
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#large_enum_variant
+    = note: `#[warn(clippy::large_enum_variant)]` on by default
+help: consider boxing the large fields or introducing indirection in some other way to reduce the total size of the enum
+    |
+617 -     Block(BlockSegmentReader),
+617 +     Block(Box<BlockSegmentReader>),
+    |
+
+warning: using `chunks_exact` with a constant chunk size
+   --> src/segment_block.rs:669:14
+    |
+669 |             .chunks_exact(4)
+    |              ^^^^^^^^^^^^^^^ help: consider using `as_chunks` instead: `as_chunks::<4>().0.iter()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#chunks_exact_to_as_chunks
+
+warning: this `if` has identical blocks
+   --> src/segment_block.rs:811:54
+    |
+811 |               if f.seek(SeekFrom::Start(pos)).is_err() {
+    |  ______________________________________________________^
+812 | |                 ok = false;
+813 | |             } else if f.read_exact(&mut buf).is_err() {
+    | |_____________^
+    |
+note: same as this
+   --> src/segment_block.rs:813:55
+    |
+813 |               } else if f.read_exact(&mut buf).is_err() {
+    |  _______________________________________________________^
+814 | |                 ok = false;
+815 | |             }
+    | |_____________^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#if_same_then_else
+
+warning: this `if` has identical blocks
+    --> src/segment_block.rs:1387:62
+     |
+1387 |                       if f.seek(SeekFrom::Start(pos)).is_err() {
+     |  ______________________________________________________________^
+1388 | |                         ok = false;
+1389 | |                     } else if f.read_exact(&mut buf).is_err() {
+     | |_____________________^
+     |
+note: same as this
+    --> src/segment_block.rs:1389:63
+     |
+1389 |                       } else if f.read_exact(&mut buf).is_err() {
+     |  _______________________________________________________________^
+1390 | |                         ok = false;
+1391 | |                     }
+     | |_____________________^
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#if_same_then_else
+
+warning: this `if` has identical blocks
+    --> src/segment_block.rs:1461:66
+     |
+1461 |                           if f.seek(SeekFrom::Start(pos)).is_err() {
+     |  __________________________________________________________________^
+1462 | |                             ok = false;
+1463 | |                         } else if f.read_exact(&mut buf).is_err() {
+     | |_________________________^
+     |
+note: same as this
+    --> src/segment_block.rs:1463:67
+     |
+1463 |                           } else if f.read_exact(&mut buf).is_err() {
+     |  ___________________________________________________________________^
+1464 | |                             ok = false;
+1465 | |                         }
+     | |_________________________^
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#if_same_then_else
+
+warning: the loop variable `d` is used to index `r`
+   --> src/simd_bitap.rs:121:18
+    |
+121 |         for d in 1..=k {
+    |                  ^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#needless_range_loop
+    = note: `#[warn(clippy::needless_range_loop)]` on by default
+help: consider using an iterator and enumerate()
+    |
+121 -         for d in 1..=k {
+121 +         for (d, <item>) in r.iter_mut().enumerate().take(k + 1).skip(1) {
+    |
+
+warning: the loop variable `d` is used to index `r`
+   --> src/simd_bitap.rs:141:22
+    |
+141 |             for d in 0..=k {
+    |                      ^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+    |
+141 -             for d in 0..=k {
+141 +             for (d, <item>) in r.iter().enumerate().take(k + 1) {
+    |
+
+warning: the loop variable `d` is only used to index `r`
+   --> src/simd_bitap.rs:169:22
+    |
+169 |             for d in 1..=k {
+    |                      ^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#needless_range_loop
+help: consider using an iterator
+    |
+169 -             for d in 1..=k {
+169 +             for <item> in r.iter_mut().take(k + 1).skip(1) {
+    |
+
+warning: the loop variable `d` is used to index `r`
+   --> src/simd_bitap.rs:176:22
+    |
+176 |             for d in 0..=k {
+    |                      ^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+    |
+176 -             for d in 0..=k {
+176 +             for (d, <item>) in r.iter().enumerate().take(k + 1) {
+    |
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+    --> src/sql_engine.rs:1572:10
+     |
+1572 |       ) -> Result<
+     |  __________^
+1573 | |         (
+1574 | |             Vec<String>,
+1575 | |             Vec<BTreeMap<String, Value>>,
+...    |
+1579 | |         String,
+1580 | |     > {
+     | |_____^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#type_complexity
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+    --> src/sql_engine.rs:1822:10
+     |
+1822 |       ) -> Result<
+     |  __________^
+1823 | |         (
+1824 | |             Vec<String>,
+1825 | |             Vec<BTreeMap<String, Value>>,
+...    |
+1829 | |         String,
+1830 | |     > {
+     | |_____^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#type_complexity
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+    --> src/sql_engine.rs:1879:10
+     |
+1879 |       ) -> Result<
+     |  __________^
+1880 | |         (
+1881 | |             Vec<String>,
+1882 | |             Vec<BTreeMap<String, Value>>,
+...    |
+1886 | |         String,
+1887 | |     > {
+     | |_____^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#type_complexity
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+    --> src/sql_engine.rs:1997:10
+     |
+1997 |       ) -> Result<
+     |  __________^
+1998 | |         (
+1999 | |             Vec<String>,
+2000 | |             Vec<BTreeMap<String, Value>>,
+...    |
+2004 | |         String,
+2005 | |     > {
+     | |_____^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#type_complexity
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+    --> src/sql_engine.rs:2185:10
+     |
+2185 |       ) -> Result<
+     |  __________^
+2186 | |         (
+2187 | |             Vec<String>,
+2188 | |             Vec<BTreeMap<String, Value>>,
+...    |
+2192 | |         String,
+2193 | |     > {
+     | |_____^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#type_complexity
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+    --> src/sql_engine.rs:2253:10
+     |
+2253 |       ) -> Result<
+     |  __________^
+2254 | |         (
+2255 | |             Vec<String>,
+2256 | |             Vec<BTreeMap<String, Value>>,
+...    |
+2260 | |         String,
+2261 | |     > {
+     | |_____^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#type_complexity
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+    --> src/sql_engine.rs:2397:10
+     |
+2397 |       ) -> Result<
+     |  __________^
+2398 | |         (
+2399 | |             Vec<String>,
+2400 | |             Vec<BTreeMap<String, Value>>,
+...    |
+2404 | |         String,
+2405 | |     > {
+     | |_____^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#type_complexity
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+    --> src/sql_engine.rs:2590:10
+     |
+2590 |       ) -> Result<
+     |  __________^
+2591 | |         (
+2592 | |             Vec<String>,
+2593 | |             Vec<BTreeMap<String, Value>>,
+...    |
+2597 | |         String,
+2598 | |     > {
+     | |_____^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#type_complexity
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+    --> src/sql_engine.rs:2759:10
+     |
+2759 |       ) -> Result<
+     |  __________^
+2760 | |         (
+2761 | |             Vec<String>,
+2762 | |             Vec<BTreeMap<String, Value>>,
+...    |
+2766 | |         String,
+2767 | |     > {
+     | |_____^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#type_complexity
+
+warning: this function has too many arguments (10/7)
+    --> src/sql_engine.rs:2748:5
+     |
+2748 | /     fn exec_select(
+2749 | |         &self,
+2750 | |         projection: &[SelectItem],
+2751 | |         from: &str,
+...    |
+2766 | |         String,
+2767 | |     > {
+     | |_____^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#too_many_arguments
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+    --> src/sql_engine.rs:2888:55
+     |
+2888 |                 if let Some(schema) = self.get_schema(&from) {
+     |                                                       ^^^^^ help: change this to: `from`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#needless_borrow
+     = note: `#[warn(clippy::needless_borrow)]` on by default
+
+warning: you seem to be trying to use `match` for destructuring a single pattern. Consider using `if let`
+    --> src/sql_engine.rs:3065:17
+     |
+3065 | /                 match lo {
+3066 | |                     Some((v, inclusive)) => {
+3067 | |                         let mut esc = escape_index_part(&encode_ordered_value(v));
+3068 | |                         if !inclusive {
+...    |
+3075 | |                     None => {}
+3076 | |                 }
+     | |_________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#single_match
+     = note: `#[warn(clippy::single_match)]` on by default
+help: try
+     |
+3065 ~                 if let Some((v, inclusive)) = lo {
+3066 +                     let mut esc = escape_index_part(&encode_ordered_value(v));
+3067 +                     if !inclusive {
+3068 +                         // terminator byte bumped: strictly past every
+3069 +                         // entry of v, still below any greater value.
+3070 +                         *esc.last_mut().unwrap() = 0x01;
+3071 +                     }
+3072 +                     start.extend_from_slice(&esc);
+3073 +                 }
+     |
+
+warning: this `if` can be collapsed into the outer `match`
+    --> src/sql_engine.rs:3447:17
+     |
+3447 | /                 if schema.secondary_index_on(column).is_some()
+3448 | |                     && !values.is_empty()
+3449 | |                     && values.iter().all(|v| !v.is_null())
+...    |
+3452 | |                 }
+     | |_________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#collapsible_match
+     = note: `#[warn(clippy::collapsible_match)]` on by default
+help: collapse nested if block
+     |
+3446 ~             Expr::InList { column, values }
+3447 |                 if schema.secondary_index_on(column).is_some()
+3448 |                     && !values.is_empty()
+3449 |                     && values.iter().all(|v| !v.is_null())
+3450 ~                 => {
+3451 |                     return Some((column.clone(), IndexAccess::Eq(values.clone())));
+3452 ~                 }
+     |
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+    --> src/sql_engine.rs:3459:19
+     |
+3459 |     let mut best: Option<(String, Option<(Value, bool)>, Option<(Value, bool)>)> = None;
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#type_complexity
+
+warning: doc list item without indentation
+  --> src/tx.rs:18:5
+   |
+18 | //!   Snapshot Isolation / MVCC version chains stay ROADMAP work: without
+   |     ^^
+   |
+   = help: if this is supposed to be its own paragraph, add a blank line
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#doc_lazy_continuation
+help: indent this line
+   |
+18 | //!     Snapshot Isolation / MVCC version chains stay ROADMAP work: without
+   |       ++
+
+warning: doc list item without indentation
+  --> src/tx.rs:19:5
+   |
+19 | //!   versioned storage stale snapshot reads cannot be served honestly, so
+   |     ^^
+   |
+   = help: if this is supposed to be its own paragraph, add a blank line
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#doc_lazy_continuation
+help: indent this line
+   |
+19 | //!     versioned storage stale snapshot reads cannot be served honestly, so
+   |       ++
+
+warning: doc list item without indentation
+  --> src/tx.rs:20:5
+   |
+20 | //!   the previously declared (but silently downgraded) variant was removed.
+   |     ^^
+   |
+   = help: if this is supposed to be its own paragraph, add a blank line
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#doc_lazy_continuation
+help: indent this line
+   |
+20 | //!     the previously declared (but silently downgraded) variant was removed.
+   |       ++
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+   --> src/wal.rs:107:41
+    |
+107 |     pub fn append_batch(&mut self, ops: &[(&WalOp, &[u8], Option<&[u8]>)]) -> io::Result<()> {
+    |                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#type_complexity
+
+warning: using `chunks_exact` with a constant chunk size
+   --> src/wal.rs:421:14
+    |
+421 |             .chunks_exact(4)
+    |              ^^^^^^^^^^^^^^^ help: consider using `as_chunks` instead: `as_chunks::<4>().0.iter()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#chunks_exact_to_as_chunks
+
+warning: `dna-db-core` (lib) generated 55 warnings (run `cargo clippy --fix --lib -p dna-db-core -- ` to apply 16 suggestions)
+warning: unnecessary use of `clone` to create a slice from a reference
+   --> src/bio_plugins.rs:315:36
+    |
+315 |             .execute("orf_finder", &[s.clone()], &["10".to_string()])
+    |                                    ^^^^^^^^^^^^ help: try: `std::slice::from_ref(&s)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#cloned_ref_to_slice_refs
+    = note: `#[warn(clippy::cloned_ref_to_slice_refs)]` on by default
+
+warning: manually reimplementing `div_ceil`
+   --> src/dna.rs:284:41
+    |
+284 |             assert_eq!(p.packed_size(), (seq.len() + 3) / 4);
+    |                                         ^^^^^^^^^^^^^^^^^^^ help: consider using `.div_ceil()`: `seq.len().div_ceil(4)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#manual_div_ceil
+
+warning: length comparison to one
+    --> src/dna_ql.rs:2005:13
+     |
+2005 |             res.rows.len() >= 1,
+     |             ^^^^^^^^^^^^^^^^^^^ help: using `!is_empty` is clearer and more explicit: `!res.rows.is_empty()`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#len_zero
+     = note: `#[warn(clippy::len_zero)]` on by default
+
+warning: called `.err().expect()` on a `Result` value
+    --> src/dna_ql.rs:2162:14
+     |
+2162 |               .err()
+     |  ______________^
+2163 | |             .expect("pathologically deep expression must be rejected");
+     | |___________________^ help: try: `expect_err`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#err_expect
+     = note: `#[warn(clippy::err_expect)]` on by default
+
+warning: the loop variable `i` is used to index `damaged`
+   --> src/reed_solomon.rs:179:26
+    |
+179 |                 for i in 0..total {
+    |                          ^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#needless_range_loop
+    = note: `#[warn(clippy::needless_range_loop)]` on by default
+help: consider using an iterator and enumerate()
+    |
+179 -                 for i in 0..total {
+179 +                 for (i, <item>) in damaged.iter_mut().enumerate().take(total) {
+    |
+
+warning: items after a test module
+   --> src/segment.rs:144:1
+    |
+144 | mod tests {
+    | ^^^^^^^^^
+...
+258 | impl SegmentReader {
+    | ^^^^^^^^^^^^^^^^^^
+...
+613 | pub enum SegmentFile {
+    | ^^^^^^^^^^^^^^^^^^^^
+...
+620 | impl SegmentFile {
+    | ^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#items_after_test_module
+    = note: `#[warn(clippy::items_after_test_module)]` on by default
+
+warning: the loop variable `d` is used to index `r`
+   --> src/simd_bitap.rs:121:18
+    |
+121 |         for d in 1..=k {
+    |                  ^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+    |
+121 -         for d in 1..=k {
+121 +         for (d, <item>) in r.iter_mut().enumerate().take(k + 1).skip(1) {
+    |
+
+warning: large size difference between variants
+   --> src/main.rs:52:1
+    |
+ 52 | /   enum Command {
+ 53 | |       /// Run the TCP server
+ 54 | | /     Serve {
+ 55 | | |         #[arg(long, default_value = "./dna_data")]
+ 56 | | |         data_dir: String,
+ 57 | | |         #[arg(long, default_value_t = 9999)]
+...   | |
+130 | | |         proxy_auth_secret: Option<String>,
+131 | | |     },
+    | | |_____- the largest variant contains at least 362 bytes
+...   |
+140 | | /     Shell {
+141 | | |         #[arg(long, default_value = "127.0.0.1")]
+142 | | |         host: String,
+143 | | |         #[arg(long, default_value_t = 9999)]
+...   | |
+160 | | |         tls_client_key: Option<String>,
+161 | | |     },
+    | | |_____- the second-largest variant contains at least 147 bytes
+...   |
+218 | |       },
+219 | |   }
+    | |___^ the entire enum is at least 368 bytes
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#large_enum_variant
+    = note: `#[warn(clippy::large_enum_variant)]` on by default
+help: consider boxing the large fields or introducing indirection in some other way to reduce the total size of the enum
+    |
+130 -         proxy_auth_secret: Option<String>,
+130 +         proxy_auth_secret: Box<Option<String>>,
+    |
+
+warning: try not to call a closure in the expression where it is declared
+    --> src/main.rs:1179:57
+     |
+1179 |       let result: std::io::Result<repair::DoctorReport> = (|| {
+     |  _________________________________________________________^
+1180 | |         if migrate {
+1181 | |             repair::doctor_migrate(dir, erasure_k, erasure_m)
+1182 | |         } else if fix {
+...    |
+1187 | |     })();
+     | |________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#redundant_closure_call
+     = note: `#[warn(clippy::redundant_closure_call)]` on by default
+help: try doing something like
+     |
+1179 ~     let result: std::io::Result<repair::DoctorReport> = (if migrate {
+1180 +             repair::doctor_migrate(dir, erasure_k, erasure_m)
+1181 +         } else if fix {
+1182 +             repair::doctor_fix(dir)
+1183 +         } else {
+1184 +             repair::doctor_scan(dir)
+1185 ~         });
+     |
+
+warning: called `.err().expect()` on a `Result` value
+    --> src/sql_engine.rs:4929:14
+     |
+4929 |               .err()
+     |  ______________^
+4930 | |             .expect("pathologically deep query must be rejected");
+     | |___________________^ help: try: `expect_err`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#err_expect
+
+warning: called `.err().expect()` on a `Result` value
+    --> src/sql_engine.rs:4948:14
+     |
+4948 |               .err()
+     |  ______________^
+4949 | |             .expect("deep subquery nesting must be rejected");
+     | |___________________^ help: try: `expect_err`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#err_expect
+
+warning: called `.err().expect()` on a `Result` value
+    --> src/sql_engine.rs:4962:14
+     |
+4962 |               .err()
+     |  ______________^
+4963 | |             .expect("bare DROP INDEX must not pass the ACL resolver");
+     | |___________________^ help: try: `expect_err`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#err_expect
+
+warning: this function has too many arguments (8/7)
+    --> src/main.rs:1413:1
+     |
+1413 | / fn run_shell(
+1414 | |     host: &str,
+1415 | |     port: u16,
+1416 | |     user: &str,
+...    |
+1421 | |     tls_client_key: Option<&str>,
+1422 | | ) -> i32 {
+     | |________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#too_many_arguments
+     = note: `#[warn(clippy::too_many_arguments)]` on by default
+
+warning: `dna-db-core` (bin "dna-db-core") generated 3 warnings (run `cargo clippy --fix --bin "dna-db-core" -p dna-db-core -- ` to apply 1 suggestion)
+warning: `dna-db-core` (lib test) generated 64 warnings (54 duplicates) (run `cargo clippy --fix --lib -p dna-db-core --tests -- ` to apply 7 suggestions)
+warning: writing `&PathBuf` instead of `&Path` involves a new object where a slice will do
+  --> tests/integration_recovery.rs:24:16
+   |
+24 | fn config(dir: &PathBuf) -> EngineConfig {
+   |                ^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#ptr_arg
+   = note: `#[warn(clippy::ptr_arg)]` on by default
+help: change this to
+   |
+24 ~ fn config(dir: &Path) -> EngineConfig {
+25 |     EngineConfig {
+26 ~         dir_path: dir.to_path_buf(),
+   |
+
+warning: `dna-db-core` (test "integration_recovery") generated 1 warning
+warning: `dna-db-core` (bin "dna-db-core" test) generated 3 warnings (3 duplicates)
+    Finished `release` profile [optimized] target(s) in 15.58s

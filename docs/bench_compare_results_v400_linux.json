@@ -1,0 +1,103 @@
+{
+  "meta": {
+    "date": "2026-10-31 21:15:40",
+    "machine": "posix | Linux-5.10.134-013.15.kangaroo.al8.x86_64-x86_64-with-glibc2.41",
+    "params": {
+      "load": 10000,
+      "reads": 4000,
+      "threads": 8,
+      "mixed_ops": 500,
+      "sql_rows": 3000,
+      "sql_queries": 1500,
+      "mt_rows": 8000,
+      "mt_threads": 8,
+      "batch_rows": 8000,
+      "batch_size": 200
+    },
+    "durability": {
+      "dnadb": "--sync strict (fsync WAL per ack); cleartext; no encryption",
+      "mysql": "innodb_flush_log_at_trx_commit=1 (default)",
+      "postgres": "synchronous_commit=on (default)"
+    }
+  },
+  "systems": {
+    "dnadb": {
+      "name": "DNA-DB v4.0.0",
+      "version": "dna-db-core 4.0.0 (legacy, strict fsync)",
+      "load": {
+        "ops": 10000,
+        "secs": 0.255,
+        "ops_s": 39194,
+        "avg_ms": 0.025,
+        "p50_ms": 0.02,
+        "p95_ms": 0.025,
+        "p99_ms": 0.031
+      },
+      "load_mt": {
+        "ops": 8000,
+        "secs": 0.383,
+        "ops_s": 20902,
+        "threads": 8,
+        "errors": 0,
+        "avg_ms": 0.092,
+        "p50_ms": 0.043,
+        "p95_ms": 0.119,
+        "p99_ms": 0.258,
+        "verify_ok": true
+      },
+      "load_batch": {
+        "ops": 8000,
+        "secs": 0.026,
+        "ops_s": 308423,
+        "batches": 40,
+        "batch_size": 200,
+        "per_op": "batch",
+        "errors": 0,
+        "avg_ms": 0.647,
+        "p50_ms": 0.638,
+        "p95_ms": 0.732,
+        "p99_ms": 0.751,
+        "verify_ok": true
+      },
+      "point_read": {
+        "ops": 4000,
+        "secs": 0.113,
+        "ops_s": 35493,
+        "errors": 0,
+        "avg_ms": 0.027,
+        "p50_ms": 0.02,
+        "p95_ms": 0.026,
+        "p99_ms": 0.032
+      },
+      "mixed": {
+        "ops": 4000,
+        "secs": 0.193,
+        "ops_s": 20711,
+        "threads": 8,
+        "avg_ms": 0.033,
+        "p50_ms": 0.027,
+        "p95_ms": 0.033,
+        "p99_ms": 0.044
+      },
+      "sql_load": {
+        "ops": 3000,
+        "secs": 0.091,
+        "ops_s": 33023,
+        "avg_ms": 0.029,
+        "p50_ms": 0.028,
+        "p95_ms": 0.034,
+        "p99_ms": 0.042
+      },
+      "sql_point_query": {
+        "ops": 1500,
+        "secs": 0.055,
+        "ops_s": 27074,
+        "errors": 0,
+        "avg_ms": 0.032,
+        "p50_ms": 0.027,
+        "p95_ms": 0.033,
+        "p99_ms": 0.039
+      }
+    }
+  }
+}

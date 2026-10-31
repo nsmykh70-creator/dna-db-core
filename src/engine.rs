@@ -391,40 +391,46 @@ impl Engine {
 
         let replay_count = wal_entries.len();
         for entry in wal_entries {
-            match entry {
-                WalEntry {
-                    op: WalOp::Put,
-                    key,
-                    value: Some(v),
-                } => {
-                    memtable.put(key, v);
+            // Replay into the ENGINE's current active memtable (not a stale
+            // local Arc): when the memtable fills up mid-replay we flush and
+            // the engine swaps in a fresh one. Without the in-loop capacity
+            // check, replaying a huge WAL buffered the ENTIRE log in memory
+            // before the single end-of-loop check — an OOM on restart.
+            {
+                let mem = engine.active_memtable.read();
+                match &entry {
+                    WalEntry {
+                        op: WalOp::Put,
+                        key,
+                        value: Some(v),
+                    } => {
+                        mem.put(key.clone(), v.clone());
+                    }
+                    WalEntry {
+                        op: WalOp::Delete,
+                        key,
+                        ..
+                    } => {
+                        mem.delete(key.clone());
+                    }
+                    WalEntry {
+                        op: WalOp::Put,
+                        key,
+                        value: None,
+                    } => {
+                        // batch delete payload quirk: treat as delete
+                        let _ = key;
+                    }
                 }
-                WalEntry {
-                    op: WalOp::Delete,
-                    key,
-                    ..
-                } => {
-                    memtable.delete(key);
-                }
-                WalEntry {
-                    op: WalOp::Put,
-                    key,
-                    value: None,
-                } => {
-                    // batch delete payload quirk: treat as delete
-                    let _ = key;
-                }
+            }
+            if engine.active_memtable.read().is_full() {
+                engine.ensure_capacity()?;
             }
         }
         engine
             .stats
             .wal_replayed_entries
             .store(replay_count as u64, Ordering::Relaxed);
-
-        // If replay filled the memtable, flush immediately
-        if memtable.is_full() {
-            engine.ensure_capacity()?;
-        }
 
         Ok(engine)
     }
@@ -438,17 +444,27 @@ impl Engine {
             mirror.ensure_writable()?;
         }
         let stored = self.encrypt_value(key, value)?;
-        {
+        let wal_mark = {
             let mut wal_guard = self.wal.write();
+            let mark = wal_guard.logical_len()?;
             wal_guard.append(WalOp::Put, key, Some(&stored))?;
             self.maybe_rotate_wal(&mut wal_guard)?;
-        }
+            (wal_guard.path().to_path_buf(), mark)
+        };
 
         let mirror_result = self
             .mirror
             .as_ref()
             .map(|mirror| mirror.mirror_write(WalOp::Put, key, Some(&stored)))
             .transpose();
+
+        // Mirror BEFORE the memtable: a failed mirror write must roll the
+        // already-persisted WAL frame back, otherwise a write that returned an
+        // error to the caller resurrects itself from the WAL on next restart.
+        if let Err(message) = mirror_result {
+            self.rollback_wal_mark(&wal_mark);
+            return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, message));
+        }
 
         let is_full = {
             let mem_guard = self.active_memtable.read();
@@ -461,9 +477,38 @@ impl Engine {
 
         self.stats
             .record_put(key.len() + value.len(), t0.elapsed().as_nanos() as u64);
-        mirror_result
-            .map(|_| ())
-            .map_err(|message| std::io::Error::new(std::io::ErrorKind::BrokenPipe, message))
+        Ok(())
+    }
+
+    /// Undo an already-appended WAL record after a mirror failure so a write
+    /// that was never acknowledged cannot survive the next restart/replay.
+    /// Best-effort: a failed rollback is logged loudly (frame CRCs still make
+    /// the tail either fully valid or auto-truncated on open).
+    fn rollback_wal_mark(&self, mark: &(PathBuf, u64)) {
+        let (path, offset) = mark;
+        let mut wal_guard = self.wal.write();
+        if wal_guard.path() == path.as_path() {
+            if let Err(e) = wal_guard.rollback_to(*offset) {
+                eprintln!(
+                    "[WAL] rollback after mirror failure failed for {}: {e}",
+                    path.display()
+                );
+            }
+            return;
+        }
+        // The WAL was rotated between append and mirror failure: the record
+        // now lives at the tail of a closed WAL with no active writer handle.
+        drop(wal_guard);
+        let outcome = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .and_then(|f| f.set_len(*offset).and_then(|_| f.sync_all()));
+        if let Err(e) = outcome {
+            eprintln!(
+                "[WAL] rollback of rotated WAL {} failed: {e}",
+                path.display()
+            );
+        }
     }
 
     pub fn delete(&self, key: &[u8]) -> Result<(), std::io::Error> {
@@ -472,17 +517,25 @@ impl Engine {
         if let Some(mirror) = &self.mirror {
             mirror.ensure_writable()?;
         }
-        {
+        let wal_mark = {
             let mut wal_guard = self.wal.write();
+            let mark = wal_guard.logical_len()?;
             wal_guard.append(WalOp::Delete, key, None)?;
             self.maybe_rotate_wal(&mut wal_guard)?;
-        }
+            (wal_guard.path().to_path_buf(), mark)
+        };
 
         let mirror_result = self
             .mirror
             .as_ref()
             .map(|mirror| mirror.mirror_write(WalOp::Delete, key, None))
             .transpose();
+
+        // See `put`: mirror failure rolls the WAL frame back.
+        if let Err(message) = mirror_result {
+            self.rollback_wal_mark(&wal_mark);
+            return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, message));
+        }
 
         let is_full = {
             let mem_guard = self.active_memtable.read();
@@ -494,9 +547,7 @@ impl Engine {
         }
 
         self.stats.record_delete(t0.elapsed().as_nanos() as u64);
-        mirror_result
-            .map(|_| ())
-            .map_err(|message| std::io::Error::new(std::io::ErrorKind::BrokenPipe, message))
+        Ok(())
     }
 
     /// Atomic multi-key write: one WAL batch frame -> one fsync -> all ops
@@ -531,17 +582,25 @@ impl Engine {
             .iter()
             .map(|(op, k, v)| (op, k.as_slice(), v.as_deref()))
             .collect();
-        {
+        let wal_mark = {
             let mut wal_guard = self.wal.write();
+            let mark = wal_guard.logical_len()?;
             wal_guard.append_batch(&refs)?;
             self.maybe_rotate_wal(&mut wal_guard)?;
-        }
+            (wal_guard.path().to_path_buf(), mark)
+        };
 
         let mirror_result = self
             .mirror
             .as_ref()
             .map(|mirror| mirror.mirror_batch(&refs))
             .transpose();
+
+        // See `put`: mirror failure rolls the whole batch frame back.
+        if let Err(message) = mirror_result {
+            self.rollback_wal_mark(&wal_mark);
+            return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, message));
+        }
 
         let mut is_full = false;
         {
@@ -572,7 +631,6 @@ impl Engine {
     // ---------------- reads ----------------
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, std::io::Error> {
-        let _mutation_gate = self.mutation_gate.read();
         let t0 = std::time::Instant::now();
         let result = self.get_inner(key);
         let bytes = result
@@ -585,22 +643,45 @@ impl Engine {
         result
     }
 
+    /// Consistent read snapshot taken under a SHORT mutation-gate read.
+    ///
+    /// Readers used to hold `mutation_gate.read()` for the whole lookup, which
+    /// meant the writer's WAL fsync (potentially milliseconds on strict sync)
+    /// blocked every read on the engine. Now readers only grab the gate to
+    /// clone Arcs (active/immutable memtable + segment list) and immediately
+    /// release it; the Arcs keep every layer alive even if a concurrent flush
+    /// swaps the active memtable mid-read. Tombstone semantics plus the
+    /// newest-layer-wins merge order keep the result linearizable: a key that
+    /// was already written before the read started is always visible in the
+    /// snapshotted layers.
+    fn read_snapshot(
+        &self,
+    ) -> (
+        Arc<MemTable>,
+        Option<Arc<MemTable>>,
+        Vec<Arc<SegmentFile>>,
+    ) {
+        let _gate = self.mutation_gate.read();
+        let active = self.active_memtable.read().clone();
+        let immutable = self.immutable_memtable.read().clone();
+        let segments = self.segments.read().clone();
+        (active, immutable, segments)
+    }
+
     fn get_inner(&self, key: &[u8]) -> Result<Option<Vec<u8>>, std::io::Error> {
+        let (active, immutable, segments) = self.read_snapshot();
         {
-            let active = self.active_memtable.read();
             if let Some(res) = active.get(key) {
                 return self.decrypt_optional(key, res);
             }
         }
         {
-            let immut = self.immutable_memtable.read();
-            if let Some(ref imm) = *immut {
+            if let Some(ref imm) = immutable {
                 if let Some(res) = imm.get(key) {
                     return self.decrypt_optional(key, res);
                 }
             }
         }
-        let segments = self.segments.read().clone();
         for seg in segments.iter() {
             match self.get_from_segment(seg, key)? {
                 Some(SegmentLookup::Found(v)) => {
@@ -653,13 +734,12 @@ impl Engine {
     /// Newest version wins; tombstoned keys are excluded.
     /// Result is sorted by key.
     pub fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, std::io::Error> {
-        let _mutation_gate = self.mutation_gate.read();
+        let (active, immutable, segments) = self.read_snapshot();
         let mut merged: std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>> =
             std::collections::BTreeMap::new();
 
         // oldest segments first so newer layers overwrite
         {
-            let segments = self.segments.read().clone();
             for seg in segments.iter().rev() {
                 for key in self.segment_keys(seg, prefix)? {
                     // per-key lookup: exact & correct (bloom + block index)
@@ -676,8 +756,7 @@ impl Engine {
             }
         }
         {
-            let immut = self.immutable_memtable.read();
-            if let Some(ref imm) = *immut {
+            if let Some(ref imm) = immutable {
                 for (k, ev) in imm.scan_prefix(prefix) {
                     merged.insert(
                         k,
@@ -690,7 +769,6 @@ impl Engine {
             }
         }
         {
-            let active = self.active_memtable.read();
             for (k, ev) in active.scan_prefix(prefix) {
                 merged.insert(
                     k,
@@ -726,12 +804,11 @@ impl Engine {
             .collect();
         let in_range = |k: &[u8]| k >= start && k < end;
 
-        let _mutation_gate = self.mutation_gate.read();
+        let (active, immutable, segments) = self.read_snapshot();
         let mut merged: std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>> =
             std::collections::BTreeMap::new();
 
         {
-            let segments = self.segments.read().clone();
             for seg in segments.iter().rev() {
                 for key in self.segment_keys(seg, &lcp)? {
                     if !in_range(&key) {
@@ -750,8 +827,7 @@ impl Engine {
             }
         }
         {
-            let immut = self.immutable_memtable.read();
-            if let Some(ref imm) = *immut {
+            if let Some(ref imm) = immutable {
                 for (k, ev) in imm.scan_prefix(&lcp) {
                     if !in_range(&k) {
                         continue;
@@ -767,7 +843,6 @@ impl Engine {
             }
         }
         {
-            let active = self.active_memtable.read();
             for (k, ev) in active.scan_prefix(&lcp) {
                 if !in_range(&k) {
                     continue;

@@ -19,6 +19,32 @@ ops: 50 000            (bench subcommand, default 50k)
 [BITAP Hamming]     100 000 bp, k<=1: 127 matches in 0.989 ms = 101.1 Mbp/s
 ```
 
+## v3.5.0 — сравнительный прогон с MySQL 8.4.6 и PostgreSQL 17.11 (2026-10-31, Linux)
+
+Одинаковая нагрузка и RNG на всех трёх системах, у каждой — durability по умолчанию
+(DNA-DB `--sync strict`, MySQL `innodb_flush_log_at_trx_commit=1`, PG `synchronous_commit=on`).
+Сырые данные: [bench_compare_results_v350_linux.json](bench_compare_results_v350_linux.json),
+графики: [charts/v350/](charts/v350/), отчёт: [DB_COMPARISON_RU.md](DB_COMPARISON_RU.md).
+
+
+| Фаза (одинаковая нагрузка и RNG) | DNA-DB v3.5.0 | MySQL 8.4.6 | PostgreSQL 17.11 |
+|---|---:|---:|---:|
+| Load 10 000 KV rows, single connection (ack per row) | **36 260 rows/s** | 4 353 rows/s | 19 182 rows/s |
+| Multithreaded load, 8 threads × 1 000 single-row INSERTs | 17 636 rows/s | 8 316 rows/s | **22 157 rows/s** |
+| Batched load, 8 000 rows in 40 × 200-row INSERTs | **298 936 rows/s** | 162 166 rows/s | 215 926 rows/s |
+| Point read ×4 000, single connection | **43 779 ops/s** | 11 049 ops/s | 17 565 ops/s |
+| Mixed 80/20, 8 threads × 500 ops | **20 411 ops/s** | 8 403 ops/s | 17 985 ops/s |
+| SQL `INSERT`, 3 000 rows | **24 986 ops/s** | 4 003 ops/s | 16 811 ops/s |
+| SQL `SELECT … WHERE pk`, ×1 500 | 22 470 ops/s | 8 916 ops/s | **23 638 ops/s** |
+| Verified reads returning a wrong value | **0** | 0 | 0 |
+
+Итог: DNA-DB быстрее MySQL во всех 7 фазах (1,8–8,3×) и PostgreSQL в 5 из 7
+фаз; PostgreSQL выигрывает в пике параллельных одиночных INSERT (22,2k против
+17,6k rows/s) и чуть впереди в SQL SELECT по PK (23,6k против 22,5k ops/s).
+Неверных значений при проверке чтений — 0 у всех трёх систем.
+
+---
+
 ## Выводы
 
 - **Throughput точечных операций** упирается в блокировки WAL (одна RwLock на append) — масштабирование записи по ядрам ожидается от группового commit.

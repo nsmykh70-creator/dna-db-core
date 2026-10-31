@@ -1,10 +1,10 @@
-# DNA-DB Core v3.4 «Granular Access» (per-table ACL, proxy SSO, mirror-aware rotation)
+# DNA-DB Core v3.5 «Granular Access» (закалено аудитом: per-table ACL, proxy SSO, mirror-aware rotation)
 
 > **English:** [README.md](README.md) · здесь — [русская версия](README_RU.md)
 
 Высокопроизводительный встраиваемый и клиент-серверный движок баз данных на Rust с архитектурой LSM-Tree, 2-битной компрессией нуклеотидов, двухнитевым зеркалированием дисков, языком **DnaQL**, **полноценным SQL-подмножеством** (агрегаты, GROUP BY/HAVING, ORDER BY, IN/подзапросы, **secondary- и диапазонные индексы**), встроенной **веб-панелью управления** (phpMyAdmin-подобной) и самовосстановлением при повреждении секторов.
 
-## 0.2. Production-безопасность (v3.4)
+## 0.2. Production-безопасность (v3.5)
 
 | Контроль | Реализация |
 |---|---|
@@ -12,7 +12,7 @@
 | Сертификаты | пара PEM через `--tls-cert/--tls-key`; при первом старте генерируется self-signed сертификат для localhost в `DATA/tls/` (только для разработки) |
 | Mutual TLS | `--tls-client-ca CA.pem` требует клиентский сертификат, подписанный этим CA, на TCP и HTTPS; в shell — `--tls-client-cert/--tls-client-key` |
 | Пароли | **Argon2id** PHC-хеши в `DATA/users.json`, соль на пользователя, выравнивание времени для несуществующих пользователей |
-| Пользователи | bootstrap `admin` / `password`, затем создание/отключение/удаление пользователей и сброс/смена пароля в панели; роли `admin`, `operator`, `viewer`; последнего активного администратора удалить нельзя |
+| Пользователи | пароля по умолчанию нет: при первом старте генерируется случайный bootstrap-пароль (24 символа), печатается **один раз** в stderr, аккаунт помечен `must_change = true`; далее создание/отключение/удаление пользователей и сброс/смена пароля в панели; роли `admin`, `operator`, `viewer`; последнего активного администратора удалить нельзя |
 | Per-table ACL | необязательный список `allowed_tables` у пользователя (пустой = запрет всех, отсутствует/`*` = без ограничений). Проверяется по AST SQL и DnaQL (SELECT/JOIN/подзапросы/DDL), в browse/query панели; raw KV для ограниченных пользователей отключён |
 | Внешний IdP | SSO через доверенный reverse proxy (`--trusted-proxy IP`, заголовок `X-Auth-Request-User`, опциональный shared secret). Совместимо с oauth2-proxy, Authentik, nginx `auth_request`; proxy обязан вырезать клиентский заголовок. Встроенного OIDC/SAML по-прежнему нет |
 | Сессии | 256-битные CSPRNG bearer-токены, TTL 12 ч, отзыв при смене пароля/отключении/изменении ACL |
@@ -26,7 +26,8 @@
 
 ```bash
 # production-подобный запуск: TLS и шифрование включены по умолчанию.
-# При первом старте создаётся admin/password — сразу смените его в панели.
+# При первом старте без --admin-pass генерируется СЛУЧАЙНЫЙ пароль (печатается один раз
+# в stderr, аккаунт помечен must_change) — статический admin/password больше не существует.
 ./target/release/dna-db-core serve --data-dir ./dna_data --port 9999 --admin-port 8080
 # https://127.0.0.1:8080/  (self-signed: передайте DATA/tls/cert.pem клиентам)
 
@@ -182,13 +183,14 @@ cargo build --release
 ./target/release/dna-db-core serve \
   --data-dir ./dna_data \
   --port 9999 \
-  --admin-pass password \
+  --admin-pass 'change-me-now' \
   --admin-port 8080 \
   --sync strict \
   --demo-data          # опционально: демо-таблицы chr_users/chr_orders/chr_patients/chr_variants
 ```
 TLS и шифрование payload включены по умолчанию. На новом каталоге данных
-bootstrap-учётка — **`admin` / `password`**; сразу смените её в панели.
+без `--admin-pass` генерируется **случайный** bootstrap-пароль (печатается один
+раз в stderr, аккаунт помечен `must_change`) — статического admin/password больше нет.
 Для явного пароля первого старта используйте `--admin-pass` или `DNA_DB_ADMIN_PASS`.
 После запуска откройте **https://127.0.0.1:8080/** (сгенерированный сертификат
 self-signed; передайте `DATA/tls/cert.pem` CLI/HTTP-клиентам или укажите реальный).

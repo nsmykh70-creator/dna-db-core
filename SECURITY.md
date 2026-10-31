@@ -185,7 +185,9 @@ test. The vendored crate retains its upstream MIT license.
 
 ## Operational checklist
 
-1. Change `admin/password` before exposing the panel.
+1. The bootstrap account no longer has a known default: without `--admin-pass` a random
+   password is generated (printed once, `must_change = true`). Change it after first login
+   before exposing the panel.
 2. Put the data directory and the key on different volumes / access domains.
 3. Supply a CA-issued certificate; do not rely on the self-signed bootstrap
    certificate outside localhost.

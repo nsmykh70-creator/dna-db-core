@@ -1,6 +1,6 @@
 [package]
 name = "dna-db-core"
-version = "3.4.0"
+version = "4.0.0"
 edition = "2021"
 authors = ["DNA-DB Engineering Team"]
 description = "High-performance LSM storage engine with 2-bit DNA packing, dual-strand hot-swap, DnaQL/SQL, TLS, Argon2id auth and encryption at rest"
@@ -29,6 +29,10 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-pki-types = { version = "1", features = ["std"] }
 webpki-roots = "1"
 rcgen = "0.13"
+# Advisory file locks: the server holds one on its data directory for its
+# whole lifetime so `doctor` cannot mutate a live database (and two doctors
+# cannot race each other). Locks are released by the OS on process death.
+fs2 = "0.4"
 
 [patch.crates-io]
 # Kept byte-compatible with reed-solomon-erasure 6.0.0 (WAL/SST parity from
@@ -40,4 +44,7 @@ reed-solomon-erasure = { path = "vendor/reed-solomon-erasure" }
 opt-level = 3
 lto = "thin"
 codegen-units = 1
-panic = "abort"
+# unwind (default) instead of abort: a parser/eval panic must not take the
+# whole multi-tenant server down. Request handlers catch panics at the
+# connection boundary and answer "ERR: internal error" instead.
+panic = "unwind"

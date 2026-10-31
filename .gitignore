@@ -1,22 +1,24 @@
-/target
+# ── Rust ──
+/target/
 **/*.rs.bk
-*.pdb
 
-# runtime data (WAL, segments, repair journal)
-/dna_data
-/bench_tmp
-/panel_demo_data
-/shell_test_data
-/run-*
-*.log
-/security_results.json
-
-# python
+# ── Python ──
 __pycache__/
-*.pyc
+*.py[cod]
+.venv/
+venv/
 
-# editors / OS
+# ── Runtime-артефакты DNA-DB (локальные каталоги данных) ──
+/dna_data/
+/data/
+/*.wal
+
+# ── Релизные бинарники публикуются через GitHub Releases, а не в git ──
+/dist/
+
+# ── ОС и редакторы ──
 .DS_Store
 Thumbs.db
 .idea/
 .vscode/
+*.swp

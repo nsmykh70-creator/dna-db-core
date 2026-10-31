@@ -248,6 +248,7 @@ class Server:
             "--admin-pass", "chaos-pass",
             "--memtable-mb", str(memtable_mb),
             "--sync", "strict",
+            "--no-tls", "--no-encryption",
         ]
         if extra.get("no_scrub"):
             cmd.append("--no-scrub")

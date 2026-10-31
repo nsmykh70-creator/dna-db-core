@@ -44,6 +44,18 @@ pub struct SqlEngine {
     pub engine: Arc<Engine>,
     schemas: RwLock<BTreeMap<String, ChromosomeTable>>,
     pub complement_index: RwLock<ComplementIndex>,
+    /// v3.6: statement-scoped CTE materialisation store. Populated while a
+    /// `WITH ... SELECT` runs, always emptied before the statement returns.
+    cte_store: std::sync::Mutex<std::collections::HashMap<String, Vec<BTreeMap<String, Value>>>>,
+}
+
+/// v3.6 session transaction buffer: DML inside `BEGIN ... COMMIT` is
+/// collected here and applied as ONE atomic `write_batch` on COMMIT
+/// (a single fsync durability interval, mirroring tx.rs semantics).
+#[derive(Default)]
+pub struct SqlTxBuffer {
+    pub ops: Vec<(crate::wal::WalOp, Vec<u8>, Option<Vec<u8>>)>,
+    pub active: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -255,7 +267,7 @@ fn stokenize(input: &str) -> Result<Vec<STok>, String> {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
-pub(crate) enum Stmt {
+pub enum Stmt {
     Select {
         projection: Vec<SelectItem>, // empty = *
         from: String,
@@ -270,6 +282,8 @@ pub(crate) enum Stmt {
     Insert {
         table: String,
         rows: Vec<Vec<(String, Value)>>,
+        /// v3.6: `ON CONFLICT (col) DO NOTHING | DO UPDATE SET ...` (UPSERT).
+        on_conflict: Option<OnConflict>,
     },
     Update {
         table: String,
@@ -305,6 +319,64 @@ pub(crate) enum Stmt {
     /// a SELECT is executed read-only so the plan reflects reality
     /// (only its plan is returned, rows are discarded).
     Explain(Box<Stmt>),
+    /// v3.6: `SELECT ... UNION [ALL] SELECT ...` — compound set operation.
+    /// ORDER BY / LIMIT / OFFSET captured from the right-hand select apply
+    /// to the compound result (standard SQL semantics).
+    Union {
+        left: Box<Stmt>,
+        right: Box<Stmt>,
+        all: bool,
+        order_by: Vec<(String, bool)>,
+        limit: Option<usize>,
+        offset: usize,
+    },
+    /// v3.6: `SHOW TABLES` (alias `SHOW CHROMOSOMES`) — table introspection.
+    ShowTables,
+    /// v3.6: `BEGIN | COMMIT | ROLLBACK` — session transaction control.
+    /// DML inside an active transaction is buffered and applied as ONE
+    /// atomic WAL batch on COMMIT (single fsync durability interval).
+    Tx { action: TxAction },
+    /// v3.6: `WITH name AS (SELECT ...) [, name2 AS (...)] SELECT ...` —
+    /// common table expressions. Each CTE is materialised once into a
+    /// statement-scoped temp store and referenced like a table.
+    Cte {
+        ctes: Vec<(String, Stmt)>,
+        body: Box<Stmt>,
+    },
+    /// v3.9 Online DDL: instant metadata-only `ALTER TABLE t ADD COLUMN c T`
+    /// (no row rewrite; existing rows read the new column as NULL).
+    AddColumn {
+        table: String,
+        column: String,
+        col_type: ColumnType,
+    },
+}
+
+/// v3.6 UPSERT tail of an INSERT statement.
+#[derive(Debug, Clone)]
+pub(crate) enum OnConflict {
+    /// `ON CONFLICT (pk) DO NOTHING` — skip conflicting rows.
+    DoNothing,
+    /// `ON CONFLICT (pk) DO UPDATE SET col = <literal> | EXCLUDED.col`.
+    DoUpdate {
+        assignments: Vec<(String, UpsertValue)>,
+    },
+}
+
+/// Right side of a `DO UPDATE SET` assignment: a literal or the conflicting
+/// row's new value (`EXCLUDED.col`).
+#[derive(Debug, Clone)]
+pub(crate) enum UpsertValue {
+    Literal(Value),
+    Excluded(String),
+}
+
+/// v3.6 session transaction control statements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TxAction {
+    Begin,
+    Commit,
+    Rollback,
 }
 
 /// One item of a SELECT projection: a plain column or an aggregate call,
@@ -330,6 +402,53 @@ pub(crate) enum SelectItem {
         /// Output column name: alias if given, else the rendered expression.
         rendered: String,
     },
+    /// v3.6: scalar subquery in the projection, e.g.
+    /// `(SELECT MAX(total) FROM chr_orders WHERE user_id = id) AS max_order`.
+    /// Correlated references are resolved against the current outer row.
+    ScalarSub {
+        stmt: Box<Stmt>,
+        /// Rendered SQL (plan display + re-execution for uncorrelated subs).
+        canonical: String,
+        /// Output column name (alias, else the canonical rendering).
+        rendered: String,
+    },
+    /// v3.6: window function `ROW_NUMBER() / RANK() / DENSE_RANK() OVER
+    /// (PARTITION BY ... ORDER BY ...)` computed over the filtered row set.
+    Window {
+        func: WindowFunc,
+        partition: Vec<String>,
+        order: Vec<(String, bool)>,
+        /// Canonical rendering used as the internal row key.
+        canonical: String,
+        /// Output column name: alias if given, else the canonical rendering.
+        rendered: String,
+    },
+}
+
+/// v3.6 ranking window functions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowFunc {
+    RowNumber,
+    Rank,
+    DenseRank,
+}
+
+impl WindowFunc {
+    fn name(&self) -> &'static str {
+        match self {
+            WindowFunc::RowNumber => "ROW_NUMBER",
+            WindowFunc::Rank => "RANK",
+            WindowFunc::DenseRank => "DENSE_RANK",
+        }
+    }
+    fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_uppercase().as_str() {
+            "ROW_NUMBER" => Some(WindowFunc::RowNumber),
+            "RANK" => Some(WindowFunc::Rank),
+            "DENSE_RANK" => Some(WindowFunc::DenseRank),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -366,14 +485,57 @@ pub(crate) struct JoinSpec {
 pub(crate) enum JoinType {
     Inner,
     Left,
+    /// v3.6: `RIGHT [OUTER] JOIN` — executed as a left join with the sides
+    /// swapped (identical row semantics, single-namespace row model).
+    Right,
+    /// v3.6: `FULL [OUTER] JOIN` — matched rows plus unmatched rows from
+    /// BOTH sides (right rows padded with NULLs).
+    Full,
+}
+
+impl PartialEq for Stmt {
+    /// Structural equality via canonical debug rendering. Only the compiler
+    /// (through Expr's derived PartialEq) needs this; subquery-heavy
+    /// statements are rarely compared and Debug is a faithful total map.
+    fn eq(&self, other: &Self) -> bool {
+        format!("{:?}", self) == format!("{:?}", other)
+    }
 }
 
 struct SParser {
     toks: Vec<STok>,
     pos: usize,
+    /// Recursion depth of the expression/select parser. The grammar recurses
+    /// once per nested parenthesis (and once per nested subquery), so a
+    /// hostile frame full of '(' would overflow the stack and, with the old
+    /// panic=abort profile, kill the whole server. Both recursion cycles go
+    /// through `parse_or` (expressions) or `parse_select` (subqueries), so
+    /// guarding those two bounds the entire grammar.
+    depth: usize,
 }
 
+/// Maximum nesting accepted by the SQL parser (parenthesised expressions,
+/// nested subqueries, or any mix of both).
+const MAX_PARSE_DEPTH: usize = 128;
+
 impl SParser {
+    /// Enter one recursion level; errors out instead of smashing the stack.
+    fn enter(&mut self) -> Result<(), String> {
+        self.depth += 1;
+        if self.depth > MAX_PARSE_DEPTH {
+            self.depth -= 1;
+            return Err(format!(
+                "SQL: expression nested too deeply (limit {})",
+                MAX_PARSE_DEPTH
+            ));
+        }
+        Ok(())
+    }
+
+    fn leave(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
+    }
+
     fn peek(&self) -> &STok {
         &self.toks[self.pos.min(self.toks.len() - 1)]
     }
@@ -427,6 +589,9 @@ impl SParser {
                     | "inner"
                     | "left"
                     | "right"
+                    | "full"
+                    | "outer"
+                    | "cross"
                     | "where"
                     | "limit"
                     | "offset"
@@ -434,6 +599,7 @@ impl SParser {
                     | "group"
                     | "order"
                     | "union"
+                    | "all"
                     | "having"
             ) {
                 self.next();
@@ -462,6 +628,8 @@ impl SParser {
     fn parse_stmt(&mut self) -> Result<Stmt, String> {
         if self.kw("SELECT") {
             self.parse_select_tail()
+        } else if self.kw("WITH") {
+            self.parse_cte()
         } else if self.kw("INSERT") {
             self.parse_insert()
         } else if self.kw("UPDATE") {
@@ -472,8 +640,48 @@ impl SParser {
             self.parse_create()
         } else if self.kw("DROP") {
             self.parse_drop()
+        } else if self.kw("BEGIN") || self.kw("START") {
+            // START TRANSACTION is the fully standard spelling of BEGIN.
+            if self.kw("TRANSACTION") {
+                self.eat_semi();
+            }
+            Ok(Stmt::Tx { action: TxAction::Begin })
+        } else if self.kw("COMMIT") || self.kw("END") {
+            self.eat_semi();
+            Ok(Stmt::Tx { action: TxAction::Commit })
+        } else if self.kw("ROLLBACK") {
+            self.eat_semi();
+            Ok(Stmt::Tx { action: TxAction::Rollback })
+        } else if self.kw("SHOW") {
+            if self.kw("TABLES") || self.kw("CHROMOSOMES") {
+                self.eat_semi();
+                Ok(Stmt::ShowTables)
+            } else {
+                Err("SQL: unsupported SHOW target (supported: SHOW TABLES / SHOW CHROMOSOMES)".into())
+            }
+        } else if self.kw("ALTER") {
+            self.expect_kw("TABLE")?;
+            let table = self.ident()?;
+            self.expect_kw("ADD")?;
+            self.expect_kw("COLUMN")?;
+            let column = self.ident()?;
+            let col_type = if self.kw("INT") || self.kw("INTEGER") || self.kw("INT64") {
+                ColumnType::Int64
+            } else if self.kw("FLOAT") || self.kw("FLOAT64") || self.kw("DOUBLE") {
+                ColumnType::Float64
+            } else if self.kw("TEXT") || self.kw("VARCHAR") || self.kw("STRING") {
+                ColumnType::Text
+            } else if self.kw("DNA") || self.kw("DNA2BIT") {
+                ColumnType::Dna2Bit
+            } else if self.kw("TIMESTAMP") {
+                ColumnType::Timestamp
+            } else {
+                return Err(format!("SQL: unknown column type for '{}'", column));
+            };
+            self.eat_semi();
+            Ok(Stmt::AddColumn { table, column, col_type })
         } else if self.kw("EXPLAIN") {
-            self.next();
+            // kw() already consumed the EXPLAIN token.
             let inner = self.parse_stmt()?;
             Ok(Stmt::Explain(Box::new(inner)))
         } else {
@@ -484,15 +692,86 @@ impl SParser {
         }
     }
 
+    /// Consume a statement-terminating `;` if present.
+    fn eat_semi(&mut self) {
+        if matches!(self.peek(), STok::Semi) {
+            self.next();
+        }
+    }
+
+    /// `WITH name AS (SELECT ...) [, name2 AS (...)] body` (v3.6).
+    fn parse_cte(&mut self) -> Result<Stmt, String> {
+        self.enter()?;
+        let mut ctes = Vec::new();
+        loop {
+            let name = self.ident()?;
+            self.expect_kw("AS")?;
+            self.expect(STok::LParen)?;
+            if !self.kw("SELECT") {
+                return Err("SQL: CTE body must be a SELECT (WITH name AS (SELECT ...))".into());
+            }
+            let def = self.parse_select_tail()?;
+            self.expect(STok::RParen)?;
+            ctes.push((name, def));
+            if matches!(self.peek(), STok::Comma) {
+                self.next();
+                continue;
+            }
+            break;
+        }
+        let body = self.parse_stmt()?;
+        self.leave();
+        Ok(Stmt::Cte {
+            ctes,
+            body: Box::new(body),
+        })
+    }
+
     /// Body of a SELECT after the SELECT keyword has been consumed.
+    /// v3.6: recognises a trailing `UNION [ALL] SELECT ...` and builds a
+    /// compound statement (chained left-associatively).
     fn parse_select_tail(&mut self) -> Result<Stmt, String> {
         let stmt = self.parse_select()?;
-        // Validate trailing tokens for top-level statements only (sub-selects
-        // are followed by ')' which the caller consumes).
-        Ok(stmt)
+        if !self.kw("UNION") {
+            return Ok(stmt);
+        }
+        let all = self.kw("ALL");
+        // Peek WITHOUT consuming: parse_stmt handles SELECT/WITH itself
+        // (consuming the keyword here swallowed the projection token).
+        let next_is_select = matches!(self.peek(), STok::Ident(s) if s.eq_ignore_ascii_case("SELECT") || s.eq_ignore_ascii_case("WITH"));
+        if !next_is_select {
+            return Err("SQL: expected SELECT after UNION".into());
+        }
+        let right = self.parse_stmt()?;
+        // ORDER BY / LIMIT / OFFSET parsed into the right-hand select belong
+        // to the compound result (standard SQL set-operation semantics).
+        let (order_by, limit, offset) = match &right {
+            Stmt::Select {
+                order_by,
+                limit,
+                offset,
+                ..
+            } => (order_by.clone(), *limit, *offset),
+            _ => (Vec::new(), None, 0),
+        };
+        Ok(Stmt::Union {
+            left: Box::new(stmt),
+            right: Box::new(right),
+            all,
+            order_by,
+            limit,
+            offset,
+        })
     }
 
     fn parse_select(&mut self) -> Result<Stmt, String> {
+        self.enter()?;
+        let result = self.parse_select_inner();
+        self.leave();
+        result
+    }
+
+    fn parse_select_inner(&mut self) -> Result<Stmt, String> {
         let mut projection = Vec::new();
         if matches!(self.peek(), STok::Star) {
             self.next();
@@ -507,8 +786,15 @@ impl SParser {
                 }
             }
         }
-        self.expect_kw("FROM")?;
-        let from = self.ident()?;
+        // v4.0: FROM-less SELECT (`SELECT (SELECT MAX(x) FROM t) AS mx`) —
+        // the canonical way to evaluate scalar expressions / subqueries.
+        // Everything else still requires FROM.
+        let from = if matches!(self.peek(), STok::Ident(s) if s.eq_ignore_ascii_case("FROM")) {
+            self.expect_kw("FROM")?;
+            self.ident()?
+        } else {
+            String::new()
+        };
         self.maybe_alias();
         let mut joins = Vec::new();
         loop {
@@ -516,8 +802,17 @@ impl SParser {
                 self.expect_kw("JOIN")?;
                 JoinType::Inner
             } else if self.kw("LEFT") {
+                self.kw("OUTER");
                 self.expect_kw("JOIN")?;
                 JoinType::Left
+            } else if self.kw("RIGHT") {
+                self.kw("OUTER");
+                self.expect_kw("JOIN")?;
+                JoinType::Right
+            } else if self.kw("FULL") {
+                self.kw("OUTER");
+                self.expect_kw("JOIN")?;
+                JoinType::Full
             } else if self.kw("JOIN") {
                 JoinType::Inner
             } else {
@@ -647,12 +942,87 @@ impl SParser {
         })
     }
 
-    /// One projection item: `*`, a plain column, an aggregate call or an
-    /// arithmetic expression (`total_usd * 2 AS doub`).
+    /// One projection item: `*`, a plain column, an aggregate call, a window
+    /// function, a scalar subquery or an arithmetic expression
+    /// (`total_usd * 2 AS doub`).
     fn parse_select_item(&mut self) -> Result<SelectItem, String> {
         if matches!(self.peek(), STok::Star) {
             self.next();
             return Ok(SelectItem::Star);
+        }
+        // v3.6: scalar subquery `(SELECT ...) [AS alias]`.
+        if matches!(self.peek(), STok::LParen)
+            && matches!(self.peek_at(1), STok::Ident(s) if s.eq_ignore_ascii_case("SELECT"))
+        {
+            self.next(); // (
+            if !self.kw("SELECT") {
+                return Err("SQL: expected SELECT in scalar subquery".into());
+            }
+            let sub = self.parse_select_tail()?;
+            self.expect(STok::RParen)?;
+            let alias = self.maybe_as_alias()?;
+            let canonical = render_select_sql(&sub);
+            let rendered = alias.unwrap_or_else(|| format!("({})", canonical));
+            return Ok(SelectItem::ScalarSub {
+                stmt: Box::new(sub),
+                canonical,
+                rendered,
+            });
+        }
+        // v3.6: window function ROW_NUMBER()/RANK()/DENSE_RANK() OVER (...).
+        if let STok::Ident(s) = self.peek().clone() {
+            if matches!(self.peek_at(1), STok::LParen)
+                && WindowFunc::from_name(&s).is_some()
+            {
+                let func = WindowFunc::from_name(&s).unwrap();
+                self.next();
+                self.next(); // (
+                self.expect(STok::RParen)?;
+                self.expect_kw("OVER")?;
+                self.expect(STok::LParen)?;
+                let mut partition = Vec::new();
+                if self.kw("PARTITION") {
+                    self.expect_kw("BY")?;
+                    loop {
+                        partition.push(self.ident()?);
+                        if matches!(self.peek(), STok::Comma) {
+                            self.next();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                let mut order = Vec::new();
+                if self.kw("ORDER") {
+                    self.expect_kw("BY")?;
+                    loop {
+                        let col = self.ident()?;
+                        let asc = if self.kw("DESC") {
+                            false
+                        } else {
+                            self.kw("ASC");
+                            true
+                        };
+                        order.push((col, asc));
+                        if matches!(self.peek(), STok::Comma) {
+                            self.next();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                self.expect(STok::RParen)?;
+                let alias = self.maybe_as_alias()?;
+                let canonical = render_window(&func, &partition, &order);
+                let rendered = alias.unwrap_or_else(|| canonical.clone());
+                return Ok(SelectItem::Window {
+                    func,
+                    partition,
+                    order,
+                    canonical,
+                    rendered,
+                });
+            }
         }
         // aggregate call: COUNT(*) / SUM(col) — recognised before the general
         // expression path so `COUNT(*)` never parses as multiplication.
@@ -717,12 +1087,17 @@ impl SParser {
                     | "join"
                     | "inner"
                     | "left"
+                    | "right"
+                    | "full"
+                    | "outer"
                     | "on"
                     | "and"
                     | "or"
                     | "asc"
                     | "desc"
                     | "union"
+                    | "all"
+                    | "over"
             ) {
                 return Ok(Some(self.ident()?));
             }
@@ -762,10 +1137,13 @@ impl SParser {
                 rows[0].push((col, v));
             }
             self.expect(STok::RParen)?;
-            if matches!(self.peek(), STok::Semi) {
-                self.next();
-            }
-            return Ok(Stmt::Insert { table, rows });
+            let on_conflict = self.parse_on_conflict_tail()?;
+            self.eat_semi();
+            return Ok(Stmt::Insert {
+                table,
+                rows,
+                on_conflict,
+            });
         }
 
         // Standard positional form
@@ -807,10 +1185,61 @@ impl SParser {
                 break;
             }
         }
-        if matches!(self.peek(), STok::Semi) {
-            self.next();
+        let on_conflict = self.parse_on_conflict_tail()?;
+        self.eat_semi();
+        Ok(Stmt::Insert {
+            table,
+            rows,
+            on_conflict,
+        })
+    }
+
+    /// v3.6 UPSERT tail: `ON CONFLICT (col) DO NOTHING | DO UPDATE SET ...`.
+    fn parse_on_conflict_tail(&mut self) -> Result<Option<OnConflict>, String> {
+        if !self.kw("ON") {
+            return Ok(None);
         }
-        Ok(Stmt::Insert { table, rows })
+        self.expect_kw("CONFLICT")?;
+        self.expect(STok::LParen)?;
+        let _target = self.ident()?; // conflict target column (PK expected)
+        self.expect(STok::RParen)?;
+        self.expect_kw("DO")?;
+        if self.kw("NOTHING") {
+            return Ok(Some(OnConflict::DoNothing));
+        }
+        if !self.kw("UPDATE") {
+            return Err("SQL: expected DO NOTHING or DO UPDATE after ON CONFLICT".into());
+        }
+        self.expect_kw("SET")?;
+        let mut assignments = Vec::new();
+        loop {
+            let col = self.ident()?;
+            match self.next() {
+                STok::Eq => {}
+                t => return Err(format!("SQL: expected '=' in DO UPDATE SET, got {:?}", t)),
+            }
+            // Value: EXCLUDED.col (the row that caused the conflict) or a literal.
+            if let STok::Ident(s) = self.peek().clone() {
+                if s.eq_ignore_ascii_case("EXCLUDED") {
+                    self.next();
+                    self.expect(STok::Dot)?;
+                    let source = self.ident()?;
+                    assignments.push((col, UpsertValue::Excluded(source)));
+                    if matches!(self.peek(), STok::Comma) {
+                        self.next();
+                        continue;
+                    }
+                    break;
+                }
+            }
+            assignments.push((col, UpsertValue::Literal(self.value()?)));
+            if matches!(self.peek(), STok::Comma) {
+                self.next();
+            } else {
+                break;
+            }
+        }
+        Ok(Some(OnConflict::DoUpdate { assignments }))
     }
 
     fn parse_update(&mut self) -> Result<Stmt, String> {
@@ -1023,6 +1452,12 @@ impl SParser {
         self.parse_or()
     }
     fn parse_or(&mut self) -> Result<Expr, String> {
+        self.enter()?;
+        let result = self.parse_or_inner();
+        self.leave();
+        result
+    }
+    fn parse_or_inner(&mut self) -> Result<Expr, String> {
         let mut left = self.parse_and()?;
         while self.kw("OR") {
             let right = self.parse_and()?;
@@ -1039,6 +1474,24 @@ impl SParser {
         Ok(left)
     }
     fn parse_cmp(&mut self) -> Result<Expr, String> {
+        // v3.6: `NOT <predicate>` including `[NOT] EXISTS (SELECT ...)`.
+        if self.kw("NOT") {
+            let inner = self.parse_cmp()?;
+            return Ok(Expr::Not(Box::new(inner)));
+        }
+        if matches!(self.peek(), STok::Ident(s) if s.eq_ignore_ascii_case("EXISTS")) {
+            self.expect_kw("EXISTS")?;
+            self.expect(STok::LParen)?;
+            if !self.kw("SELECT") {
+                return Err("SQL: EXISTS requires a SELECT subquery".into());
+            }
+            let sub = self.parse_select_tail()?;
+            self.expect(STok::RParen)?;
+            return Ok(Expr::Exists {
+                stmt: Box::new(sub),
+                negated: false,
+            });
+        }
         let left = self.parse_operand()?;
         let op = match self.peek() {
             STok::Eq => Some(CmpOp::Eq),
@@ -1189,6 +1642,16 @@ impl SParser {
             }
             STok::LParen => {
                 self.next();
+                // v3.6: scalar subquery `(SELECT ...)` in operand position
+                // (WHERE comparisons, arithmetic, IS NULL checks).
+                if matches!(self.peek(), STok::Ident(s) if s.eq_ignore_ascii_case("SELECT")) {
+                    self.next(); // SELECT (parse_select_tail expects it gone)
+                    let sub = self.parse_select_tail()?;
+                    self.expect(STok::RParen)?;
+                    return Ok(Expr::ScalarSubquery {
+                        stmt: Box::new(sub),
+                    });
+                }
                 let e = self.parse_or()?;
                 match self.next() {
                     STok::RParen => Ok(e),
@@ -1221,7 +1684,11 @@ impl SParser {
 /// This is used by the per-user ACL before execution; it never touches storage.
 pub(crate) fn referenced_tables(sql: &str) -> Result<Vec<String>, String> {
     let toks = stokenize(sql)?;
-    let mut parser = SParser { toks, pos: 0 };
+    let mut parser = SParser {
+        toks,
+        pos: 0,
+        depth: 0,
+    };
     let stmt = parser.parse_stmt()?;
     if parser.peek() != &STok::Eof {
         return Err(format!(
@@ -1251,8 +1718,14 @@ fn collect_stmt_tables(stmt: &Stmt, out: &mut Vec<String>) -> Result<(), String>
                 out.push(join.table.clone());
             }
             for item in projection {
-                if let SelectItem::Computed { expr, .. } = item {
-                    collect_expr_tables(expr, out)?;
+                match item {
+                    SelectItem::Computed { expr, .. } => collect_expr_tables(expr, out)?,
+                    // Scalar subqueries contribute their own tables.
+                    SelectItem::ScalarSub { stmt, .. } => {
+                        collect_stmt_tables(stmt, out)?;
+                    }
+                    SelectItem::Window { .. } => {}
+                    _ => {}
                 }
             }
             if let Some(expr) = where_clause {
@@ -1262,7 +1735,28 @@ fn collect_stmt_tables(stmt: &Stmt, out: &mut Vec<String>) -> Result<(), String>
                 collect_expr_tables(expr, out)?;
             }
         }
-        Stmt::Insert { table, .. } | Stmt::DropTable { table, .. } => out.push(table.clone()),
+        Stmt::Union { left, right, .. } => {
+            collect_stmt_tables(left, out)?;
+            collect_stmt_tables(right, out)?;
+        }
+        Stmt::Cte { ctes, body } => {
+            for (_, def) in ctes {
+                collect_stmt_tables(def, out)?;
+            }
+            collect_stmt_tables(body, out)?;
+        }
+        Stmt::ShowTables | Stmt::Tx { .. } => {}
+        Stmt::AddColumn { table, .. } => out.push(table.clone()),
+        Stmt::Insert { table, rows, on_conflict } => {
+            out.push(table.clone());
+            // Column values are literals; no table refs beyond the target.
+            if let Some(OnConflict::DoUpdate { assignments }) = on_conflict {
+                for (col, val) in assignments {
+                    let _ = (col, val);
+                }
+            }
+        }
+        Stmt::DropTable { table, .. } => out.push(table.clone()),
         Stmt::Update {
             table,
             where_clause,
@@ -1286,11 +1780,118 @@ fn collect_stmt_tables(stmt: &Stmt, out: &mut Vec<String>) -> Result<(), String>
         }
         Stmt::CreateIndex { table, .. } => out.push(table.clone()),
         Stmt::DropIndex { table, .. } => {
-            if let Some(table) = table {
-                out.push(table.clone());
+            // The bare form (`DROP INDEX name`) does not name its table, and
+            // this function must not touch storage to resolve the name — so a
+            // table-restricted user cannot be permission-checked here.
+            // Reject it for the ACL path instead of silently authorising an
+            // index drop on ANY table (the ACL bypass this used to be).
+            // Administrators never reach this code (they skip the ACL), and
+            // everybody else can use the documented ON form.
+            if table.is_none() {
+                return Err(
+                    "SQL: DROP INDEX without ON <table> cannot be permission-checked; \
+                     use DROP INDEX <name> ON <table>"
+                        .to_string(),
+                );
             }
+            out.push(table.clone().unwrap());
         }
         Stmt::Explain(inner) => collect_stmt_tables(inner, out)?,
+    }
+    Ok(())
+}
+
+/// Every column a statement references (WHERE, HAVING, projections,
+/// computed items). Used to distinguish inner columns from correlated
+/// outer references of a subquery.
+fn collect_stmt_columns(stmt: &Stmt, out: &mut Vec<String>) -> Result<(), String> {
+    match stmt {
+        Stmt::Select {
+            projection,
+            where_clause,
+            having,
+            ..
+        } => {
+            for item in projection {
+                match item {
+                    SelectItem::Column { source, .. } => {
+                        if !out.contains(source) {
+                            out.push(source.clone());
+                        }
+                    }
+                    SelectItem::Computed { expr, .. } => {
+                        expr.collect_columns(out);
+                    }
+                    SelectItem::Agg { arg, .. } => {
+                        if let Some(c) = arg {
+                            if !out.contains(c) {
+                                out.push(c.clone());
+                            }
+                        }
+                    }
+                    SelectItem::ScalarSub { stmt, .. } => collect_stmt_columns(stmt, out)?,
+                    SelectItem::Window { partition, order, .. } => {
+                        for c in partition {
+                            if !out.contains(c) {
+                                out.push(c.clone());
+                            }
+                        }
+                        for (c, _) in order {
+                            if !out.contains(c) {
+                                out.push(c.clone());
+                            }
+                        }
+                    }
+                    SelectItem::Star => {}
+                }
+            }
+            if let Some(e) = where_clause {
+                e.collect_columns(out);
+            }
+            if let Some(e) = having {
+                e.collect_columns(out);
+            }
+        }
+        Stmt::Union { left, right, order_by, .. } => {
+            collect_stmt_columns(left, out)?;
+            collect_stmt_columns(right, out)?;
+            for (c, _) in order_by {
+                if !out.contains(c) {
+                    out.push(c.clone());
+                }
+            }
+        }
+        Stmt::Cte { ctes, body } => {
+            for (_, def) in ctes {
+                collect_stmt_columns(def, out)?;
+            }
+            collect_stmt_columns(body, out)?;
+        }
+        Stmt::Update { assignments, where_clause, .. } => {
+            for (c, _) in assignments {
+                if !out.contains(c) {
+                    out.push(c.clone());
+                }
+            }
+            if let Some(e) = where_clause {
+                e.collect_columns(out);
+            }
+        }
+        Stmt::Delete { where_clause, .. } => {
+            if let Some(e) = where_clause {
+                e.collect_columns(out);
+            }
+        }
+        Stmt::Insert { rows, .. } => {
+            for row in rows {
+                for (c, _) in row {
+                    if !out.contains(c) {
+                        out.push(c.clone());
+                    }
+                }
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -1300,6 +1901,9 @@ fn collect_expr_tables(expr: &Expr, out: &mut Vec<String>) -> Result<(), String>
         Expr::InSubquery { query, .. } => {
             let nested = referenced_tables(query)?;
             out.extend(nested);
+        }
+        Expr::ScalarSubquery { stmt } | Expr::Exists { stmt, .. } => {
+            collect_stmt_tables(stmt, out)?;
         }
         Expr::Not(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
             collect_expr_tables(inner, out)?;
@@ -1323,6 +1927,7 @@ impl SqlEngine {
             engine,
             schemas: RwLock::new(BTreeMap::new()),
             complement_index: RwLock::new(ComplementIndex::new()),
+            cte_store: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         if let Err(error) = s.load_schemas_from_disk() {
             eprintln!("[SQL] Could not rebuild persisted schema/index state: {error}");
@@ -1393,7 +1998,7 @@ impl SqlEngine {
     /// ```
     pub fn sql_to_dnaql(&self, sql: &str) -> Result<String, String> {
         let toks = stokenize(sql)?;
-        let mut p = SParser { toks, pos: 0 };
+        let mut p = SParser { toks, pos: 0, depth: 0 };
         let mut out = Vec::new();
         while p.peek() != &STok::Eof {
             let stmt = p.parse_stmt()?;
@@ -1408,6 +2013,19 @@ impl SqlEngine {
     }
 
     pub fn execute(&self, sql: &str) -> Result<QueryResult, String> {
+        let mut tx = None;
+        self.execute_in_tx(sql, &mut tx)
+    }
+
+    /// Execute a statement with an optional session transaction (v3.6).
+    /// `tx` carries the `BEGIN`/`COMMIT`/`ROLLBACK` state across calls:
+    /// while active, DML operations are buffered and applied as one atomic
+    /// WAL batch on COMMIT; ROLLBACK discards them.
+    pub fn execute_in_tx(
+        &self,
+        sql: &str,
+        tx: &mut Option<SqlTxBuffer>,
+    ) -> Result<QueryResult, String> {
         let start = std::time::Instant::now();
         // SHOW HEALTH — engine health snapshot (P5.2), handled before the
         // regular SQL grammar so it works everywhere SQL does.
@@ -1435,8 +2053,29 @@ impl SqlEngine {
                 )),
             });
         }
+        let trimmed_upper = sql.trim_start().to_ascii_uppercase();
+        // SELECT VERSION() — server identity string (v3.6; used by pgwire
+        // clients, DBeaver, psql and the LiveConsole preview).
+        if trimmed_upper == "SELECT VERSION()"
+            || trimmed_upper.starts_with("SELECT VERSION()")
+                && (trimmed_upper.len() == "SELECT VERSION()".len()
+                    || trimmed_upper["SELECT VERSION()".len()..].starts_with(';'))
+        {
+            let mut m = std::collections::BTreeMap::new();
+            m.insert(
+                "version".to_string(),
+                Value::Text(Self::server_version()),
+            );
+            return Ok(QueryResult {
+                columns: vec!["version".to_string()],
+                rows: vec![m],
+                execution_plan: "ScalarEvaluate(VERSION())".to_string(),
+                execution_time_us: start.elapsed().as_micros() as u64,
+                message: None,
+            });
+        }
         let toks = stokenize(sql)?;
-        let mut p = SParser { toks, pos: 0 };
+        let mut p = SParser { toks, pos: 0, depth: 0 };
         let stmt = p.parse_stmt()?;
         if p.peek() != &STok::Eof {
             return Err(format!(
@@ -1444,7 +2083,38 @@ impl SqlEngine {
                 p.peek()
             ));
         }
-        let (columns, rows, plan, message) = match stmt {
+        let (columns, rows, plan, message) = self.exec_stmt(stmt, tx)?;
+        Ok(QueryResult {
+            columns,
+            rows,
+            execution_plan: plan,
+            execution_time_us: start.elapsed().as_micros() as u64,
+            message,
+        })
+    }
+
+    /// Server identity string reported by VERSION() and pgwire.
+    pub fn server_version() -> String {
+        format!(
+            "DNA-DB v{} (Linux x86_64, LSM RS(4+2), pgwire 5432)",
+            env!("CARGO_PKG_VERSION")
+        )
+    }
+
+    fn exec_stmt(
+        &self,
+        stmt: Stmt,
+        tx: &mut Option<SqlTxBuffer>,
+    ) -> Result<
+        (
+            Vec<String>,
+            Vec<BTreeMap<String, Value>>,
+            String,
+            Option<String>,
+        ),
+        String,
+    > {
+        match stmt {
             Stmt::Select {
                 projection,
                 from,
@@ -1465,43 +2135,571 @@ impl SqlEngine {
                 &order_by,
                 limit,
                 offset,
-            )?,
-            Stmt::Insert { table, rows } => self.exec_insert(&table, rows)?,
+            ),
+            Stmt::Union {
+                left,
+                right,
+                all,
+                order_by,
+                limit,
+                offset,
+            } => self.exec_union(*left, *right, all, order_by, limit, offset),
+            Stmt::Cte { ctes, body } => self.exec_cte(ctes, *body, tx),
+            Stmt::ShowTables => self.exec_show_tables(),
+            Stmt::Tx { action } => self.exec_tx(action, tx),
+            Stmt::Insert { table, rows, on_conflict } => {
+                match tx {
+                    Some(buf) if buf.active => {
+                        let mut sink = SqlTxBuffer::default();
+                        let res = self.exec_insert_tx(&table, rows, on_conflict, Some(&mut sink))?;
+                        tx.as_mut().unwrap().ops.extend(sink.ops);
+                        Ok(res)
+                    }
+                    _ => self.exec_insert_tx(&table, rows, on_conflict, None),
+                }
+            }
             Stmt::Update {
                 table,
                 assignments,
                 where_clause,
-            } => self.exec_update(&table, &assignments, where_clause)?,
-            Stmt::Delete {
-                table,
-                where_clause,
-            } => self.exec_delete(&table, where_clause)?,
+            } => {
+                match tx {
+                    Some(buf) if buf.active => {
+                        let mut sink = SqlTxBuffer::default();
+                        let res = self.exec_update_tx(&table, &assignments, where_clause, Some(&mut sink))?;
+                        tx.as_mut().unwrap().ops.extend(sink.ops);
+                        Ok(res)
+                    }
+                    _ => self.exec_update_tx(&table, &assignments, where_clause, None),
+                }
+            }
+            Stmt::Delete { table, where_clause } => {
+                match tx {
+                    Some(buf) if buf.active => {
+                        let mut sink = SqlTxBuffer::default();
+                        let res = self.exec_delete_tx(&table, where_clause, Some(&mut sink))?;
+                        tx.as_mut().unwrap().ops.extend(sink.ops);
+                        Ok(res)
+                    }
+                    _ => self.exec_delete_tx(&table, where_clause, None),
+                }
+            }
             Stmt::CreateTable {
                 table,
                 if_not_exists,
-            } => self.exec_create_table(table, if_not_exists)?,
-            Stmt::DropTable { table, if_exists } => self.exec_drop_table(&table, if_exists)?,
+            } => self.exec_create_table(table, if_not_exists),
+            Stmt::DropTable { table, if_exists } => self.exec_drop_table(&table, if_exists),
             Stmt::CreateIndex {
                 name,
                 table,
                 column,
                 unique,
                 if_not_exists,
-            } => self.exec_create_index(&name, &table, &column, unique, if_not_exists)?,
+            } => self.exec_create_index(&name, &table, &column, unique, if_not_exists),
             Stmt::DropIndex {
                 name,
                 if_exists,
                 table,
-            } => self.exec_drop_index(&name, if_exists, table.as_deref())?,
-            Stmt::Explain(inner) => self.exec_explain(*inner)?,
-        };
-        Ok(QueryResult {
-            columns,
+            } => self.exec_drop_index(&name, if_exists, table.as_deref()),
+            Stmt::AddColumn {
+                table,
+                column,
+                col_type,
+            } => self.exec_add_column(&table, &column, col_type),
+            Stmt::Explain(inner) => self.exec_explain(*inner),
+        }
+    }
+
+    // ---------- SHOW / transactions / CTE ----------
+
+    fn exec_show_tables(
+        &self,
+    ) -> Result<
+        (
+            Vec<String>,
+            Vec<BTreeMap<String, Value>>,
+            String,
+            Option<String>,
+        ),
+        String,
+    > {
+        let schemas = self.schemas.read();
+        let mut rows = Vec::new();
+        for (name, schema) in schemas.iter() {
+            let mut r = BTreeMap::new();
+            r.insert("table_name".to_string(), Value::Text(name.clone()));
+            r.insert(
+                "engine".to_string(),
+                Value::Text("LSM+ReedSolomon RS(4+2)".to_string()),
+            );
+            r.insert(
+                "columns".to_string(),
+                Value::Int(schema.columns.len() as i64),
+            );
+            rows.push(r);
+        }
+        // CTEs are statement-scoped, never listed here.
+        let n = rows.len();
+        Ok((
+            vec!["table_name".into(), "engine".into(), "columns".into()],
             rows,
-            execution_plan: plan,
-            execution_time_us: start.elapsed().as_micros() as u64,
-            message,
+            format!("ShowTables({} table(s))", n),
+            Some(format!("{} table(s)", n)),
+        ))
+    }
+
+    fn exec_tx(
+        &self,
+        action: TxAction,
+        tx: &mut Option<SqlTxBuffer>,
+    ) -> Result<
+        (
+            Vec<String>,
+            Vec<BTreeMap<String, Value>>,
+            String,
+            Option<String>,
+        ),
+        String,
+    > {
+        match action {
+            TxAction::Begin => {
+                if tx.as_ref().map(|t| t.active).unwrap_or(false) {
+                    return Err("SQL: transaction already active (COMMIT or ROLLBACK first)".into());
+                }
+                *tx = Some(SqlTxBuffer {
+                    ops: Vec::new(),
+                    active: true,
+                });
+                Ok((
+                    vec!["status".into()],
+                    vec![mk_row(&[("status", Value::Text("BEGIN".into()))])],
+                    "TxBegin".into(),
+                    Some("transaction started; DML is buffered until COMMIT".into()),
+                ))
+            }
+            TxAction::Commit => {
+                let buf = tx.take();
+                match buf {
+                    Some(buf) if buf.active => {
+                        let n = buf.ops.len();
+                        if n > 0 {
+                            self.engine
+                                .write_batch(&buf.ops)
+                                .map_err(|e| format!("COMMIT failed: {}", e))?;
+                        }
+                        Ok((
+                            vec!["status".into()],
+                            vec![mk_row(&[("status", Value::Text("COMMIT".into()))])],
+                            format!("TxCommit(ops={})", n),
+                            Some(format!(
+                                "{} buffered operation(s) applied in ONE atomic WAL frame",
+                                n
+                            )),
+                        ))
+                    }
+                    _ => Err("SQL: COMMIT without an active transaction".into()),
+                }
+            }
+            TxAction::Rollback => {
+                let buf = tx.take();
+                let n = buf.map(|b| b.ops.len()).unwrap_or(0);
+                Ok((
+                    vec!["status".into()],
+                    vec![mk_row(&[("status", Value::Text("ROLLBACK".into()))])],
+                    format!("TxRollback(discarded={})", n),
+                    Some(format!("{} buffered operation(s) discarded", n)),
+                ))
+            }
+        }
+    }
+
+    fn exec_cte(
+        &self,
+        ctes: Vec<(String, Stmt)>,
+        body: Stmt,
+        tx: &mut Option<SqlTxBuffer>,
+    ) -> Result<
+        (
+            Vec<String>,
+            Vec<BTreeMap<String, Value>>,
+            String,
+            Option<String>,
+        ),
+        String,
+    > {
+        let mut plan = String::from("CTE(");
+        {
+            let mut store = self.cte_store.lock().unwrap();
+            if !store.is_empty() {
+                return Err("SQL: nested WITH statements are not supported".into());
+            }
+        }
+        // Execute each CTE body WITHOUT holding the store lock: statement
+        // execution reads tables through read_table_rows(), which locks the
+        // same store (std Mutex is not reentrant — holding it here used to
+        // deadlock on the very first CTE that touched any table).
+        for (name, def) in &ctes {
+            if self.get_schema(name).is_some() {
+                return Err(format!(
+                    "SQL: CTE name '{}' conflicts with an existing table",
+                    name
+                ));
+            }
+            let (_, rows, _cplan, _) = self.exec_stmt(def.clone(), &mut None)?;
+            let mut store = self.cte_store.lock().unwrap();
+            if store.contains_key(name) {
+                return Err(format!("SQL: duplicate CTE name '{}'", name));
+            }
+            plan.push_str(&format!("{}[{} rows] ", name, rows.len()));
+            store.insert(name.clone(), rows);
+        }
+        plan.push_str(")");
+        let result = self.exec_stmt(body, tx);
+        // Statement-scoped: whatever happens, the CTE data does not outlive it.
+        self.cte_store.lock().unwrap().clear();
+        let (columns, rows, body_plan, message) = result?;
+        plan.push_str(&body_plan);
+        Ok((columns, rows, plan, message))
+    }
+
+    /// v3.6 UNION / UNION ALL executor. Both sides must be SELECT-shaped
+    /// statements with the same number of output columns. `UNION` dedups
+    /// full rows, `UNION ALL` keeps everything. Top-level ORDER BY / LIMIT /
+    /// OFFSET apply to the compound result.
+    fn exec_union(
+        &self,
+        left: Stmt,
+        right: Stmt,
+        all: bool,
+        order_by: Vec<(String, bool)>,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<
+        (
+            Vec<String>,
+            Vec<BTreeMap<String, Value>>,
+            String,
+            Option<String>,
+        ),
+        String,
+    > {
+        let (lcols, mut lrows, lplan, _) = self.exec_select_stmt(&left)?;
+        let (rcols, rrows, rplan, _) = self.exec_select_stmt(&right)?;
+        if lcols.len() != rcols.len() {
+            return Err(format!(
+                "SQL: UNION requires the same number of columns ({} vs {})",
+                lcols.len(),
+                rcols.len()
+            ));
+        }
+        // Standard SQL: output column names come from the FIRST select.
+        // Right rows carry their own names — rename positionally so the
+        // combined result set is homogeneous (UNION of `SELECT username`
+        // and `SELECT status` must not produce mixed column keys).
+        let renamed = rrows
+            .into_iter()
+            .map(|row| {
+                let mut out = std::collections::BTreeMap::new();
+                for (i, v) in row.into_values().enumerate() {
+                    if let Some(name) = lcols.get(i) {
+                        out.insert(name.clone(), v);
+                    }
+                }
+                out
+            })
+            .collect::<Vec<_>>();
+        let _ = rcols;
+        let mut plan = format!(
+            "Union({}) [ {} | {} ]",
+            if all { "ALL" } else { "DISTINCT" },
+            lplan,
+            rplan
+        );
+        lrows.extend(renamed);
+        if !all {
+            // Dedup by the canonical encoding of every field.
+            let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+            lrows.retain(|row| {
+                let mut key = Vec::new();
+                for (k, v) in row.iter() {
+                    key.extend_from_slice(k.as_bytes());
+                    key.push(0);
+                    key.extend_from_slice(&encode_index_value(v));
+                    key.push(0);
+                }
+                seen.insert(key)
+            });
+        }
+        // Top-level ORDER BY / LIMIT / OFFSET.
+        if !order_by.is_empty() {
+            plan.push_str(&format!(
+                " -> Sort({})",
+                order_by
+                    .iter()
+                    .map(|(k, asc)| format!("{} {}", k, if *asc { "ASC" } else { "DESC" }))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            lrows.sort_by(|a, b| {
+                for (key, asc) in &order_by {
+                    let va = a.get(key).cloned().unwrap_or(Value::Null);
+                    let vb = b.get(key).cloned().unwrap_or(Value::Null);
+                    let ord = va.compare(&vb);
+                    if ord != std::cmp::Ordering::Equal {
+                        return if *asc { ord } else { ord.reverse() };
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+        }
+        if offset > 0 {
+            lrows.drain(0..offset.min(lrows.len()));
+        }
+        if let Some(n) = limit {
+            lrows.truncate(n);
+        }
+        let columns: Vec<String> = lrows
+            .first()
+            .map(|r| r.keys().cloned().collect())
+            .unwrap_or_default();
+        let n = lrows.len();
+        Ok((
+            columns,
+            lrows,
+            plan,
+            Some(format!("{} row(s) after UNION {}", n, if all { "ALL" } else { "DISTINCT" })),
+        ))
+    }
+
+    /// Run a SELECT-shaped statement (Select or nested Union/CTE) and return
+    /// its result tuple. Used by UNION and EXPLAIN.
+    fn exec_select_stmt(
+        &self,
+        stmt: &Stmt,
+    ) -> Result<
+        (
+            Vec<String>,
+            Vec<BTreeMap<String, Value>>,
+            String,
+            Option<String>,
+        ),
+        String,
+    > {
+        match stmt {
+            Stmt::Select {
+                projection,
+                from,
+                joins,
+                where_clause,
+                group_by,
+                having,
+                order_by,
+                limit,
+                offset,
+            } => self.exec_select(
+                projection,
+                from,
+                joins,
+                where_clause.clone(),
+                group_by,
+                having.clone(),
+                order_by,
+                *limit,
+                *offset,
+            ),
+            Stmt::Union {
+                left,
+                right,
+                all,
+                order_by,
+                limit,
+                offset,
+            } => self.exec_union(
+                (**left).clone(),
+                (**right).clone(),
+                *all,
+                order_by.clone(),
+                *limit,
+                *offset,
+            ),
+            Stmt::Cte { ctes, body } => {
+                let mut none = None;
+                self.exec_cte(ctes.clone(), (**body).clone(), &mut none)
+            }
+            other => Err(format!(
+                "SQL: expected a SELECT statement, got {}",
+                Self::describe_stmt(other)
+            )),
+        }
+    }
+
+    /// Columns referenced by a (sub)statement that are NOT resolvable from
+    /// its own tables — i.e. correlated references to the outer query.
+    /// A column counts as "own" when it exists in the schema of one of the
+    /// statement's tables; unknown tables (CTEs) treat all their WHERE
+    /// columns as own columns to avoid false correlation.
+    fn stmt_outer_refs(&self, stmt: &Stmt) -> Result<Vec<String>, String> {
+        let mut tables = Vec::new();
+        collect_stmt_tables(stmt, &mut tables)?;
+        let mut own_cols: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for t in &tables {
+            if let Some(schema) = self.get_schema(t) {
+                for c in schema.columns.keys() {
+                    own_cols.insert(c.clone());
+                }
+                own_cols.insert(schema.primary_locus_column.clone());
+            }
+        }
+        let mut refs = Vec::new();
+        collect_stmt_columns(stmt, &mut refs)?;
+        refs.retain(|c| !own_cols.contains(c));
+        refs.sort();
+        refs.dedup();
+        Ok(refs)
+    }
+
+    /// Resolve subquery nodes of `e` for ONE outer row: replace
+    /// ScalarSubquery / Exists / correlated InSubquery with literal values.
+    /// Non-subquery subtrees are evaluated directly (they stay intact).
+    fn resolve_expr_for_row(&self, e: &Expr, row: &BTreeMap<String, Value>) -> Result<Expr, String> {
+        Ok(match e {
+            Expr::ScalarSubquery { stmt } => {
+                match self.eval_scalar_sub_for_row(stmt, row)? {
+                    Some(v) => Expr::Literal(v),
+                    // Empty result → SQL NULL (three-valued logic).
+                    None => Expr::Literal(Value::Null),
+                }
+            }
+            Expr::Exists { stmt, negated } => {
+                let mut sub = (**stmt).clone();
+                self.bind_outer_refs_select(&mut sub, row)?;
+                if let Stmt::Select { limit, .. } = &mut sub {
+                    *limit = Some(1); // EXISTS only needs one row
+                }
+                let sql = render_stmt_sql(&sub);
+                let res = self.execute(&sql)?;
+                let exists = !res.rows.is_empty();
+                Expr::Literal(Value::Int((exists != *negated) as i64))
+            }
+            Expr::InSubquery { column, query } => {
+                // Re-parse the rendered subquery; correlated references are
+                // bound to this row, then the result materialises to an IN list.
+                let toks = stokenize(query)?;
+                let mut p = SParser { toks, pos: 0, depth: 0 };
+                let sub = p.parse_stmt()?;
+                let mut sub = sub;
+                self.bind_outer_refs_select(&mut sub, row)?;
+                let sql = render_stmt_sql(&sub);
+                let res = self.execute(&sql)?;
+                let col = res
+                    .columns
+                    .first()
+                    .cloned()
+                    .ok_or_else(|| "SQL: IN subquery returned no columns".to_string())?;
+                let values: Vec<Value> = res
+                    .rows
+                    .iter()
+                    .filter_map(|r| r.get(&col).cloned())
+                    .collect();
+                Expr::InList {
+                    column: column.clone(),
+                    values,
+                }
+            }
+            Expr::Not(inner) => Expr::Not(Box::new(self.resolve_expr_for_row(inner, row)?)),
+            Expr::IsNull(inner) => {
+                Expr::IsNull(Box::new(self.resolve_expr_for_row(inner, row)?))
+            }
+            Expr::IsNotNull(inner) => {
+                Expr::IsNotNull(Box::new(self.resolve_expr_for_row(inner, row)?))
+            }
+            Expr::And(a, b) => Expr::And(
+                Box::new(self.resolve_expr_for_row(a, row)?),
+                Box::new(self.resolve_expr_for_row(b, row)?),
+            ),
+            Expr::Or(a, b) => Expr::Or(
+                Box::new(self.resolve_expr_for_row(a, row)?),
+                Box::new(self.resolve_expr_for_row(b, row)?),
+            ),
+            Expr::Cmp { op, left, right } => Expr::Cmp {
+                op: *op,
+                left: Box::new(self.resolve_expr_for_row(left, row)?),
+                right: Box::new(self.resolve_expr_for_row(right, row)?),
+            },
+            Expr::Arith { op, left, right } => Expr::Arith {
+                op: *op,
+                left: Box::new(self.resolve_expr_for_row(left, row)?),
+                right: Box::new(self.resolve_expr_for_row(right, row)?),
+            },
+            Expr::Literal(_) | Expr::Column(_) | Expr::InList { .. } => e.clone(),
         })
+    }
+
+    /// Rewrite a statement's WHERE (and projection scalar subs) binding every
+    /// correlated column reference to the current outer row's value.
+    fn bind_outer_refs_select(
+        &self,
+        stmt: &mut Stmt,
+        row: &BTreeMap<String, Value>,
+    ) -> Result<(), String> {
+        let refs = self.stmt_outer_refs(stmt)?;
+        if refs.is_empty() {
+            return Ok(());
+        }
+        let Stmt::Select { where_clause, .. } = stmt else {
+            return Err("SQL: correlated subquery must be a SELECT".into());
+        };
+        fn rewrite(e: &Expr, row: &BTreeMap<String, Value>, refs: &[String]) -> Expr {
+            match e {
+                Expr::Column(c) if refs.contains(c) => {
+                    Expr::Literal(row.get(c).cloned().unwrap_or(Value::Null))
+                }
+                Expr::Not(inner) => Expr::Not(Box::new(rewrite(inner, row, refs))),
+                Expr::IsNull(inner) => Expr::IsNull(Box::new(rewrite(inner, row, refs))),
+                Expr::IsNotNull(inner) => Expr::IsNotNull(Box::new(rewrite(inner, row, refs))),
+                Expr::And(a, b) => {
+                    Expr::And(Box::new(rewrite(a, row, refs)), Box::new(rewrite(b, row, refs)))
+                }
+                Expr::Or(a, b) => {
+                    Expr::Or(Box::new(rewrite(a, row, refs)), Box::new(rewrite(b, row, refs)))
+                }
+                Expr::Cmp { op, left, right } => Expr::Cmp {
+                    op: *op,
+                    left: Box::new(rewrite(left, row, refs)),
+                    right: Box::new(rewrite(right, row, refs)),
+                },
+                Expr::Arith { op, left, right } => Expr::Arith {
+                    op: *op,
+                    left: Box::new(rewrite(left, row, refs)),
+                    right: Box::new(rewrite(right, row, refs)),
+                },
+                other => other.clone(),
+            }
+        }
+        if let Some(w) = where_clause {
+            *w = rewrite(w, row, &refs);
+        }
+        Ok(())
+    }
+
+    /// Execute a scalar subquery for one outer row and return its first
+    /// column value (None when the subquery produced no rows → SQL NULL).
+    fn eval_scalar_sub_for_row(
+        &self,
+        stmt: &Stmt,
+        row: &BTreeMap<String, Value>,
+    ) -> Result<Option<Value>, String> {
+        let mut sub = stmt.clone();
+        self.bind_outer_refs_select(&mut sub, row)?;
+        if let Stmt::Select { limit, .. } = &mut sub {
+            *limit = Some(1);
+        }
+        let sql = render_stmt_sql(&sub);
+        let res = self.execute(&sql)?;
+        Ok(res
+            .rows
+            .first()
+            .and_then(|r| r.values().next().cloned()))
     }
 
     // ---------- EXPLAIN ----------
@@ -1555,6 +2753,21 @@ impl SqlEngine {
                     )),
                 ))
             }
+            // v3.6: compound/CTE selects also run read-only so their plan is
+            // the real one.
+            Stmt::Union { .. } | Stmt::Cte { .. } => {
+                let (_, rows, plan, _) = self.exec_select_stmt(&inner)?;
+                let n = rows.len();
+                Ok((
+                    vec!["plan".into()],
+                    vec![mk_row(&[("plan", Value::Text(plan.clone()))])],
+                    format!("Explain(Select rows={})", n),
+                    Some(format!(
+                        "{} row(s); the SELECT ran read-only so the plan is real, rows discarded",
+                        n
+                    )),
+                ))
+            }
             other => {
                 let desc = Self::describe_stmt(&other);
                 Ok((
@@ -1572,7 +2785,7 @@ impl SqlEngine {
     fn describe_stmt(stmt: &Stmt) -> String {
         match stmt {
             Stmt::Select { from, .. } => format!("Select(FROM {})", from),
-            Stmt::Insert { table, rows } => {
+            Stmt::Insert { table, rows, on_conflict: _ } => {
                 format!("Insert({}, {} row(s))", table, rows.len())
             }
             Stmt::Update {
@@ -1640,6 +2853,23 @@ impl SqlEngine {
                     .map(|t| format!(" ON {}", t))
                     .unwrap_or_default()
             ),
+            Stmt::Union { left, right, all, .. } => format!(
+                "Union({}) {} UNION{} {}",
+                if *all { "ALL" } else { "DISTINCT" },
+                Self::describe_stmt(left),
+                if *all { " ALL" } else { "" },
+                Self::describe_stmt(right)
+            ),
+            Stmt::ShowTables => "ShowTables()".into(),
+            Stmt::AddColumn { table, column, .. } => {
+                format!("AlterTable({} ADD COLUMN {})", table, column)
+            }
+            Stmt::Tx { action } => format!("Tx({:?})", action),
+            Stmt::Cte { ctes, body } => format!(
+                "CTE({}) {}",
+                ctes.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>().join(", "),
+                Self::describe_stmt(body)
+            ),
             Stmt::Explain(_) => "Explain(...)".into(),
         }
     }
@@ -1651,6 +2881,10 @@ impl SqlEngine {
     }
 
     fn read_table_rows(&self, table: &str) -> Result<Vec<BTreeMap<String, Value>>, String> {
+        // v3.6: statement-scoped CTE tables take precedence over disk.
+        if let Some(rows) = self.cte_store.lock().unwrap().get(table) {
+            return Ok(rows.clone());
+        }
         let prefix = format!("{}:", table);
         let raw = self
             .engine
@@ -2026,6 +3260,54 @@ impl SqlEngine {
         Ok(())
     }
 
+    /// v3.9 Online DDL: `ALTER TABLE t ADD COLUMN c T` — metadata-only and
+    /// instant: the schema row is rewritten (one WAL batch), no existing
+    /// row is touched, reads of the new column on old rows yield NULL.
+    fn exec_add_column(
+        &self,
+        table: &str,
+        column: &str,
+        col_type: ColumnType,
+    ) -> Result<
+        (
+            Vec<String>,
+            Vec<BTreeMap<String, Value>>,
+            String,
+            Option<String>,
+        ),
+        String,
+    > {
+        let mut schema = self
+            .get_schema(table)
+            .ok_or_else(|| format!("SQL: relation '{}' does not exist", table))?;
+        if schema.columns.contains_key(column) {
+            return Err(format!(
+                "SQL: column '{}' already exists in table '{}'",
+                column, table
+            ));
+        }
+        schema.add_column(column.to_string(), col_type);
+        let start = std::time::Instant::now();
+        self.persist_schema(&schema)?;
+        let us = start.elapsed().as_micros() as u64;
+        Ok((
+            vec!["status".into(), "table".into(), "column".into()],
+            vec![mk_row(&[
+                ("status", Value::Text("OK".into())),
+                ("table", Value::Text(table.to_string())),
+                ("column", Value::Text(column.to_string())),
+            ])],
+            format!(
+                "AlterTable({}, instant metadata-only, {} µs, no row rewrite)",
+                table, us
+            ),
+            Some(format!(
+                "column '{}' added to '{}' without blocking reads or writes",
+                column, table
+            )),
+        ))
+    }
+
     /// Enforce every UNIQUE secondary index of `table` for the row `new`
     /// (full row map + its row key). `old_key`, when present, is the key of
     /// the row being replaced: its own current index entries don't count as
@@ -2189,10 +3471,12 @@ impl SqlEngine {
         ))
     }
 
-    fn exec_insert(
+    fn exec_insert_tx(
         &self,
         table: &str,
         rows: Vec<Vec<(String, Value)>>,
+        on_conflict: Option<OnConflict>,
+        mut sink: Option<&mut SqlTxBuffer>,
     ) -> Result<
         (
             Vec<String>,
@@ -2230,6 +3514,8 @@ impl SqlEngine {
 
         let mut batch = Vec::new();
         let mut inserted_keys = Vec::new();
+        let mut skipped_conflicts = 0usize;
+        let mut upserted = 0usize;
         let mut seen_keys = std::collections::HashSet::new();
         // UNIQUE indexes: (column, encoded value) -> owning row key, so two
         // rows of one multi-row INSERT cannot slip the same value past us.
@@ -2240,7 +3526,14 @@ impl SqlEngine {
             let pk = Self::pk_of(&schema, &map)?;
             let key = Self::row_key(table, &pk);
             if !seen_keys.insert(key.clone()) {
-                return Err(format!("duplicate primary key in INSERT: {}", key));
+                // v3.6: same statement hit the same PK — ON CONFLICT applies.
+                match on_conflict {
+                    Some(OnConflict::DoNothing) => {
+                        skipped_conflicts += 1;
+                        continue;
+                    }
+                    _ => return Err(format!("duplicate primary key in INSERT: {}", key)),
+                }
             }
             if self
                 .engine
@@ -2248,7 +3541,66 @@ impl SqlEngine {
                 .map_err(|error| error.to_string())?
                 .is_some()
             {
-                return Err(format!("duplicate primary key in INSERT: {}", key));
+                // v3.6: existing row + ON CONFLICT → UPSERT / skip.
+                match &on_conflict {
+                    Some(OnConflict::DoNothing) => {
+                        skipped_conflicts += 1;
+                        continue;
+                    }
+                    Some(OnConflict::DoUpdate { assignments }) => {
+                        let raw = self
+                            .engine
+                            .get(key.as_bytes())
+                            .map_err(|error| error.to_string())?
+                            .expect("row existence checked above");
+                        let mut existing: BTreeMap<String, Value> =
+                            RowCodec::decode(&raw)
+                                .map_err(|e| format!("row {} unreadable: {}", key, e))?
+                                .into_iter()
+                                .collect();
+                        for (col, val) in assignments {
+                            let v = match val {
+                                UpsertValue::Literal(v) => v.clone(),
+                                UpsertValue::Excluded(source) => map
+                                    .get(source)
+                                    .cloned()
+                                    .ok_or_else(|| {
+                                        format!(
+                                            "SQL: EXCLUDED.{} not present in the conflicting row",
+                                            source
+                                        )
+                                    })?,
+                            };
+                            existing.insert(col.clone(), v);
+                        }
+                        // PK must not change via DO UPDATE SET.
+                        let new_pk = Self::pk_of(&schema, &existing)?;
+                        if Self::row_key(table, &new_pk) != key {
+                            return Err(
+                                "SQL: ON CONFLICT DO UPDATE SET cannot change the primary key".into()
+                            );
+                        }
+                        let payload = RowCodec::encode(
+                            &existing
+                                .iter()
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect::<Vec<_>>(),
+                        );
+                        batch.extend(Self::index_delta_batch(
+                            &schema,
+                            None,
+                            Some((table, &existing)),
+                        ));
+                        batch.push((
+                            crate::wal::WalOp::Put,
+                            key.clone().into_bytes(),
+                            Some(payload),
+                        ));
+                        upserted += 1;
+                        continue;
+                    }
+                    None => return Err(format!("duplicate primary key in INSERT: {}", key)),
+                }
             }
             // UNIQUE index enforcement — also covers duplicates between rows
             // of this same statement (via stmt_unique) and against rows that
@@ -2299,9 +3651,13 @@ impl SqlEngine {
             inserted_keys.push((key, map, pk));
         }
 
-        self.engine
-            .write_batch(&batch)
-            .map_err(|e| format!("insert failed: {}", e))?;
+        if let Some(buf) = sink.as_deref_mut() {
+            buf.ops.extend(batch);
+        } else {
+            self.engine
+                .write_batch(&batch)
+                .map_err(|e| format!("insert failed: {}", e))?;
+        }
 
         // maintain complement index
         {
@@ -2324,19 +3680,32 @@ impl SqlEngine {
             out_rows.push(r);
         }
 
+        let msg = match (upserted, skipped_conflicts) {
+            (0, 0) => format!("{} row(s) inserted", n),
+            (u, s) => format!(
+                "{} row(s) inserted, {} upserted, {} skipped (ON CONFLICT)",
+                n, u, s
+            ),
+        };
         Ok((
             vec!["inserted_key".into(), "pk".into()],
             out_rows,
-            format!("BatchInsert({}) rows={} via single WAL frame", table, n),
-            Some(format!("{} row(s) inserted", n)),
+            format!(
+                "BatchInsert({}) rows={} via single WAL frame{}",
+                table,
+                n + upserted,
+                if on_conflict.is_some() { " + UPSERT" } else { "" }
+            ),
+            Some(msg),
         ))
     }
 
-    fn exec_update(
+    fn exec_update_tx(
         &self,
         table: &str,
         assignments: &[(String, Value)],
         where_clause: Option<Expr>,
+        mut sink: Option<&mut SqlTxBuffer>,
     ) -> Result<
         (
             Vec<String>,
@@ -2477,9 +3846,13 @@ impl SqlEngine {
                 Some(payload),
             ));
         }
-        self.engine
-            .write_batch(&batch)
-            .map_err(|e| format!("update failed: {}", e))?;
+        if let Some(buf) = sink.as_deref_mut() {
+            buf.ops.extend(batch);
+        } else {
+            self.engine
+                .write_batch(&batch)
+                .map_err(|e| format!("update failed: {}", e))?;
+        }
 
         {
             let mut index = self.complement_index.write();
@@ -2526,10 +3899,11 @@ impl SqlEngine {
         ))
     }
 
-    fn exec_delete(
+    fn exec_delete_tx(
         &self,
         table: &str,
         where_clause: Option<Expr>,
+        mut sink: Option<&mut SqlTxBuffer>,
     ) -> Result<
         (
             Vec<String>,
@@ -2651,9 +4025,13 @@ impl SqlEngine {
                 let _ = key;
             }
         }
-        self.engine
-            .write_batch(&batch)
-            .map_err(|e| format!("delete failed: {}", e))?;
+        if let Some(buf) = sink.as_deref_mut() {
+            buf.ops.extend(batch);
+        } else {
+            self.engine
+                .write_batch(&batch)
+                .map_err(|e| format!("delete failed: {}", e))?;
+        }
 
         {
             let mut index = self.complement_index.write();
@@ -2708,11 +4086,34 @@ impl SqlEngine {
         ),
         String,
     > {
+        // v4.0: unknown FROM/JOIN tables are a hard error (SQL semantics:
+        // PostgreSQL answers 42P01 undefined_table). CTE tables count as
+        // existing while their WITH statement runs. FROM-less SELECTs
+        // evaluate a single empty row.
+        if !from.is_empty()
+            && self.get_schema(from).is_none()
+            && !self.cte_contains(from)
+        {
+            return Err(format!("SQL: relation '{}' does not exist (CREATE TABLE first)", from));
+        }
+        for j in joins {
+            if self.get_schema(&j.table).is_none() && !self.cte_contains(&j.table) {
+                return Err(format!(
+                    "SQL: relation '{}' does not exist (CREATE TABLE first)",
+                    j.table
+                ));
+            }
+        }
         // Materialise IN-subqueries before any planning.
         let where_clause = self.materialize_subqueries(where_clause)?;
         // FROM — candidates via point lookup / secondary index / seq scan.
-        let (mut current, scan_op) = self.fetch_candidates(from, where_clause.as_ref())?;
-        let mut plan = scan_op;
+        // A FROM-less SELECT sources exactly one (empty) row.
+        let (mut current, mut plan) = if from.is_empty() {
+            (vec![BTreeMap::new()], "ScalarEvaluate()".to_string())
+        } else {
+            let (rows, op) = self.fetch_candidates(from, where_clause.as_ref())?;
+            (rows, op)
+        };
 
         // JOINs (hash join on equi-condition; O(n+m) build+probe)
         for j in joins {
@@ -2720,13 +4121,24 @@ impl SqlEngine {
             let next = match j.join_type {
                 JoinType::Inner => hash_join(&current, &right, &j.left_col, &j.right_col),
                 JoinType::Left => hash_join_left(&current, &right, &j.left_col, &j.right_col),
+                // RIGHT JOIN == LEFT JOIN with the sides swapped (the row
+                // model is single-namespace, so column naming is unchanged).
+                JoinType::Right => {
+                    hash_join_left(&right, &current, &j.right_col, &j.left_col)
+                }
+                // FULL OUTER JOIN: left join + every right row that never
+                // matched, padded with NULLs on the left columns.
+                JoinType::Full => {
+                    hash_join_full(&current, &right, &j.left_col, &j.right_col)
+                }
             };
             plan.push_str(&format!(
                 " -> {}HashJoin({}.{}, {}.{})",
-                if j.join_type == JoinType::Left {
-                    "Left"
-                } else {
-                    "Inner"
+                match j.join_type {
+                    JoinType::Left => "Left",
+                    JoinType::Right => "Right",
+                    JoinType::Full => "Full",
+                    JoinType::Inner => "Inner",
                 },
                 from,
                 j.left_col,
@@ -2736,10 +4148,82 @@ impl SqlEngine {
             current = next;
         }
 
-        // WHERE
+        // WHERE (with per-row resolution of correlated subqueries, v3.6)
         if let Some(e) = &where_clause {
             plan.push_str(&format!(" -> Filter({})", e.describe()));
-            current.retain(|r| e.eval_bool(r));
+            if expr_has_subquery(e) {
+                let mut kept = Vec::with_capacity(current.len());
+                for row in current.drain(..) {
+                    let resolved = self.resolve_expr_for_row(e, &row)?;
+                    if resolved.eval_bool(&row) {
+                        kept.push(row);
+                    }
+                }
+                current = kept;
+            } else {
+                current.retain(|r| e.eval_bool(r));
+            }
+        }
+
+        // Window functions (v3.6): computed over the filtered row set, before
+        // projection and ORDER BY. Not combinable with GROUP BY/aggregates.
+        let window_items: Vec<&SelectItem> = projection
+            .iter()
+            .filter(|p| matches!(p, SelectItem::Window { .. }))
+            .collect();
+        if !window_items.is_empty() {
+            if !collect_agg_items(projection, having.as_ref()).is_empty()
+                || !group_by.is_empty()
+                || having.is_some()
+            {
+                return Err(
+                    "SQL: window functions cannot be combined with GROUP BY/aggregates".into(),
+                );
+            }
+            for item in &window_items {
+                if let SelectItem::Window {
+                    func,
+                    partition,
+                    order,
+                    canonical,
+                    ..
+                } = item
+                {
+                    compute_window(current.as_mut_slice(), *func, partition, order, canonical);
+                    plan.push_str(&format!(" -> Window({})", canonical));
+                }
+            }
+        }
+
+        // Scalar subqueries in the projection (v3.6): uncorrelated ones run
+        // once; correlated ones are re-resolved per output row.
+        let scalar_subs: Vec<(&String, &Stmt)> = projection
+            .iter()
+            .filter_map(|p| match p {
+                SelectItem::ScalarSub { stmt, canonical, .. } => Some((canonical, stmt.as_ref())),
+                _ => None,
+            })
+            .collect();
+        for (canonical, sub) in &scalar_subs {
+            let outer_refs = self.stmt_outer_refs(sub)?;
+            if outer_refs.is_empty() {
+                let rendered_sql = render_stmt_sql(sub);
+                let sub_res = self.execute(&rendered_sql)?;
+                let value = sub_res
+                    .rows
+                    .first()
+                    .and_then(|r| r.values().next().cloned())
+                    .unwrap_or(Value::Null);
+                for row in current.iter_mut() {
+                    row.insert(canonical.as_str().to_string(), value.clone());
+                }
+                plan.push_str(&format!(" -> ScalarSub(once: {})", canonical));
+            }
+        }
+        if scalar_subs.iter().any(|(_, s)| {
+            self.stmt_outer_refs(s).map(|r| !r.is_empty()).unwrap_or(false)
+        }) {
+            plan.push_str(" -> ScalarSub(per-row)");
         }
 
         // Aggregation (GROUP BY / HAVING / aggregate projections).
@@ -2806,6 +4290,20 @@ impl SqlEngine {
                 let mut columns: Vec<(String, String)> = Vec::new();
                 let mut computed: Vec<(String, Expr)> = Vec::new();
                 let mut specs: Vec<String> = Vec::new();
+                // v3.6: window + scalar-sub items expose their precomputed
+                // canonical key; correlated scalar subs evaluate per row.
+                let correlated: Vec<(String, String, &Stmt)> = projection
+                    .iter()
+                    .filter_map(|p| match p {
+                        SelectItem::ScalarSub { stmt, canonical, rendered } => {
+                            Some((canonical.clone(), rendered.clone(), stmt.as_ref()))
+                        }
+                        _ => None,
+                    })
+                    .filter(|(_, _, s)| {
+                        self.stmt_outer_refs(s).map(|r| !r.is_empty()).unwrap_or(false)
+                    })
+                    .collect();
                 for item in projection {
                     match item {
                         SelectItem::Column { source, alias } => {
@@ -2816,6 +4314,14 @@ impl SqlEngine {
                                 format!("{} AS {}", source, out)
                             });
                             columns.push((source.clone(), out));
+                        }
+                        SelectItem::ScalarSub { canonical, rendered, .. } => {
+                            specs.push(format!("{} AS {}", canonical, rendered));
+                            columns.push((canonical.clone(), rendered.clone()));
+                        }
+                        SelectItem::Window { canonical, rendered, .. } => {
+                            specs.push(format!("{} AS {}", canonical, rendered));
+                            columns.push((canonical.clone(), rendered.clone()));
                         }
                         SelectItem::Computed { expr, rendered } => {
                             specs.push(format!("{} AS {}", expr.describe(), rendered));
@@ -2840,22 +4346,29 @@ impl SqlEngine {
                     }
                 }
                 plan.push_str(&format!(" -> Project({:?})", specs));
-                current = current
-                    .into_iter()
-                    .map(|r| {
-                        let mut out = BTreeMap::new();
-                        for (src, out_name) in &columns {
-                            if let Some(v) = r.get(src) {
-                                out.insert(out_name.clone(), v.clone());
-                            }
+                let mut evaluated: Vec<BTreeMap<String, Value>> = Vec::with_capacity(current.len());
+                for r in current.into_iter() {
+                    let mut out = BTreeMap::new();
+                    for (src, out_name) in &columns {
+                        if let Some(v) = r.get(src) {
+                            out.insert(out_name.clone(), v.clone());
                         }
-                        for (out_name, expr) in &computed {
-                            let v = expr.eval(&r).unwrap_or(Value::Null);
+                    }
+                    for (out_name, expr) in &computed {
+                        let v = expr.eval(&r).unwrap_or(Value::Null);
+                        out.insert(out_name.clone(), v);
+                    }
+                    // Correlated scalar subqueries run against THIS row.
+                    for (canonical, out_name, sub) in &correlated {
+                        if let Some(v) = self.eval_scalar_sub_for_row(sub, &r)? {
                             out.insert(out_name.clone(), v);
+                        } else {
+                            let _ = canonical;
                         }
-                        out
-                    })
-                    .collect();
+                    }
+                    evaluated.push(out);
+                }
+                current = evaluated;
             }
         }
 
@@ -2881,6 +4394,11 @@ impl SqlEngine {
                             }
                         }
                         SelectItem::Computed { rendered, .. } => {
+                            if !keep.contains(rendered) {
+                                keep.push(rendered.clone());
+                            }
+                        }
+                        SelectItem::Window { rendered, .. } | SelectItem::ScalarSub { rendered, .. } => {
                             if !keep.contains(rendered) {
                                 keep.push(rendered.clone());
                             }
@@ -2920,6 +4438,11 @@ impl SqlEngine {
             .map(|r| r.keys().cloned().collect())
             .unwrap_or_default();
         Ok((columns, current, plan, None))
+    }
+
+    /// v3.6: is `name` a live CTE of the statement currently running?
+    fn cte_contains(&self, name: &str) -> bool {
+        self.cte_store.lock().unwrap().contains_key(name)
     }
 
     /// Candidate rows for a FROM table: PK point lookup > secondary index
@@ -3043,18 +4566,28 @@ impl SqlEngine {
         }
     }
 
-    /// Replace IN-subquery nodes with materialised IN-lists.
+    /// Replace IN-subquery nodes with materialised IN-lists; resolve
+    /// uncorrelated scalar subqueries / EXISTS to literals (v3.6). Correlated
+    /// nodes stay in place and are resolved per row by the executor.
     fn materialize_subqueries(&self, expr: Option<Expr>) -> Result<Option<Expr>, String> {
         fn walk(sql: &SqlEngine, e: &Expr) -> Result<Expr, String> {
             match e {
                 Expr::InSubquery { column, query } => {
-                    let sub = sql.execute(query)?;
-                    let col = sub
+                    // Correlated? Render and re-parse the subquery, then ask
+                    // for outer references. Correlated nodes resolve per row.
+                    let toks = stokenize(query)?;
+                    let mut p = SParser { toks, pos: 0, depth: 0 };
+                    let sub = p.parse_stmt()?;
+                    if !sql.stmt_outer_refs(&sub)?.is_empty() {
+                        return Ok(e.clone());
+                    }
+                    let sub_res = sql.execute(query)?;
+                    let col = sub_res
                         .columns
                         .first()
                         .cloned()
                         .ok_or_else(|| "SQL: IN subquery returned no columns".to_string())?;
-                    let values: Vec<Value> = sub
+                    let values: Vec<Value> = sub_res
                         .rows
                         .iter()
                         .filter_map(|r| r.get(&col).cloned())
@@ -3063,6 +4596,31 @@ impl SqlEngine {
                         column: column.clone(),
                         values,
                     })
+                }
+                Expr::ScalarSubquery { stmt } => {
+                    if !sql.stmt_outer_refs(stmt)?.is_empty() {
+                        return Ok(e.clone()); // per-row resolution
+                    }
+                    let rendered = render_stmt_sql(stmt);
+                    let sub_res = sql.execute(&rendered)?;
+                    let value = sub_res
+                        .rows
+                        .first()
+                        .and_then(|r| r.values().next().cloned())
+                        .unwrap_or(Value::Null);
+                    Ok(Expr::Literal(value))
+                }
+                Expr::Exists { stmt, negated } => {
+                    if !sql.stmt_outer_refs(stmt)?.is_empty() {
+                        return Ok(e.clone()); // per-row resolution
+                    }
+                    let mut sub = (**stmt).clone();
+                    if let Stmt::Select { limit, .. } = &mut sub {
+                        *limit = Some(1);
+                    }
+                    let res = sql.execute(&render_stmt_sql(&sub))?;
+                    let exists = !res.rows.is_empty();
+                    Ok(Expr::Literal(Value::Int((exists != *negated) as i64)))
                 }
                 Expr::InList { .. } | Expr::Literal(_) | Expr::Column(_) => Ok(e.clone()),
                 Expr::Not(inner) => Ok(Expr::Not(Box::new(walk(sql, inner)?))),
@@ -3572,6 +5130,27 @@ fn expr_to_sql(e: &Expr) -> String {
     fn quote(s: &str) -> String {
         format!("'{}'", s.replace('\'', "''"))
     }
+    // Arithmetic precedence: Add/Sub bind looser than Mul/Div. A child
+    // arithmetic node whose precedence is <= the parent's must be
+    // parenthesised, otherwise `a * (b + c)` rendered as `a * b + c`
+    // re-parses (and re-executes) to a DIFFERENT result — the silently
+    // wrong subquery results this renderer used to produce.
+    fn arith_prec(op: &ArithOp) -> u8 {
+        match op {
+            ArithOp::Add | ArithOp::Sub => 1,
+            ArithOp::Mul | ArithOp::Div => 2,
+        }
+    }
+    fn render_arith(op: &ArithOp, left: &Expr, right: &Expr) -> String {
+        let prec = arith_prec(op);
+        let side = |e: &Expr| match e {
+            Expr::Arith { op: child, .. } if arith_prec(child) <= prec => {
+                format!("({})", expr_to_sql(e))
+            }
+            other => expr_to_sql(other),
+        };
+        format!("{} {} {}", side(left), op.as_str(), side(right))
+    }
     match e {
         Expr::Literal(Value::Text(s)) | Expr::Literal(Value::Dna(s)) => quote(s),
         Expr::Literal(v) => v.to_string(),
@@ -3581,14 +5160,7 @@ fn expr_to_sql(e: &Expr) -> String {
         Expr::Or(a, b) => format!("({} OR {})", expr_to_sql(a), expr_to_sql(b)),
         Expr::IsNull(inner) => format!("{} IS NULL", expr_to_sql(inner)),
         Expr::IsNotNull(inner) => format!("{} IS NOT NULL", expr_to_sql(inner)),
-        Expr::Arith { op, left, right } => {
-            format!(
-                "{} {} {}",
-                expr_to_sql(left),
-                op.as_str(),
-                expr_to_sql(right)
-            )
-        }
+        Expr::Arith { op, left, right } => render_arith(op, left, right),
         Expr::Cmp { op, left, right } => {
             format!(
                 "{} {} {}",
@@ -3610,6 +5182,12 @@ fn expr_to_sql(e: &Expr) -> String {
                 .join(", ")
         ),
         Expr::InSubquery { column, query } => format!("{} IN ({})", column, query),
+        Expr::ScalarSubquery { stmt } => format!("({})", render_select_sql(stmt)),
+        Expr::Exists { stmt, negated } => format!(
+            "{}EXISTS ({})",
+            if *negated { "NOT " } else { "" },
+            render_select_sql(stmt)
+        ),
     }
 }
 
@@ -3650,6 +5228,8 @@ fn render_select_sql(stmt: &Stmt) -> String {
                     }
                 }
                 SelectItem::Agg { canonical, .. } => canonical.clone(),
+                SelectItem::ScalarSub { canonical, .. } => canonical.clone(),
+                SelectItem::Window { canonical, .. } => canonical.clone(),
             })
             .collect::<Vec<_>>()
             .join(", ")
@@ -3661,6 +5241,8 @@ fn render_select_sql(stmt: &Stmt) -> String {
             match j.join_type {
                 JoinType::Inner => "INNER",
                 JoinType::Left => "LEFT",
+                JoinType::Right => "RIGHT",
+                JoinType::Full => "FULL",
             },
             j.table,
             j.left_col,
@@ -3692,6 +5274,24 @@ fn render_select_sql(stmt: &Stmt) -> String {
     out
 }
 
+/// Join-key encoding with SQL comparison semantics:
+///  * NULL never matches anything, not even another NULL (three-valued
+///    logic) — previously NULL keys were hashed together and joined;
+///  * Int and Float compare numerically, so Int(5) and Float(5.0) must
+///    land in the same bucket (the raw index encoding is per-type, which
+///    silently dropped cross-type matches).
+fn join_key(v: &Value) -> Option<Vec<u8>> {
+    match v {
+        Value::Null => None,
+        Value::Float(f)
+            if f.is_finite() && f.fract() == 0.0 && *f >= i64::MIN as f64 && *f < i64::MAX as f64 =>
+        {
+            Some(crate::relational::encode_index_value(&Value::Int(*f as i64)))
+        }
+        other => Some(crate::relational::encode_index_value(other)),
+    }
+}
+
 /// Inner hash join on equi-condition left_col = right_col.
 /// Column collisions: right-side columns are prefixed '<table>.'.
 fn hash_join(
@@ -3704,27 +5304,28 @@ fn hash_join(
     let mut index: HashMap<Vec<u8>, Vec<&BTreeMap<String, Value>>> = HashMap::new();
     for r in right {
         if let Some(v) = r.get(right_col) {
-            index
-                .entry(crate::relational::encode_index_value(v))
-                .or_default()
-                .push(r);
+            if let Some(key) = join_key(v) {
+                index.entry(key).or_default().push(r);
+            }
         }
     }
     let mut out = Vec::new();
     for l in left {
         if let Some(v) = l.get(left_col) {
-            if let Some(matches) = index.get(&crate::relational::encode_index_value(v)) {
-                for r in matches {
-                    let mut merged = l.clone();
-                    for (k, val) in r.iter() {
-                        let name = if merged.contains_key(k) {
-                            format!("joined_{}", k)
-                        } else {
-                            k.clone()
-                        };
-                        merged.insert(name, val.clone());
+            if let Some(key) = join_key(v) {
+                if let Some(matches) = index.get(&key) {
+                    for r in matches {
+                        let mut merged = l.clone();
+                        for (k, val) in r.iter() {
+                            let name = if merged.contains_key(k) {
+                                format!("joined_{}", k)
+                            } else {
+                                k.clone()
+                            };
+                            merged.insert(name, val.clone());
+                        }
+                        out.push(merged);
                     }
-                    out.push(merged);
                 }
             }
         }
@@ -3745,14 +5346,14 @@ fn hash_join_left(
     let matched_keys: HashSet<Vec<u8>> = out
         .iter()
         .filter_map(|r| r.get(left_col))
-        .map(crate::relational::encode_index_value)
+        .filter_map(join_key)
         .collect();
     let right_cols: Vec<String> = right
         .first()
         .map(|r| r.keys().cloned().collect())
         .unwrap_or_default();
     for l in left {
-        let key = l.get(left_col).map(crate::relational::encode_index_value);
+        let key = l.get(left_col).and_then(join_key);
         let matched = key
             .as_ref()
             .map(|k| matched_keys.contains(k))
@@ -3768,6 +5369,183 @@ fn hash_join_left(
         }
     }
     out
+}
+
+/// v3.6 FULL OUTER JOIN: every matched pair, plus unmatched LEFT rows (right
+/// columns NULL) and unmatched RIGHT rows (left columns NULL). NULL keys
+/// never match (three-valued logic, same as hash_join/hash_join_left).
+fn hash_join_full(
+    left_rows: &[BTreeMap<String, Value>],
+    right_rows: &[BTreeMap<String, Value>],
+    left_col: &str,
+    right_col: &str,
+) -> Vec<BTreeMap<String, Value>> {
+    use std::collections::HashMap;
+    // key -> indices into right_rows
+    let mut index: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
+    for (i, r) in right_rows.iter().enumerate() {
+        if let Some(k) = join_key(r.get(right_col).unwrap_or(&Value::Null)) {
+            index.entry(k).or_default().push(i);
+        }
+    }
+    let right_cols: Vec<String> = right_rows
+        .first()
+        .map(|r| r.keys().cloned().collect())
+        .unwrap_or_default();
+    let mut matched_right: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for l in left_rows {
+        let key = join_key(l.get(left_col).unwrap_or(&Value::Null));
+        let matches: &[usize] = key
+            .as_ref()
+            .and_then(|k| index.get(k))
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        if matches.is_empty() {
+            let mut row = l.clone();
+            for c in &right_cols {
+                if !row.contains_key(c) {
+                    row.insert(c.clone(), Value::Null);
+                }
+            }
+            out.push(row);
+            continue;
+        }
+        for &ri in matches {
+            matched_right.insert(ri);
+            let r = &right_rows[ri];
+            let mut row = l.clone();
+            for (k, v) in r.iter() {
+                row.insert(k.clone(), v.clone());
+            }
+            out.push(row);
+        }
+    }
+    // Right rows that never matched: keep the right columns, NULL-pad the
+    // left side (any column the right row does not carry becomes NULL —
+    // the single-namespace model unifies both sides).
+    for (i, r) in right_rows.iter().enumerate() {
+        if matched_right.contains(&i) {
+            continue;
+        }
+        let mut row = r.clone();
+        for (k, v) in row.iter_mut() {
+            if !r.contains_key(k) {
+                *v = Value::Null;
+            }
+        }
+        out.push(row);
+    }
+    out
+}
+
+/// Does this expression contain SQL subquery nodes (InSubquery that may be
+/// correlated, ScalarSubquery, Exists)? Used to switch the WHERE filter to
+/// the per-row resolution path.
+fn expr_has_subquery(e: &Expr) -> bool {
+    match e {
+        Expr::ScalarSubquery { .. } | Expr::Exists { .. } | Expr::InSubquery { .. } => true,
+        Expr::Not(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            expr_has_subquery(inner)
+        }
+        Expr::And(a, b) | Expr::Or(a, b) => expr_has_subquery(a) || expr_has_subquery(b),
+        Expr::Cmp { left, right, .. } | Expr::Arith { left, right, .. } => {
+            expr_has_subquery(left) || expr_has_subquery(right)
+        }
+        Expr::Literal(_) | Expr::Column(_) | Expr::InList { .. } => false,
+    }
+}
+
+/// Canonical rendering of a window function expression.
+fn render_window(func: &WindowFunc, partition: &[String], order: &[(String, bool)]) -> String {
+    let mut s = format!("{}() OVER (", func.name());
+    if !partition.is_empty() {
+        s.push_str(&format!("PARTITION BY {} ", partition.join(", ")));
+    }
+    if !order.is_empty() {
+        s.push_str(&format!(
+            "ORDER BY {}",
+            order
+                .iter()
+                .map(|(c, asc)| format!("{} {}", c, if *asc { "ASC" } else { "DESC" }))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    s.push(')');
+    s
+}
+
+/// Render any SELECT-shaped statement back to SQL text (subquery execution).
+pub(crate) fn render_stmt_sql(stmt: &Stmt) -> String {
+    render_select_sql(stmt)
+}
+
+/// Compute a ranking window function over `rows` in place, inserting the
+/// result under `canonical`. Rows are grouped by the partition key (encoded
+/// values), sorted by the window ORDER BY inside each partition, then
+/// numbered: ROW_NUMBER = position, RANK = position of first peer,
+/// DENSE_RANK = consecutive peer groups.
+fn compute_window(
+    rows: &mut [BTreeMap<String, Value>],
+    func: WindowFunc,
+    partition: &[String],
+    order: &[(String, bool)],
+    canonical: &str,
+) {
+    // Index rows by partition key.
+    let mut partitions: std::collections::BTreeMap<Vec<u8>, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (i, row) in rows.iter().enumerate() {
+        let mut key = Vec::new();
+        for col in partition {
+            let v = row.get(col).cloned().unwrap_or(Value::Null);
+            key.extend_from_slice(&encode_index_value(&v));
+            key.push(0);
+        }
+        partitions.entry(key).or_default().push(i);
+    }
+    for (_, mut idxs) in partitions {
+        if !order.is_empty() {
+            idxs.sort_by(|&a, &b| {
+                for (col, asc) in order {
+                    let va = rows[a].get(col).cloned().unwrap_or(Value::Null);
+                    let vb = rows[b].get(col).cloned().unwrap_or(Value::Null);
+                    let ord = va.compare(&vb);
+                    if ord != std::cmp::Ordering::Equal {
+                        return if *asc { ord } else { ord.reverse() };
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+        }
+        let mut rank = 1usize;
+        let mut dense = 1usize;
+        for (pos, &i) in idxs.iter().enumerate() {
+            let value = match func {
+                WindowFunc::RowNumber => (pos + 1) as i64,
+                WindowFunc::Rank => rank as i64,
+                WindowFunc::DenseRank => dense as i64,
+            };
+            rows[i].insert(canonical.to_string(), Value::Int(value));
+            let is_last = pos + 1 == idxs.len();
+            if !is_last {
+                // Peers share the same ORDER BY values; a new peer group
+                // advances RANK to the current position and DENSE_RANK by 1.
+                let a = &rows[i];
+                let b = &rows[idxs[pos + 1]];
+                let peer = order.iter().all(|(col, _)| {
+                    let va = a.get(col).cloned().unwrap_or(Value::Null);
+                    let vb = b.get(col).cloned().unwrap_or(Value::Null);
+                    va.compare(&vb) == std::cmp::Ordering::Equal
+                });
+                if !peer {
+                    rank = pos + 2;
+                    dense += 1;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4817,5 +6595,131 @@ mod acl_parse_tests {
         .unwrap();
         assert!(tables.contains(&"chr_orders".to_string()));
         assert!(tables.contains(&"chr_users".to_string()));
+    }
+}
+
+/// Regression tests for the v3.5.0 audit fixes (P0-1, P0-2, P1).
+#[cfg(test)]
+mod security_regression_tests {
+    use super::*;
+
+    #[test]
+    fn parser_rejects_pathologically_nested_expressions() {
+        // 100k nested parentheses used to recurse once per '(' and smash the
+        // stack (with panic=abort that killed the WHOLE server). Now it is a
+        // plain parse error.
+        let deep = format!(
+            "SELECT * FROM chr_t WHERE {} 1 = 1 {}",
+            "(".repeat(100_000),
+            ")".repeat(100_000)
+        );
+        let err = referenced_tables(&deep)
+            .err()
+            .expect("pathologically deep query must be rejected");
+        assert!(
+            err.contains("nested too deeply"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parser_rejects_deeply_nested_subqueries() {
+        let mut query = String::new();
+        for _ in 0..2_000 {
+            query.push_str("SELECT a FROM chr_t WHERE a IN (");
+        }
+        query.push_str("1 = 1");
+        for _ in 0..2_000 {
+            query.push(')');
+        }
+        let err = referenced_tables(&query)
+            .err()
+            .expect("deep subquery nesting must be rejected");
+        assert!(
+            err.contains("nested too deeply"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn bare_drop_index_is_rejected_for_permission_checking() {
+        // The bare form does not name its table, so it cannot be
+        // permission-checked without storage access; the ACL resolver must
+        // reject it instead of silently authorising a drop on ANY table.
+        let err = referenced_tables("DROP INDEX idx_x")
+            .err()
+            .expect("bare DROP INDEX must not pass the ACL resolver");
+        assert!(err.contains("ON <table>"), "unexpected error: {err}");
+        // The documented ON form keeps working.
+        let tables = referenced_tables("DROP INDEX idx_x ON chr_t").unwrap();
+        assert_eq!(tables, vec!["chr_t".to_string()]);
+    }
+
+    #[test]
+    fn expr_to_sql_keeps_operator_precedence() {
+        // a * (b + c) must not render as `a * b + c` (silently wrong
+        // materialised subquery results).
+        let e = Expr::Arith {
+            op: ArithOp::Mul,
+            left: Box::new(Expr::Column("a".into())),
+            right: Box::new(Expr::Arith {
+                op: ArithOp::Add,
+                left: Box::new(Expr::Column("b".into())),
+                right: Box::new(Expr::Column("c".into())),
+            }),
+        };
+        assert_eq!(expr_to_sql(&e), "a * (b + c)");
+
+        // Left-associative same-precedence chain stays parenthesised.
+        let e2 = Expr::Arith {
+            op: ArithOp::Sub,
+            left: Box::new(Expr::Arith {
+                op: ArithOp::Sub,
+                left: Box::new(Expr::Column("a".into())),
+                right: Box::new(Expr::Column("b".into())),
+            }),
+            right: Box::new(Expr::Column("c".into())),
+        };
+        assert_eq!(expr_to_sql(&e2), "(a - b) - c");
+
+        // Higher-precedence child needs no parens.
+        let e3 = Expr::Arith {
+            op: ArithOp::Add,
+            left: Box::new(Expr::Column("a".into())),
+            right: Box::new(Expr::Arith {
+                op: ArithOp::Mul,
+                left: Box::new(Expr::Column("b".into())),
+                right: Box::new(Expr::Column("c".into())),
+            }),
+        };
+        assert_eq!(expr_to_sql(&e3), "a + b * c");
+    }
+
+    #[test]
+    fn hash_join_null_never_matches_and_int_matches_float() {
+        fn row(col: &str, v: Value) -> BTreeMap<String, Value> {
+            let mut m = BTreeMap::new();
+            m.insert(col.to_string(), v);
+            m
+        }
+        let left = vec![
+            row("id", Value::Null),
+            row("id", Value::Int(5)),
+            row("id", Value::Int(7)),
+        ];
+        let right = vec![
+            row("id", Value::Null),
+            row("id", Value::Float(5.0)),
+            row("id", Value::Int(5)),
+        ];
+        // Int(5) joins Float(5.0) and Int(5) => 2 result rows; NULL never
+        // joins anything (not even NULL = NULL), Int(7) has no rival.
+        let joined = hash_join(&left, &right, "id", "id");
+        assert_eq!(joined.len(), 2);
+
+        // LEFT join = 2 matched pairs + the NULL-keyed row + the Int(7) row
+        // (both kept with NULLs on the right side).
+        let left_joined = hash_join_left(&left, &right, "id", "id");
+        assert_eq!(left_joined.len(), 4);
     }
 }

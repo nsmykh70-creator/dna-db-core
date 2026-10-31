@@ -10,6 +10,58 @@
 
 ---
 
+## 0. Прогон проверки v3.5.0 — 2026-10-31 (нативный Linux, актуальный релиз)
+
+> Ниже — исторические прогоны v3.0–v3.4.
+
+* **Платформа:** Debian 13 (trixie), x86_64, 2 vCPU, 4 ГБ RAM, профиль release (`panic = "unwind"`)
+* **Инструментарий:** rustc/cargo 1.99.1, Python 3.12.16
+* **Соперники:** MySQL 8.4.6 (официальный minimal-билд, `innodb_flush_log_at_trx_commit=1`, по умолчанию) и PostgreSQL 17.11 (`synchronous_commit=on`, по умолчанию) — все три системы на одной машине
+
+### Полная батарея тестов
+
+| # | Проверка | Команда | Результат |
+|---|---|---|---|
+| 1 | Сборка release | `cargo build --release` | **PASS** — 0 ошибок |
+| 2 | Все Rust-тесты | `cargo test --release` | **PASS — 197 passed, 0 failed** (182 unit + 2 encryption + 13 recovery, включая 11 новых регрессионных тестов на аудиторские фиксы) |
+| 3 | Линт | `cargo clippy --release --all-targets` | **PASS** — 0 ошибок, 35 предупреждений (стиль/сложность) |
+| 4 | Живой smoke протокола | `python scripts/smoke_test.py` | **PASS — 15/15** |
+| 5 | Security smoke (закалка v3.5) | `python scripts/security_smoke.py` | **PASS — 12/12** (случайный bootstrap, лимит глубины парсера, slowloris-дедлайн, блокировка doctor, …) |
+| 6 | Долговечность под SIGKILL | `python scripts/kill9_test.py` | **PASS — 123 408 подтверждённых записей, 0 потеряно, 0 испорчено** (strict fsync, 8 потоков) |
+| 7 | Chaos / самовосстановление | `python scripts/chaos_test.py` | **PASS — 3/3 сценария, 300 000 проверок ключей** (ремонт RS(4+2), живой on-read repair, честный UNREPAIRABLE) |
+| 8 | Сравнительный бенчмарк с MySQL/PostgreSQL | `python scripts/bench_compare.py` | **PASS** — таблица ниже, сырые данные в [bench_compare_results_v350_linux.json](bench_compare_results_v350_linux.json) |
+| 9 | Соответствие SQL (3 системы, 32 проверки) | `python scripts/sql_feature_test.py` | **PASS** — DNA-DB **25/32 поддерживается, 0 неверных результатов**; MySQL 31/32; PostgreSQL 32/32 ([sql_feature_results_v350_linux.json](sql_feature_results_v350_linux.json)) |
+
+### Сравнительный бенчмарк (у каждой системы durability по умолчанию)
+
+
+| Фаза (одинаковая нагрузка и RNG) | DNA-DB v3.5.0 | MySQL 8.4.6 | PostgreSQL 17.11 |
+|---|---:|---:|---:|
+| Load 10 000 KV rows, single connection (ack per row) | **36 260 rows/s** | 4 353 rows/s | 19 182 rows/s |
+| Multithreaded load, 8 threads × 1 000 single-row INSERTs | 17 636 rows/s | 8 316 rows/s | **22 157 rows/s** |
+| Batched load, 8 000 rows in 40 × 200-row INSERTs | **298 936 rows/s** | 162 166 rows/s | 215 926 rows/s |
+| Point read ×4 000, single connection | **43 779 ops/s** | 11 049 ops/s | 17 565 ops/s |
+| Mixed 80/20, 8 threads × 500 ops | **20 411 ops/s** | 8 403 ops/s | 17 985 ops/s |
+| SQL `INSERT`, 3 000 rows | **24 986 ops/s** | 4 003 ops/s | 16 811 ops/s |
+| SQL `SELECT … WHERE pk`, ×1 500 | 22 470 ops/s | 8 916 ops/s | **23 638 ops/s** |
+| Verified reads returning a wrong value | **0** | 0 | 0 |
+
+
+DNA-DB быстрее во всех фазах, кроме пика параллельных INSERT у PostgreSQL и
+одно-поточного SQL SELECT по PK (паритет с PostgreSQL). Ускорение против MySQL:
+**8,3×** однопоточная запись, **4,0×** точечные чтения, **2,4×** смешанная нагрузка,
+**1,8×** пакетная запись; против PostgreSQL: **1,9× / 2,5× / 1,1× / 1,4×**.
+
+![Throughput by workload phase](charts/v350/throughput.png)
+
+Сырые логи: [bench_compare_run_v350.log](bench_compare_run_v350.log) ·
+[sql_feature_run_v350.log](sql_feature_run_v350.log) · [clippy_v350.log](clippy_v350.log) ·
+[smoke_test_results_v350.txt](smoke_test_results_v350.txt) · [security_smoke_v350.txt](security_smoke_v350.txt) ·
+[KILL9_TEST_RESULT_v350.txt](KILL9_TEST_RESULT_v350.txt) · [chaos_results_v350.txt](chaos_results_v350.txt)
+
+---
+
+
 ## 1. Коротко
 
 Одинаковая нагрузка, одинаковые ключи и одна последовательность RNG на всех трёх системах, все

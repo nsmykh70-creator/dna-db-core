@@ -285,13 +285,34 @@ def run_batch(n_rows, batch_size, put_batch):
 # ---------------------------------------------------------------------------
 
 class DnaDbAdapter:
-    name = "DNA-DB v3.3"
+    # version is read from Cargo.toml so the tool never goes stale
+    _ver = None
+
+    @classmethod
+    def pkg_version(cls):
+        if cls._ver is None:
+            v = "3.5"
+            try:
+                import re
+                with open(os.path.join(PROJECT, "Cargo.toml")) as f:
+                    m = re.search(r'^version\s*=\s*"([^"]+)"', f.read(), re.M)
+                if m:
+                    v = m.group(1)
+            except Exception:
+                pass
+            cls._ver = v
+        return cls._ver
+
+    @property
+    def name(self):
+        return "DNA-DB v%s" % self.pkg_version()
 
     def __init__(self, port, cafile=None, mode="legacy"):
         self.port = port
         self.cafile = cafile
         self.mode = mode
-        self.version = ("dna-db-core 3.4.0 (%s, strict fsync)" % mode)
+        self.version = ("dna-db-core %s (%s, strict fsync)"
+                        % (self.pkg_version(), mode))
 
     def connect(self):
         return DnaDbClient("127.0.0.1", self.port, "admin", "bench-pass",

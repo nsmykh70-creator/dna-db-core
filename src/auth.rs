@@ -75,13 +75,29 @@ impl UserStore {
             path: None,
             users: RwLock::new(BTreeMap::new()),
         };
-        store.seed_bootstrap(username, password)?;
+        store.seed_bootstrap(username, password, false)?;
         Ok(store)
     }
 
     /// Open the persistent user database, creating the bootstrap admin only
-    /// when the file does not exist.
+    /// when the file does not exist (bootstrap account starts without the
+    /// must-change flag — used by tests and embedded callers that pass an
+    /// explicit, non-default credential).
     pub fn open(path: &Path, bootstrap_user: &str, bootstrap_pass: &str) -> Result<Self, String> {
+        Self::open_with_policy(path, bootstrap_user, bootstrap_pass, false)
+    }
+
+    /// Same as `open`, but the freshly seeded bootstrap account is created
+    /// with `must_change = true` when requested. The CLI uses this whenever
+    /// it generates a random bootstrap password (or the user keeps the
+    /// well-known default), so the panel forces a real password on first
+    /// login instead of shipping `admin/password` as a permanent credential.
+    pub fn open_with_policy(
+        path: &Path,
+        bootstrap_user: &str,
+        bootstrap_pass: &str,
+        bootstrap_must_change: bool,
+    ) -> Result<Self, String> {
         if path.exists() {
             let bytes = std::fs::read(path)
                 .map_err(|e| format!("cannot read users file {:?}: {e}", path))?;
@@ -113,12 +129,17 @@ impl UserStore {
             path: Some(path.to_path_buf()),
             users: RwLock::new(BTreeMap::new()),
         };
-        store.seed_bootstrap(bootstrap_user, bootstrap_pass)?;
+        store.seed_bootstrap(bootstrap_user, bootstrap_pass, bootstrap_must_change)?;
         store.persist()?;
         Ok(store)
     }
 
-    fn seed_bootstrap(&self, username: &str, password: &str) -> Result<(), String> {
+    fn seed_bootstrap(
+        &self,
+        username: &str,
+        password: &str,
+        must_change: bool,
+    ) -> Result<(), String> {
         validate_username(username)?;
         validate_password(password)?;
         let now = unix_now();
@@ -128,7 +149,7 @@ impl UserStore {
             allowed_tables: None,
             password_hash: hash_password(password)?,
             disabled: false,
-            must_change: false,
+            must_change,
             created_at: now,
             updated_at: now,
         };

@@ -100,7 +100,11 @@ pub(crate) fn transpile(
             Ok(format!("{};", parts.join(" ")))
         }
 
-        Stmt::Insert { table, rows } => {
+        Stmt::Insert {
+            table,
+            rows,
+            on_conflict: _,
+        } => {
             let schema = schema_of(table)
                 .ok_or_else(|| format!("SQL→DnaQL: table '{}' does not exist", table))?;
             let pk = &schema.primary_locus_column;
@@ -230,6 +234,24 @@ pub(crate) fn transpile(
              execution note of every DnaQL result"
                 .into(),
         ),
+        // v3.6 statements with no DnaQL equivalent.
+        Stmt::Union { .. } => Err(
+            "SQL→DnaQL: UNION is not expressible in DnaQL; run each SELECT separately"
+                .into(),
+        ),
+        Stmt::Cte { .. } => Err(
+            "SQL→DnaQL: WITH (CTE) is not expressible in DnaQL; materialise each CTE separately"
+                .into(),
+        ),
+        Stmt::ShowTables => Err("SQL→DnaQL: SHOW TABLES is SQL-only (DnaQL: SHOW CHROMOSOMES)".into()),
+        Stmt::Tx { action } => Err(format!(
+            "SQL→DnaQL: {:?} is SQL-only (DnaQL wraps writes in TX {{ ... }} blocks)",
+            action
+        )),
+        Stmt::AddColumn { table, column, .. } => Err(format!(
+            "SQL→DnaQL: ALTER TABLE {} ADD COLUMN {} has no DnaQL equivalent",
+            table, column
+        )),
     }
 }
 
@@ -285,6 +307,18 @@ fn emit_columns(
                 return Err(format!(
                     "SQL→DnaQL: computed projection '{}' is not expressible in DnaQL EMIT",
                     rendered
+                ));
+            }
+            SelectItem::ScalarSub { rendered, .. } => {
+                return Err(format!(
+                    "SQL→DnaQL: scalar subquery '{}' is not expressible in DnaQL EMIT",
+                    rendered
+                ));
+            }
+            SelectItem::Window { canonical, .. } => {
+                return Err(format!(
+                    "SQL→DnaQL: window function '{}' is not expressible in DnaQL EMIT",
+                    canonical
                 ));
             }
         }
@@ -390,6 +424,11 @@ fn expr(e: &Expr) -> Result<String, String> {
              has no subqueries; run the inner SELECT separately",
             column
         )),
+        Expr::ScalarSubquery { .. } | Expr::Exists { .. } => Err(
+            "SQL→DnaQL: scalar/EXISTS subqueries are not expressible in DnaQL; run the inner \
+             SELECT separately"
+                .into(),
+        ),
     }
 }
 

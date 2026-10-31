@@ -45,6 +45,17 @@ pub enum Expr {
         /// Rendered sub-SELECT, re-executed by the SQL engine.
         query: String,
     },
+    /// `(SELECT ...)` scalar subquery (v3.6) — SQL-only node. Resolved by the
+    /// SQL executor (uncorrelated → literal, correlated → per outer row);
+    /// eval returns NULL so a node that slips through cannot fake a value.
+    ScalarSubquery {
+        stmt: Box<crate::sql_engine::Stmt>,
+    },
+    /// `[NOT] EXISTS (SELECT ...)` (v3.6) — SQL-only node, resolved per row.
+    Exists {
+        stmt: Box<crate::sql_engine::Stmt>,
+        negated: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,7 +148,9 @@ impl Expr {
                         as i64,
                 ))
             }
-            Expr::InSubquery { .. } => Some(Value::Null),
+            Expr::InSubquery { .. }
+            | Expr::ScalarSubquery { .. }
+            | Expr::Exists { .. } => Some(Value::Null),
             Expr::Cmp { op, left, right } => {
                 let l = left.eval(row)?;
                 let r = right.eval(row)?;
@@ -187,6 +200,16 @@ impl Expr {
             Expr::InSubquery { column, query } => {
                 format!("{} IN ({})", column, query)
             }
+            Expr::ScalarSubquery { stmt } => {
+                format!("({})", crate::sql_engine::render_stmt_sql(stmt))
+            }
+            Expr::Exists { stmt, negated } => {
+                format!(
+                    "{}EXISTS ({})",
+                    if *negated { "NOT " } else { "" },
+                    crate::sql_engine::render_stmt_sql(stmt)
+                )
+            }
             Expr::Cmp { op, left, right } => {
                 format!("{} {} {}", left.describe(), op.as_str(), right.describe())
             }
@@ -212,6 +235,9 @@ impl Expr {
                     out.push(column.clone());
                 }
             }
+            // Subquery nodes: their columns live in the subquery scope, not
+            // in the outer projection, so nothing to collect here.
+            Expr::ScalarSubquery { .. } | Expr::Exists { .. } => {}
             Expr::And(a, b) | Expr::Or(a, b) => {
                 a.collect_columns(out);
                 b.collect_columns(out);
@@ -226,6 +252,9 @@ impl Expr {
 
 /// Numeric arithmetic with Int/Float promotion. Division always produces a
 /// Float; x / 0 (and x / 0.0) produces NULL instead of panicking.
+/// Integer overflow produces NULL (SQL three-valued logic) instead of the
+/// silently wrapped value `wrapping_*` used to return: a WHERE predicate
+/// must never compare against a bogus number that happens to fit.
 fn arith(op: ArithOp, l: &Value, r: &Value) -> Option<Value> {
     fn num(v: &Value) -> Option<(f64, bool)> {
         match v {
@@ -239,10 +268,28 @@ fn arith(op: ArithOp, l: &Value, r: &Value) -> Option<Value> {
     if op == ArithOp::Div && b == 0.0 {
         return Some(Value::Null);
     }
+    // Exact integer path: keep i64 precision and surface overflow as NULL
+    // (three-valued logic) instead of the silently wrapped value that
+    // wrapping_* used to return. A WHERE predicate must never compare
+    // against a bogus number that merely happens to fit.
+    if ai && bi && !matches!(op, ArithOp::Div) {
+        let x = match l {
+            Value::Int(x) => *x,
+            _ => 0,
+        };
+        let y = match r {
+            Value::Int(y) => *y,
+            _ => 0,
+        };
+        let checked = match op {
+            ArithOp::Add => x.checked_add(y),
+            ArithOp::Sub => x.checked_sub(y),
+            ArithOp::Mul => x.checked_mul(y),
+            ArithOp::Div => None,
+        };
+        return checked.map(Value::Int);
+    }
     Some(match op {
-        ArithOp::Add if ai && bi => Value::Int((a as i64).wrapping_add(b as i64)),
-        ArithOp::Sub if ai && bi => Value::Int((a as i64).wrapping_sub(b as i64)),
-        ArithOp::Mul if ai && bi => Value::Int((a as i64).wrapping_mul(b as i64)),
         ArithOp::Add => Value::Float(a + b),
         ArithOp::Sub => Value::Float(a - b),
         ArithOp::Mul => Value::Float(a * b),

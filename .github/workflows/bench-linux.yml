@@ -1,18 +1,22 @@
 name: Bench (Linux, native DBs)
 
-# Runs the same comparison as scripts/bench_compare.py locally, but on a Linux
-# runner with MySQL and PostgreSQL installed natively (apt + systemd), i.e.
-# WITHOUT the Docker/WSL2 container overhead of the Windows dev machine.
-# Trigger: manually, or whenever the benchmark script itself changes.
-# Results (JSON, run log, PNG charts) are committed back to the repository.
+# Повторяет прогон из docs/DB_COMPARISON_RU.md, §8: MySQL и PostgreSQL
+# ставятся НАТИВНО через apt (без Docker), DNA-DB собирается в release,
+# затем выполняются scripts/bench_compare.py и scripts/gen_charts.py.
+# Результаты (JSON + лог + графики) коммитятся обратно в репозиторий.
+#
+# Подключения, ожидаемые скриптом:
+#   MySQL      root/bench @127.0.0.1:3306, база bench
+#   PostgreSQL bench/bench @127.0.0.1:5432, база bench
+#   DNA-DB     сервер запускается сам (admin/bench-pass)
 
 on:
   workflow_dispatch:
   push:
-    # Results are committed back to the branch; a tag ref cannot be pushed to,
-    # so a release tag must not trigger this workflow.
     branches: [main]
     paths:
+      - 'src/**'
+      - 'Cargo.toml'
       - 'scripts/bench_compare.py'
       - 'scripts/gen_charts.py'
       - '.github/workflows/bench-linux.yml'
@@ -20,180 +24,50 @@ on:
 permissions:
   contents: write
 
-concurrency:
-  group: bench-linux
-  cancel-in-progress: true
-
 jobs:
   bench:
+    name: DNA-DB vs MySQL vs PostgreSQL
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust (stable)
-        run: |
-          if ! command -v cargo >/dev/null 2>&1; then
-            curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable
-            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          else
-            rustup default stable || true
-          fi
+      - name: Установка Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
 
-      - name: Install MySQL + PostgreSQL (native, no containers)
+      - name: Кэш cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Установка MySQL (нативно, apt)
         run: |
-          set -eo pipefail
           sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            mysql-server postgresql
-          sudo systemctl start mysql || true
+          sudo apt-get install -y mysql-server
+          sudo systemctl start mysql
+          sudo mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY 'bench'; FLUSH PRIVILEGES;"
+          sudo mysql -e "CREATE DATABASE IF NOT EXISTS bench;"
+
+      - name: Установка PostgreSQL (нативно, apt)
+        run: |
+          sudo apt-get install -y postgresql postgresql-contrib
           sudo systemctl start postgresql
+          sudo -u postgres psql -c "CREATE USER bench WITH PASSWORD 'bench';"
+          sudo -u postgres psql -c "CREATE DATABASE bench OWNER bench;"
 
-      - name: Configure MySQL (root password 'bench', database 'bench')
-        run: |
-          set -eo pipefail
-          # Statements executed by whichever bootstrap method succeeds below.
-          sudo tee /tmp/mysql-init.sql >/dev/null <<'SQL'
-          FLUSH PRIVILEGES;
-          ALTER USER 'root'@'localhost' IDENTIFIED BY 'bench';
-          CREATE USER IF NOT EXISTS 'root'@'127.0.0.1' IDENTIFIED BY 'bench';
-          GRANT ALL ON *.* TO 'root'@'127.0.0.1' WITH GRANT OPTION;
-          CREATE USER IF NOT EXISTS 'bench'@'127.0.0.1' IDENTIFIED BY 'bench';
-          GRANT ALL ON *.* TO 'bench'@'127.0.0.1' WITH GRANT OPTION;
-          CREATE USER IF NOT EXISTS 'bench'@'localhost' IDENTIFIED BY 'bench';
-          GRANT ALL ON *.* TO 'bench'@'localhost' WITH GRANT OPTION;
-          CREATE DATABASE IF NOT EXISTS bench;
-          FLUSH PRIVILEGES;
-          SQL
-          sudo chmod 644 /tmp/mysql-init.sql
+      - name: Python-драйверы и графика
+        run: python3 -m pip install --quiet pymysql psycopg2-binary matplotlib
 
-          configured=0
-
-          # (a) password-less socket login (auth_socket images)
-          if sudo mysql --connect-timeout=5 -e "SELECT 1" >/dev/null 2>&1; then
-            echo "socket login works, configuring root directly"
-            if sudo mysql < /tmp/mysql-init.sql; then
-              configured=1
-            fi
-          fi
-
-          # (b) authoritative: temporary --skip-grant-tables server, the
-          #     documented MySQL root-password-reset procedure. FLUSH PRIVILEGES
-          #     is the FIRST statement of ONE session: it re-loads the grant
-          #     tables, so ALTER/CREATE/GRANT must run in that same already
-          #     authenticated session -- any NEW connection after the FLUSH is
-          #     checked against the re-enabled grant tables again (this is why
-          #     separate mysql invocations used to fail with ERROR 1045).
-          if [ "$configured" = 0 ]; then
-            echo "resetting root password via a temporary --skip-grant-tables server"
-            sudo systemctl stop mysql || true
-            sudo mkdir -p /var/run/mysqld
-            sudo chown mysql:mysql /var/run/mysqld
-            sock=/var/run/mysqld/mysqld.sock
-            sudo -u mysql /usr/sbin/mysqld --skip-grant-tables \
-              --socket="$sock" >/dev/null 2>&1 &
-            ok=0
-            for i in $(seq 1 45); do
-              if mysql -uroot --socket="$sock" --connect-timeout=3 \
-                  -e "SELECT 1" >/dev/null 2>&1; then
-                ok=1
-                break
-              fi
-              sleep 1
-            done
-            if [ "$ok" != 1 ]; then
-              echo "temporary server did not come up; error.log:"
-              sudo tail -40 /var/log/mysql/error.log || true
-              exit 1
-            fi
-            if ! mysql -uroot --socket="$sock" < /tmp/mysql-init.sql; then
-              echo "bootstrap SQL failed; error.log:"
-              sudo tail -40 /var/log/mysql/error.log || true
-              exit 1
-            fi
-            configured=1
-            mb_pid=$(pgrep -u mysql -x mysqld | head -1 || true)
-            if [ -n "$mb_pid" ]; then
-              sudo kill "$mb_pid" 2>/dev/null || true
-              for i in $(seq 1 30); do
-                sudo kill -0 "$mb_pid" 2>/dev/null || break
-                sleep 1
-              done
-              sudo kill -9 "$mb_pid" 2>/dev/null || true
-            fi
-            sudo systemctl daemon-reload
-            sudo systemctl reset-failed mysql || true
-            sudo systemctl start mysql || true
-          fi
-
-          # verify: this must succeed for the benchmark to run
-          for i in $(seq 1 60); do
-            mysql -h127.0.0.1 -uroot -pbench -e "SELECT 1" >/dev/null 2>&1 && break
-            sleep 2
-          done
-          if ! mysql -h127.0.0.1 -uroot -pbench -e \
-              "SELECT VERSION(); SELECT @@innodb_flush_log_at_trx_commit;"; then
-            echo "MySQL verification failed; diagnostics:"
-            sudo tail -40 /var/log/mysql/error.log || true
-            sudo systemctl status mysql --no-pager || true
-            exit 1
-          fi
-
-      - name: Configure PostgreSQL (user/database 'bench')
-        run: |
-          set -eo pipefail
-          sudo -u postgres psql -c \
-            "CREATE USER bench WITH PASSWORD 'bench';" || true
-          sudo -u postgres psql -c \
-            "CREATE DATABASE bench OWNER bench;" || true
-          for i in $(seq 1 30); do
-            pg_isready -h 127.0.0.1 -U bench && break
-            sleep 2
-          done
-          pg_isready -h 127.0.0.1 -U bench
-
-      - name: Install Python dependencies
-        run: pip3 install --quiet pymysql psycopg2-binary matplotlib
-
-      - name: Build DNA-DB (release, Linux)
+      - name: Сборка DNA-DB (release)
         run: cargo build --release
 
-      - name: Run the comparison benchmark
-        run: |
-          set -o pipefail
-          PYTHONUTF8=1 python3 scripts/bench_compare.py \
-            --json-out docs/bench_compare_results_linux.json \
-            2>&1 | tee docs/bench_linux_run.log
+      - name: Сравнительный бенчмарк (durability по умолчанию у всех)
+        run: python3 scripts/bench_compare.py --json-out docs/bench_compare_results_linux.json 2>&1 | tee docs/bench_linux_run.log
 
-      - name: Generate charts
-        run: |
-          PYTHONUTF8=1 python3 scripts/gen_charts.py \
-            --json docs/bench_compare_results_linux.json \
-            --out docs/charts/linux \
-            --sql-json ""
+      - name: Перегенерация графиков
+        run: python3 scripts/gen_charts.py --json docs/bench_compare_results_linux.json --out docs/charts/linux
 
-      - name: Job summary
-        if: always()
+      - name: Коммит результатов в репозиторий
         run: |
-          {
-            echo "### Native Linux benchmark (apt MySQL/PostgreSQL, no Docker)"
-            echo '```'
-            tail -n 14 docs/bench_linux_run.log 2>/dev/null || echo "no log"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Commit results
-        if: github.ref_type == 'branch'
-        run: |
-          set -eo pipefail
-          git config user.name "dna-db-ci"
-          git config user.email "actions@users.noreply.github.com"
-          git add docs/bench_compare_results_linux.json docs/charts/linux
-          git add -f docs/bench_linux_run.log
-          if git diff --cached --quiet; then
-            echo "results unchanged, nothing to commit"
-            exit 0
-          fi
-          git commit -m "bench: native Linux results (ubuntu runner, no containers)"
-          git push origin "HEAD:${GITHUB_REF_NAME}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/bench_compare_results_linux.json docs/bench_linux_run.log docs/charts/linux/ || true
+          git diff --cached --quiet || git commit -m "bench: обновление результатов сравнения с MySQL/PostgreSQL [skip ci]"
+          git push

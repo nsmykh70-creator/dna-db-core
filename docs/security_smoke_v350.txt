@@ -1,0 +1,15 @@
+  [PASS] random_bootstrap_password_printed tLFzC6BsXmrTV7bbZKdXhnqM
+  [PASS] static_default_gone 
+  [PASS] must_change_seeded 
+  [PASS] auth_with_generated_password 
+  [PASS] deep_query_rejected_not_crash b'ERR: SQL: expression nested too deeply (limit 128)'
+  [PASS] server_alive_after_deep_query 
+  [PASS] admin_bare_drop_index_reaches_executor b"ERR: index 'no_such_idx' does not exist"
+  [PASS] slowloris_deadline dropped after 10.4s
+  [PASS] second_instance_refused [SECURITY] no --admin-pass/DNA_DB_ADMIN_PASS supplied; generating a random bootstrap password.
+[SECU
+  [PASS] doctor_refuses_live_db [DOCTOR] refusing to run: /tmp/dna_sec_7o16w_8k is locked by another dna-db-core process (running doctor — or 
+  [PASS] doctor_works_after_stop === DNA-DB Doctor report — /tmp/dna_sec_7o16w_8k ===
+segments: 0 scanned, 0 heal
+  [PASS] password_survives_restart 
+{"passed": 12, "total": 12}

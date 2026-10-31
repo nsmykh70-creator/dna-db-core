@@ -364,11 +364,43 @@ fn tokenize(input: &str) -> Result<Vec<Tok>, String> {
 struct Parser {
     toks: Vec<Tok>,
     pos: usize,
+    /// Recursion depth of the expression parser. The parser is a
+    /// recursive-descent tree walk, so a frame full of nested parentheses
+    /// would otherwise recurse once per '(' and smash the stack (SIGSEGV or,
+    /// with the old panic=abort profile, a whole-process abort). All
+    /// recursion cycles go through `parse_or`, so guarding it bounds the
+    /// whole grammar.
+    depth: usize,
 }
+
+/// Maximum expression nesting accepted by the DnaQL parser.
+const MAX_PARSE_DEPTH: usize = 128;
 
 impl Parser {
     fn new(toks: Vec<Tok>) -> Self {
-        Self { toks, pos: 0 }
+        Self {
+            toks,
+            pos: 0,
+            depth: 0,
+        }
+    }
+
+    /// Enter one expression-recursion level. Errors out (instead of
+    /// overflowing the stack) when the query nests too deeply.
+    fn enter(&mut self) -> Result<(), String> {
+        self.depth += 1;
+        if self.depth > MAX_PARSE_DEPTH {
+            self.depth -= 1;
+            return Err(format!(
+                "DnaQL: expression nested too deeply (limit {})",
+                MAX_PARSE_DEPTH
+            ));
+        }
+        Ok(())
+    }
+
+    fn leave(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
     }
 
     fn peek(&self) -> &Tok {
@@ -972,6 +1004,13 @@ impl Parser {
     }
 
     fn parse_or(&mut self) -> Result<Expr, String> {
+        self.enter()?;
+        let result = self.parse_or_inner();
+        self.leave();
+        result
+    }
+
+    fn parse_or_inner(&mut self) -> Result<Expr, String> {
         let mut left = self.parse_and()?;
         while self.kw("OR") {
             let right = self.parse_and()?;
@@ -1203,7 +1242,14 @@ fn collect_ast_tables(ast: &DnaQlAst, out: &mut Vec<String>) {
                 }
             }
         }
-        DnaQlAst::BioAnalysis { .. } => {}
+        DnaQlAst::BioAnalysis { locus, .. } => {
+            // ANALYZE LOCUS <table>:<id> reads one row of <table>, so the
+            // per-user table ACL must see it. Returning an empty list here
+            // let a table-restricted user read any locus of any table.
+            if let Some((table, _)) = locus {
+                out.push(table.clone());
+            }
+        }
         DnaQlAst::HealthCheck { chromosome, .. } => out.push(chromosome.clone()),
         DnaQlAst::CreateChromosome { table, .. }
         | DnaQlAst::DropChromosome { table, .. } => out.push(table.clone()),
@@ -1786,14 +1832,24 @@ fn apply_assign(old: &Value, op: AssignOp, v: &Value) -> Result<Value, String> {
     match op {
         AssignOp::Set => Ok(v.clone()),
         AssignOp::Add => match (old, v) {
-            (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a + b)),
+            // Checked arithmetic: TX mutations are durable, so a silently
+            // wrapped i64 (e.g. i64::MAX + 1 becoming negative) would
+            // corrupt persisted balances/counts. Overflow aborts the
+            // mutation instead.
+            (Value::Int(a), Value::Int(b)) => a
+                .checked_add(*b)
+                .map(Value::Int)
+                .ok_or_else(|| "DnaQL: integer overflow in +=".to_string()),
             (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a + b)),
             (Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 + b)),
             (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a + *b as f64)),
             _ => Err("DnaQL: += requires numeric operands".into()),
         },
         AssignOp::Sub => match (old, v) {
-            (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a - b)),
+            (Value::Int(a), Value::Int(b)) => a
+                .checked_sub(*b)
+                .map(Value::Int)
+                .ok_or_else(|| "DnaQL: integer overflow in -=".to_string()),
             (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a - b)),
             (Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 - b)),
             (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a - *b as f64)),
@@ -2088,5 +2144,53 @@ mod acl_parse_tests {
     fn collects_transaction_tables() {
         let tables = referenced_tables("TX { chr_variants += { id: 1 } }").unwrap();
         assert_eq!(tables, vec!["chr_variants".to_string()]);
+    }
+}
+
+/// Regression tests for the v3.5.0 audit fixes (P0-1, P0-2, TX += overflow).
+#[cfg(test)]
+mod security_regression_tests {
+    use super::*;
+
+    #[test]
+    fn parser_rejects_pathologically_nested_expressions() {
+        let deep = format!("({}a = 1{})", "(".repeat(100_000), ")".repeat(100_000));
+        let toks = tokenize(&deep).unwrap();
+        let mut p = Parser::new(toks);
+        let err = p
+            .parse_expr()
+            .err()
+            .expect("pathologically deep expression must be rejected");
+        assert!(
+            err.contains("nested too deeply"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn referenced_tables_includes_bioanalysis_locus_table() {
+        // ANALYZE LOCUS reads a row of the named table, so the per-user ACL
+        // must see it (previously an empty list => ACL bypass).
+        let tables = referenced_tables("ANALYZE LOCUS chr_virus:42 |> GC_CONTENT()").unwrap();
+        assert_eq!(tables, vec!["chr_virus".to_string()]);
+        // A literal-sequence analysis touches no table at all.
+        let tables = referenced_tables("ANALYZE SEQUENCE 'ACGT' |> GC_CONTENT()").unwrap();
+        assert!(tables.is_empty());
+    }
+
+    #[test]
+    fn tx_assign_overflow_is_rejected_not_wrapped() {
+        // A durable mutation must never silently wrap i64: MAX + 1 would
+        // turn a persisted counter/balance negative.
+        assert!(apply_assign(&Value::Int(i64::MAX), AssignOp::Add, &Value::Int(1)).is_err());
+        assert!(apply_assign(&Value::Int(i64::MIN), AssignOp::Sub, &Value::Int(1)).is_err());
+        assert_eq!(
+            apply_assign(&Value::Int(2), AssignOp::Add, &Value::Int(3)).unwrap(),
+            Value::Int(5)
+        );
+        assert_eq!(
+            apply_assign(&Value::Int(5), AssignOp::Sub, &Value::Int(2)).unwrap(),
+            Value::Int(3)
+        );
     }
 }

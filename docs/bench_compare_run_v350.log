@@ -1,0 +1,41 @@
+[run_with_dbs] MySQL ready
+[run_with_dbs] PostgreSQL ready
+[run_with_dbs] running: python3 scripts/bench_compare.py --json-out docs/bench_compare_results_v350_linux.json
+
+=== DNA-DB v3.3 ===
+  load 10000 ... 36260 ops/s, avg 0.03 ms
+  load-mt 8000 rows x 8 threads ... 17636 rows/s, p50 0.04 ms, errors=0, verified=True
+  load-batch 8000 rows, batch=200 ... 298936 rows/s (40 batches), p50 0.66 ms/batch, errors=0, verified=True
+  point-read 4000 ... 43779 ops/s, p50 0.02 / p95 0.03 / p99 0.03 ms, errors=0
+  mixed 8 threads x 500 ops (80/20) ... 20411 ops/s, p50 0.03 / p99 0.05 ms
+  sql load 3000 rows ... 24986 ops/s, avg 0.04 ms
+  sql SELECT WHERE pk x 1500 ... 22470 ops/s, p50 0.03 / p95 0.03 / p99 0.05 ms, errors=0
+
+=== MySQL ===
+  load 10000 ... 4353 ops/s, avg 0.23 ms
+  load-mt 8000 rows x 8 threads ... 8316 rows/s, p50 0.60 ms, errors=0, verified=True
+  load-batch 8000 rows, batch=200 ... 162166 rows/s (40 batches), p50 1.24 ms/batch, errors=0, verified=True
+  point-read 4000 ... 11049 ops/s, p50 0.06 / p95 0.07 / p99 0.10 ms, errors=0
+  mixed 8 threads x 500 ops (80/20) ... 8403 ops/s, p50 0.48 / p99 3.51 ms
+  sql load 3000 rows ... 4003 ops/s, avg 0.25 ms
+  sql SELECT WHERE pk x 1500 ... 8916 ops/s, p50 0.07 / p95 0.09 / p99 0.13 ms, errors=0
+
+=== PostgreSQL ===
+  load 10000 ... 19182 ops/s, avg 0.05 ms
+  load-mt 8000 rows x 8 threads ... 22157 rows/s, p50 0.20 ms, errors=0, verified=True
+  load-batch 8000 rows, batch=200 ... 215926 rows/s (40 batches), p50 0.89 ms/batch, errors=0, verified=True
+  point-read 4000 ... 17565 ops/s, p50 0.04 / p95 0.05 / p99 0.07 ms, errors=0
+  mixed 8 threads x 500 ops (80/20) ... 17985 ops/s, p50 0.23 / p99 1.04 ms
+  sql load 3000 rows ... 16811 ops/s, avg 0.06 ms
+  sql SELECT WHERE pk x 1500 ... 23638 ops/s, p50 0.04 / p95 0.05 / p99 0.06 ms, errors=0
+
+JSON report: docs/bench_compare_results_v350_linux.json
+
+================================================================================================
+system / metric      load1/s   loadMT/s   batch/s    read/s   mixed/s  sqlsel/s
+------------------------------------------------------------------------------------------------
+DNA-DB                 36260      17636    298936     43779     20411     22470
+MySQL                   4353       8316    162166     11049      8403      8916
+PostgreSQL             19182      22157    215926     17565     17985     23638
+================================================================================================
+[run_with_dbs] servers stopped

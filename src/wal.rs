@@ -191,6 +191,45 @@ impl WalWriter {
     pub fn size_bytes(&self) -> io::Result<u64> {
         self.file.metadata().map(|m| m.len())
     }
+
+    /// Logical end-of-log offset: bytes on disk plus bytes still sitting in
+    /// the write buffer (unsynced). Captured BEFORE an append and handed back
+    /// to `rollback_to` if the append must be undone (e.g. the mirror write
+    /// failed after the WAL frame was already persisted).
+    pub fn logical_len(&self) -> io::Result<u64> {
+        Ok(self.file.metadata()?.len() + self.pending_bytes as u64)
+    }
+
+    /// Roll the log back to a previously captured `logical_len()`, dropping
+    /// everything appended after that mark (buffered or already fsynced).
+    ///
+    /// Used when a write that already reached the WAL must be un-acknowledged:
+    /// the engine appends the WAL frame first (durable), then mirrors it to
+    /// Strand B; if the mirror write fails the engine rolls the frame back so
+    /// a failed write cannot resurrect itself on the next restart/replay.
+    ///
+    /// The handle is opened in append mode, so subsequent appends continue at
+    /// the (new) EOF automatically — no repositioning needed.
+    pub fn rollback_to(&mut self, mark: u64) -> io::Result<()> {
+        // Flush first: buffered bytes must land at the OLD eof so the
+        // truncate below removes exactly the suffix past `mark`. Truncating
+        // before flushing would make the buffer reappear AFTER the cut.
+        self.writer.flush()?;
+        let cur = self.file.metadata()?.len();
+        if cur > mark {
+            {
+                let f = OpenOptions::new().write(true).open(&self.path)?;
+                f.set_len(mark)?;
+                f.sync_all()?;
+            }
+            // The writer's own handle is O_APPEND: its cursor follows EOF on
+            // the next write, but sync it once so the truncation is durable
+            // through the same fd the appends use.
+            self.file.sync_data()?;
+        }
+        self.pending_bytes = 0;
+        Ok(())
+    }
 }
 
 pub struct WalReader;
@@ -782,5 +821,48 @@ mod tests {
         assert_eq!(entries.len(), 4);
         assert_eq!(entries[3].op, WalOp::Delete);
         assert_eq!(entries[3].key, b"a");
+    }
+}
+
+/// Regression test for the v3.5.0 fix: mirror failures roll back the
+/// already-persisted WAL frame via `rollback_to`.
+#[cfg(test)]
+mod rollback_regression_tests {
+    use super::*;
+
+    fn tempdir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("dna_wal_rb_{}_{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn rollback_to_drops_the_last_append() {
+        let dir = tempdir("rollback_mark");
+        let path = dir.join("active.wal");
+        let mut w = WalWriter::open(&path, SyncMode::Strict).unwrap();
+        w.append(WalOp::Put, b"k1", Some(b"v1")).unwrap();
+        let mark = w.logical_len().unwrap();
+        w.append(WalOp::Put, b"k2", Some(b"v2")).unwrap();
+        assert!(w.logical_len().unwrap() > mark);
+        w.rollback_to(mark).unwrap();
+        drop(w);
+        let entries = WalReader::recover(&path).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key, b"k1".to_vec());
+    }
+
+    #[test]
+    fn rollback_to_noop_at_mark() {
+        let dir = tempdir("rollback_noop");
+        let path = dir.join("active.wal");
+        let mut w = WalWriter::open(&path, SyncMode::Strict).unwrap();
+        w.append(WalOp::Put, b"k1", Some(b"v1")).unwrap();
+        let mark = w.logical_len().unwrap();
+        w.rollback_to(mark).unwrap();
+        drop(w);
+        let entries = WalReader::recover(&path).unwrap();
+        assert_eq!(entries.len(), 1);
     }
 }
