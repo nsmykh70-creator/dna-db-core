@@ -3,6 +3,8 @@
 
 > This repository is bilingual: **English** (this file) · [Русский](README_RU.md)
 
+[![CI](https://github.com/nsmykh70-creator/dna-db-core/actions/workflows/ci.yml/badge.svg)](https://github.com/nsmykh70-creator/dna-db-core/actions/workflows/ci.yml) [![Landing](https://img.shields.io/website?url=https%3A%2F%2Fnsmykh70-creator.github.io%2Fdna-db-core%2F&label=landing)](https://nsmykh70-creator.github.io/dna-db-core/) [![Release](https://img.shields.io/github/v/release/nsmykh70-creator/dna-db-core)](https://github.com/nsmykh70-creator/dna-db-core/releases) [![Tests](https://img.shields.io/badge/tests-215%20PASS-22c55e)](docs/TEST_RESULTS.md) [![SQL](https://img.shields.io/badge/SQL%20conformance-32%2F32-1f6c92)](docs/SQL_FEATURES.md) [![License](https://img.shields.io/badge/license-AGPL--3.0%20%2F%20Apache--2.0-blue)](LICENSE)
+
 A high-performance embeddable and client/server database engine written in Rust, featuring an LSM-Tree architecture, 2-bit nucleotide compression, dual-strand disk mirroring, the **DnaQL** query language, a **full SQL subset** (aggregates, GROUP BY/HAVING, ORDER BY, IN/subqueries, **secondary and range indexes**), a built-in **web admin panel** (phpMyAdmin-style) and self-healing on sector corruption.
 
 > 🌐 **Landing page:** https://nsmykh70-creator.github.io/dna-db-core/ (source: [landing/index.html](landing/index.html)) — features, charts, benchmarks vs MySQL/PostgreSQL, test results, screenshots and a full guide in one page. Deployed automatically by [.github/workflows/pages.yml](.github/workflows/pages.yml).

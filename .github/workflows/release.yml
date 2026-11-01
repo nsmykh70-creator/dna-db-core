@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build and release (e.g. v4.0.0)'
+        required: true
+        default: 'v4.0.0'
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests before packaging
+        run: cargo test --release
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Package binary, docs and licenses
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          DIR="dna-db-core-${TAG}-x86_64-unknown-linux-gnu"
+          mkdir -p "${DIR}"
+          cp target/release/dna-db-core "${DIR}/"
+          cp README.md README_RU.md CHANGELOG.md LICENSE LICENSE-APACHE LICENSE-AGPL SECURITY.md SECURITY_RU.md "${DIR}/" 2>/dev/null || true
+          cp -r docs "${DIR}/docs"
+          tar -czf "${DIR}.tar.gz" "${DIR}"
+          sha256sum "${DIR}.tar.gz" > "${DIR}.tar.gz.sha256"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dna-db-core-linux-binaries
+          path: dna-db-core-*.tar.gz*
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: DNA-DB Enterprise ${{ github.event.inputs.tag || github.ref_name }}
+          body_path: docs/RELEASE_NOTES_v4.0.0.md
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+          files: |
+            dna-db-core-*.tar.gz
+            dna-db-core-*.tar.gz.sha256

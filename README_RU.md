@@ -2,6 +2,8 @@
 
 > **English:** [README.md](README.md) · здесь — [русская версия](README_RU.md)
 
+[![CI](https://github.com/nsmykh70-creator/dna-db-core/actions/workflows/ci.yml/badge.svg)](https://github.com/nsmykh70-creator/dna-db-core/actions/workflows/ci.yml) [![Лендинг](https://img.shields.io/website?url=https%3A%2F%2Fnsmykh70-creator.github.io%2Fdna-db-core%2F&label=лендинг)](https://nsmykh70-creator.github.io/dna-db-core/) [![Release](https://img.shields.io/github/v/release/nsmykh70-creator/dna-db-core)](https://github.com/nsmykh70-creator/dna-db-core/releases) [![Тесты](https://img.shields.io/badge/тесты-215%20PASS-22c55e)](docs/TEST_RESULTS_RU.md) [![SQL](https://img.shields.io/badge/SQL--соответствие-32%2F32-1f6c92)](docs/SQL_FEATURES_RU.md) [![Лицензия](https://img.shields.io/badge/лицензия-AGPL--3.0%20%2F%20Apache--2.0-blue)](LICENSE)
+
 Высокопроизводительный встраиваемый и клиент-серверный движок баз данных на Rust с архитектурой LSM-Tree, 2-битной компрессией нуклеотидов, двухнитевым зеркалированием дисков, языком **DnaQL**, **полноценным SQL-подмножеством** (агрегаты, GROUP BY/HAVING, ORDER BY, IN/подзапросы, **secondary- и диапазонные индексы**), встроенной **веб-панелью управления** (phpMyAdmin-подобной) и самовосстановлением при повреждении секторов.
 
 > 🌐 **Лендинг проекта:** https://nsmykh70-creator.github.io/dna-db-core/ (исходник: [landing/index.html](landing/index.html)) — описание, графики, бенчмарки против MySQL/PostgreSQL, результаты тестов, скриншоты и руководство на одной странице. Публикуется автоматически через [.github/workflows/pages.yml](.github/workflows/pages.yml).
