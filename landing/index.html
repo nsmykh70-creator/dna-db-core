@@ -3,8 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>DNA-DB Enterprise v4.0.0-GA — СУБД на Rust для геномных данных</title>
-<meta name="description" content="DNA-DB Enterprise v4.0.0-GA — LSM-движок на Rust: DnaQL, SQL 32/32 (JOIN/UNION/CTE/оконные/UPSERT/транзакции), pgwire (PostgreSQL protocol), Raft-кластер, S3-тиринг, PITR, TLS 1.3/Argon2id, RS(4+2) самовосстановление, Prometheus, Kubernetes. Бенчмарки против MySQL 8.4 и PostgreSQL 17.">
+<title>DNA-DB Enterprise v4.0.0-GA — СУБД на Rust по принципу ДНК</title>
+<meta name="description" content="DNA-DB Enterprise v4.0.0-GA — СУБД на Rust по принципу ДНК: хранение обычных цифровых данных с самовосстановлением (2-битная упаковка, двойная нить, RS(4+2)). LSM-движок: DnaQL, SQL 32/32 (JOIN/UNION/CTE/оконные/UPSERT/транзакции), pgwire (PostgreSQL protocol), Raft-кластер, S3-тиринг, PITR, TLS 1.3/Argon2id, RS(4+2) самовосстановление, Prometheus, Kubernetes. Бенчмарки против MySQL 8.4 и PostgreSQL 17.">
 <style>
 :root{
   /* light theme (default) */
@@ -177,10 +177,10 @@ footer .f1{margin-bottom:6px}
 <header>
   <div class="wrap">
     <div class="ver">v4.0.0-GA · Enterprise Production Release · 2026-10-31</div>
-    <h1><span class="ru">СУБД на Rust для геномных данных —<br>от LSM-ядра до <span class="accent">Raft-кластера</span></span>
-        <span class="en">A Rust database for genomic data —<br>from an LSM core to a <span class="accent">Raft cluster</span></span></h1>
-    <p class="sub"><span class="ru">Один бинарник: DnaQL и SQL 32/32, совместимость по проводному протоколу PostgreSQL (pgwire), кворумный Raft, S3-тиринг и PITR, TLS 1.3 / Argon2id / XChaCha20, самовосстановление RS(4+2), Prometheus-метрики и Kubernetes-манифесты. Всё подтверждено 215 тестами, kill&#8209;9-прогоном и сравнением с MySQL 8.4.6 и PostgreSQL 17.11.</span>
-    <span class="en">One binary: DnaQL plus a 32/32 SQL engine, PostgreSQL wire-protocol compatibility (pgwire), quorum Raft, S3 tiering and PITR, TLS 1.3 / Argon2id / XChaCha20, RS(4+2) self-healing, Prometheus metrics and Kubernetes manifests. Proven by 215 tests, a kill&#8209;9 durability run and a comparison against MySQL 8.4.6 and PostgreSQL 17.11.</span></p>
+    <h1><span class="ru">СУБД на Rust по принципу ДНК —<br>хранение данных с <span class="accent">самовосстановлением</span></span>
+        <span class="en">A Rust database built on the DNA principle —<br>data storage with <span class="accent">self-healing</span></span></h1>
+    <p class="sub"><span class="ru">СУБД общего назначения: хранит обычные цифровые данные — таблицы, строки, ключи. Принцип хранения подсмотрен у ДНК: четвертичный алфавит и 2-битная упаковка (4 основания в байте), комплементарная двойная нить, избыточность и самовосстановление. Один бинарник: DnaQL и SQL 32/32, совместимость по проводному протоколу PostgreSQL (pgwire), кворумный Raft, S3-тиринг и PITR, TLS 1.3 / Argon2id / XChaCha20, самовосстановление RS(4+2), Prometheus-метрики и Kubernetes-манифесты. Всё подтверждено 215 тестами, kill&#8209;9-прогоном и сравнением с MySQL 8.4.6 и PostgreSQL 17.11.</span>
+    <span class="en">A general-purpose DBMS for ordinary digital data — tables, rows, keys. The storage principle is borrowed from DNA: a quaternary alphabet with 2-bit packing (4 bases per byte), a complementary dual strand, redundancy and self-repair. One binary: DnaQL plus a 32/32 SQL engine, PostgreSQL wire-protocol compatibility (pgwire), quorum Raft, S3 tiering and PITR, TLS 1.3 / Argon2id / XChaCha20, RS(4+2) self-healing, Prometheus metrics and Kubernetes manifests. Proven by 215 tests, a kill&#8209;9 durability run and a comparison against MySQL 8.4.6 and PostgreSQL 17.11.</span></p>
     <div class="badges">
       <span class="badge">🦀 Rust · <b>без unsafe в ядре</b></span>
       <span class="badge">✅ <b>215/215</b> tests</span>

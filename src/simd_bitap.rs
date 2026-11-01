@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Bit-Parallel Genomic Alignment Engine (Myers / Wu-Manber Bitap)
+//! Bit-Parallel Sequence Alignment Engine (Myers / Wu-Manber Bitap)
+//!
+//! Operates on any 2-bit-packed data held by DNA-DB (see `crate::dna`): the
+//! sequence vocabulary (bp, mismatches, edits) comes from the DNA storage
+//! principle, while the stored payload is ordinary digital data.
 //!
 //! v2.1.0: correct bit-parallel approximate matching with the standard
 //! "match convention" bitmasks (bit i of R[d] set <=> pattern[0..=i] aligns to

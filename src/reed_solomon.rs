@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Reed–Solomon erasure codec over GF(2^8) — the "genome redundancy" layer.
+//! Reed–Solomon erasure codec over GF(2^8) — the "DNA-style redundancy" layer.
 //!
 //! Wraps the battle-tested `reed-solomon-erasure` crate (Backblaze Cauchy
 //! matrix, field polynomial 0x11D) behind a narrow, auditable API:

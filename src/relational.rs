@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Relational Schema Mapping via Genomic Base-Pairing Metaphor
+//! Relational Schema Mapping via the DNA Base-Pairing Metaphor
 //!
 //! Tables -> Chromosomes ('chr_name:locus_id' LSM namespace)
 //! Rows   -> Loci

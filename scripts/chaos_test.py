@@ -301,7 +301,7 @@ class Server:
 # ---------------------------------------------------------------------------
 
 def reference_keys(n, start=0):
-    """Deterministic reference values (pseudo-random genomic strings)."""
+    """Deterministic reference values (pseudo-random DNA-like strings)."""
     out = {}
     state = 0x9E3779B97F4A7C15 + start
     for i in range(start, start + n):
@@ -311,7 +311,7 @@ def reference_keys(n, start=0):
         val = b"".join(
             bytes([65 + (state >> (8 * j)) & 0xFF for j in range(4)])
             for _ in range(2)
-        )  # 8 bytes of pseudo-random "genomic" ASCII
+        )  # 8 bytes of pseudo-random DNA-like ASCII
         out[("chr1:%08d" % i).encode()] = val
     return out
 

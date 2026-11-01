@@ -5,7 +5,7 @@
 
 [![CI](https://github.com/nsmykh70-creator/dna-db-core/actions/workflows/ci.yml/badge.svg)](https://github.com/nsmykh70-creator/dna-db-core/actions/workflows/ci.yml) [![Landing](https://img.shields.io/website?url=https%3A%2F%2Fnsmykh70-creator.github.io%2Fdna-db-core%2F&label=landing)](https://nsmykh70-creator.github.io/dna-db-core/) [![Release](https://img.shields.io/github/v/release/nsmykh70-creator/dna-db-core)](https://github.com/nsmykh70-creator/dna-db-core/releases) [![Tests](https://img.shields.io/badge/tests-215%20PASS-22c55e)](docs/TEST_RESULTS.md) [![SQL](https://img.shields.io/badge/SQL%20conformance-32%2F32-1f6c92)](docs/SQL_FEATURES.md) [![License](https://img.shields.io/badge/license-AGPL--3.0%20%2F%20Apache--2.0-blue)](LICENSE)
 
-A high-performance embeddable and client/server database engine written in Rust, featuring an LSM-Tree architecture, 2-bit nucleotide compression, dual-strand disk mirroring, the **DnaQL** query language, a **full SQL subset** (aggregates, GROUP BY/HAVING, ORDER BY, IN/subqueries, **secondary and range indexes**), a built-in **web admin panel** (phpMyAdmin-style) and self-healing on sector corruption.
+A general-purpose, high-performance embeddable and client/server database engine written in Rust. **DNA-DB does not store genomes — it stores ordinary digital data** (tables, rows, keys); its architecture is modelled on how DNA stores information: a four-letter alphabet with 2-bit nucleotide compression (4 bases per byte), dual-strand disk mirroring and self-healing. It features an LSM-Tree architecture, the **DnaQL** query language, a **full SQL subset** (aggregates, GROUP BY/HAVING, ORDER BY, IN/subqueries, **secondary and range indexes**), a built-in **web admin panel** (phpMyAdmin-style) and self-healing on sector corruption.
 
 > 🌐 **Landing page:** https://nsmykh70-creator.github.io/dna-db-core/ (source: [landing/index.html](landing/index.html)) — features, charts, benchmarks vs MySQL/PostgreSQL, test results, screenshots and a full guide in one page. Deployed automatically by [.github/workflows/pages.yml](.github/workflows/pages.yml).
 > 🧪 **v4.0.0-GA verification:** 215/215 Rust tests · SQL conformance 32/32 (0 mismatch) · 15/15 smoke · 12/12 security smoke · 123 408 acknowledged writes survived `kill -9` (0 lost) · chaos 3/3 · Raft failover 1.05 s · details in [docs/TEST_RESULTS.md](docs/TEST_RESULTS.md) and [docs/RELEASE_NOTES_v4.0.0.md](docs/RELEASE_NOTES_v4.0.0.md).
@@ -130,7 +130,7 @@ DNA → engineering analogy:
 
 | Mechanism in DNA | Implementation in DNA-DB |
 |---|---|
-| Genome redundancy | Reed–Solomon GF(2^8) inside every segment: k=4 data + m=2 parity, 4 KiB blocks (format `DNASST02`) |
+| Redundancy (many copies of every region) | Reed–Solomon GF(2^8) inside every segment: k=4 data + m=2 parity, 4 KiB blocks (format `DNASST02`) |
 | Damage sensors (checkpoint kinases) | CRC-32 (IEEE, `crc32fast`) per 4 KiB block, duplicated CRC table, redundant superblock/footer |
 | Excision repair (BER/NER) | on-read repair: CRC miss → stripe reconstruction from surviving shards → rewrite → journal |
 | Scanner enzymes | background scrubber (on by default: 24 h, 32 MiB/s, configurable) |
@@ -372,4 +372,4 @@ use stays open; the interactive web panel is permissive Apache-2.0
 one-way compatible with AGPL-3.0: the combined binary (core + panel) is
 distributed under AGPL-3.0, retaining the Apache notices in the panel sources.
 
-The v2.1.0 release is a working engine of a new kind (genome-relational model), suitable for embedding and client/server operation. Current limitations (MVCC, distributed 2PC, io_uring, WASM plugins, long bitap patterns) are recorded in [docs/ROADMAP.md](docs/ROADMAP.md).
+The v2.1.0 release is a working engine of a new kind (DNA-relational model), suitable for embedding and client/server operation. Current limitations (MVCC, distributed 2PC, io_uring, WASM plugins, long bitap patterns) are recorded in [docs/ROADMAP.md](docs/ROADMAP.md).

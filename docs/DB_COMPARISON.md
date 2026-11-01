@@ -254,7 +254,7 @@ Also verified by CI on Linux: [`.github/workflows/ci.yml`](../.github/workflows/
 DNA-DB is substantially faster than both servers at their default durability settings, and returns
 identically correct data. For complex relational workloads, transactions across statements,
 replication or analytics, MySQL/PostgreSQL remain the right tool; DNA-DB's niche is
-genomics-shaped workloads (fuzzy sequence search, packed nucleotides, self-healing storage).
+self-healing storage and DNA-style workloads (fuzzy sequence search, packed nucleotides).
 
 Feature-by-feature (not performance) comparison of the same three systems — 32 SQL checks with
 charts and real error texts: [SQL_FEATURES.md](SQL_FEATURES.md).

@@ -64,7 +64,7 @@ matched_sequence.
 ```dnaql
 FROM chr_orders
 |> LINK chr_users VIA COMPLEMENT(user_id)
-|> LINK chr_genomic_variants VIA COMPLEMENT(user_id)
+|> LINK chr_variants VIA COMPLEMENT(user_id)
 |> WHERE total_usd > 300.00
 |> EMIT order_id, username, variant_name;
 ```

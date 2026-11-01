@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Bio-Plugin Registry — in-database bioinformatics functions.
+//! Bio-Plugin Registry — optional sequence-analysis extension functions.
+//!
+//! The core engine is a general-purpose store for ordinary digital data;
+//! these plugins (alignment, PAM scan, ORF finder, GC content) serve users
+//! who deliberately keep nucleotide-sequence payloads in it. They are
+//! registered in BioPluginRegistry and invoked only by explicit name.
 //!
 //! v2.1.0: replaced the fake WASM runtime (which only printed "0 memory
 //! leaks") with a REAL, extensible function registry. Shipped plugins are
@@ -166,7 +171,7 @@ pub mod plugins {
     }
 
     /// CRISPR PAM scan: finds NGG (SpCas9) and NRG (Cas12a-ish) sites.
-    /// Reports PAM genomic offset (1-based) and the 20bp upstream protospacer
+    /// Reports PAM offset within the input sequence (1-based) and the 20bp upstream protospacer
     /// window when available.
     pub fn crispr_pam_scan(inputs: &[PackedDna], args: &[String]) -> Result<Vec<String>, String> {
         if inputs.is_empty() {

@@ -41,7 +41,7 @@ impl SyncArg {
 #[command(
     name = "dna-db-core",
     version,
-    about = "DNA-DB: genomic-relational LSM storage engine with self-healing, TLS and encryption at rest (v4.0)"
+    about = "DNA-DB: DNA-inspired LSM storage engine for ordinary digital data, with self-healing, TLS and encryption at rest (v4.0)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -163,7 +163,7 @@ enum Command {
         #[arg(long)]
         tls_client_key: Option<String>,
     },
-    /// Offline genome health check: scan / repair / migrate segments
+    /// Offline storage health check: scan / repair / migrate segments (DNA-style self-repair)
     Doctor {
         #[arg(long, default_value = "./dna_data")]
         data_dir: String,

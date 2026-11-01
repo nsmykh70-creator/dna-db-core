@@ -1,5 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! DNA-DB Core: High-performance storage engine
+//!
+//! Concept: DNA-DB is a general-purpose database for ordinary digital data.
+//! It does not store genomes — it stores bytes, rows and tables — but its
+//! architecture is modelled on how DNA stores information: a quaternary
+//! alphabet (2-bit packing), redundant copies, complementary strands and
+//! enzyme-style self-repair, applied to byte-addressed storage.
+//!
 //! Features:
 //! - LSM-Tree architecture with append-only WAL & SSTable segments
 //! - Zero-allocation 2-bit DNA sequence encoding (4x compression)
