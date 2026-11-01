@@ -1,37 +1,37 @@
 
 === DNA-DB v4.0.0 ===
-  load 10000 ... 3634 ops/s, avg 0.28 ms
-  load-mt 8000 rows x 8 threads ... 3971 rows/s, p50 1.45 ms, errors=0, verified=True
-  load-batch 8000 rows, batch=200 ... 225881 rows/s (40 batches), p50 0.88 ms/batch, errors=0, verified=True
-  point-read 4000 ... 27738 ops/s, p50 0.03 / p95 0.05 / p99 0.07 ms, errors=0
-  mixed 8 threads x 500 ops (80/20) ... 7757 ops/s, p50 0.31 / p99 1.56 ms
-  sql load 3000 rows ... 1546 ops/s, avg 0.65 ms
-  sql SELECT WHERE pk x 1500 ... 19114 ops/s, p50 0.05 / p95 0.06 / p99 0.07 ms, errors=0
+  load 10000 ... 3594 ops/s, avg 0.28 ms
+  load-mt 8000 rows x 8 threads ... 3988 rows/s, p50 1.68 ms, errors=0, verified=True
+  load-batch 8000 rows, batch=200 ... 170271 rows/s (40 batches), p50 1.13 ms/batch, errors=0, verified=True
+  point-read 4000 ... 17804 ops/s, p50 0.06 / p95 0.07 / p99 0.09 ms, errors=0
+  mixed 8 threads x 500 ops (80/20) ... 10369 ops/s, p50 0.36 / p99 1.21 ms
+  sql load 3000 rows ... 3243 ops/s, avg 0.30 ms
+  sql SELECT WHERE pk x 1500 ... 10360 ops/s, p50 0.08 / p95 0.11 / p99 0.12 ms, errors=0
 
 === MySQL ===
-  load 10000 ... 1365 ops/s, avg 0.73 ms
-  load-mt 8000 rows x 8 threads ... 5237 rows/s, p50 0.92 ms, errors=0, verified=True
-  load-batch 8000 rows, batch=200 ... 22448 rows/s (40 batches), p50 1.79 ms/batch, errors=0, verified=True
-  point-read 4000 ... 8636 ops/s, p50 0.10 / p95 0.16 / p99 0.17 ms, errors=0
-  mixed 8 threads x 500 ops (80/20) ... 10506 ops/s, p50 0.52 / p99 1.69 ms
-  sql load 3000 rows ... 1675 ops/s, avg 0.60 ms
-  sql SELECT WHERE pk x 1500 ... 7368 ops/s, p50 0.13 / p95 0.17 / p99 0.18 ms, errors=0
+  load 10000 ... 1462 ops/s, avg 0.68 ms
+  load-mt 8000 rows x 8 threads ... 5578 rows/s, p50 1.27 ms, errors=0, verified=True
+  load-batch 8000 rows, batch=200 ... 86689 rows/s (40 batches), p50 2.24 ms/batch, errors=0, verified=True
+  point-read 4000 ... 5039 ops/s, p50 0.20 / p95 0.23 / p99 0.24 ms, errors=0
+  mixed 8 threads x 500 ops (80/20) ... 7319 ops/s, p50 0.77 / p99 2.48 ms
+  sql load 3000 rows ... 1499 ops/s, avg 0.67 ms
+  sql SELECT WHERE pk x 1500 ... 4647 ops/s, p50 0.21 / p95 0.25 / p99 0.26 ms, errors=0
 
 === PostgreSQL ===
-  load 10000 ... 4001 ops/s, avg 0.25 ms
-  load-mt 8000 rows x 8 threads ... 10367 rows/s, p50 0.36 ms, errors=0, verified=True
-  load-batch 8000 rows, batch=200 ... 31490 rows/s (40 batches), p50 0.88 ms/batch, errors=0, verified=True
-  point-read 4000 ... 12387 ops/s, p50 0.07 / p95 0.10 / p99 0.29 ms, errors=0
-  mixed 8 threads x 500 ops (80/20) ... 9998 ops/s, p50 0.29 / p99 1.95 ms
-  sql load 3000 rows ... 3157 ops/s, avg 0.32 ms
-  sql SELECT WHERE pk x 1500 ... 9330 ops/s, p50 0.11 / p95 0.13 / p99 0.14 ms, errors=0
+  load 10000 ... 4320 ops/s, avg 0.23 ms
+  load-mt 8000 rows x 8 threads ... 14074 rows/s, p50 0.50 ms, errors=0, verified=True
+  load-batch 8000 rows, batch=200 ... 164772 rows/s (40 batches), p50 1.16 ms/batch, errors=0, verified=True
+  point-read 4000 ... 7232 ops/s, p50 0.12 / p95 0.18 / p99 0.20 ms, errors=0
+  mixed 8 threads x 500 ops (80/20) ... 14265 ops/s, p50 0.40 / p99 1.46 ms
+  sql load 3000 rows ... 4140 ops/s, avg 0.24 ms
+  sql SELECT WHERE pk x 1500 ... 6286 ops/s, p50 0.16 / p95 0.19 / p99 0.20 ms, errors=0
 
 JSON report: docs/bench_compare_results_linux.json
 
 ================================================================================================
 system / metric      load1/s   loadMT/s   batch/s    read/s   mixed/s  sqlsel/s
 ------------------------------------------------------------------------------------------------
-DNA-DB                  3634       3971    225881     27738      7757     19114
-MySQL                   1365       5237     22448      8636     10506      7368
-PostgreSQL              4001      10367     31490     12387      9998      9330
+DNA-DB                  3594       3988    170271     17804     10369     10360
+MySQL                   1462       5578     86689      5039      7319      4647
+PostgreSQL              4320      14074    164772      7232     14265      6286
 ================================================================================================
