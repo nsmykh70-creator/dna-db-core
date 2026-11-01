@@ -5,9 +5,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, cms-edition]
   pull_request:
-    branches: [main]
+    branches: [main, cms-edition]
 
 jobs:
   test:
@@ -35,3 +35,30 @@ jobs:
 
       - name: Синтаксис Python-скриптов
         run: python3 -m py_compile scripts/*.py
+
+  # CMS Edition (ветка cms-edition): та же база + feature cms.
+  # По правилам docs/CMS_EDITION_RU.md: cargo test с --features cms
+  # плюс проверка, что обычная сборка без feature не сломана.
+  cms-test:
+    name: cargo test --features cms (CMS edition)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Установка Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Кэш cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: CMS-сборка (feature cms)
+        run: cargo build --features cms
+
+      - name: Все тесты с feature cms
+        run: cargo test --features cms
+
+      - name: Обычная сборка без cms не должна ломаться
+        run: cargo check
+
+      - name: Clippy на cms-коде
+        run: cargo clippy --features cms --all-targets
