@@ -182,7 +182,7 @@ footer .f1{margin-bottom:6px}
     <p class="sub"><span class="ru">СУБД общего назначения: хранит обычные цифровые данные — таблицы, строки, ключи. Принцип хранения подсмотрен у ДНК: четвертичный алфавит и 2-битная упаковка (4 основания в байте), комплементарная двойная нить, избыточность и самовосстановление. Один бинарник: DnaQL и SQL 32/32, совместимость по проводному протоколу PostgreSQL (pgwire), кворумный Raft, S3-тиринг и PITR, TLS 1.3 / Argon2id / XChaCha20, самовосстановление RS(4+2), Prometheus-метрики и Kubernetes-манифесты. Всё подтверждено 215 тестами, kill&#8209;9-прогоном и сравнением с MySQL 8.4.6 и PostgreSQL 17.11.</span>
     <span class="en">A general-purpose DBMS for ordinary digital data — tables, rows, keys. The storage principle is borrowed from DNA: a quaternary alphabet with 2-bit packing (4 bases per byte), a complementary dual strand, redundancy and self-repair. One binary: DnaQL plus a 32/32 SQL engine, PostgreSQL wire-protocol compatibility (pgwire), quorum Raft, S3 tiering and PITR, TLS 1.3 / Argon2id / XChaCha20, RS(4+2) self-healing, Prometheus metrics and Kubernetes manifests. Proven by 215 tests, a kill&#8209;9 durability run and a comparison against MySQL 8.4.6 and PostgreSQL 17.11.</span></p>
     <div class="badges">
-      <span class="badge">🦀 Rust · <b>без unsafe в ядре</b></span>
+      <span class="badge">🦀 Rust · <b><span class="ru">без unsafe в ядре</span><span class="en">no unsafe in the core</span></b></span>
       <span class="badge">✅ <b>215/215</b> tests</span>
       <span class="badge">🧪 SQL <b>32/32</b> conformance</span>
       <span class="badge">🔐 TLS 1.3 · Argon2id · XChaCha20</span>
@@ -202,7 +202,7 @@ footer .f1{margin-bottom:6px}
   <div class="stat"><div class="n g">32 / 32</div><div class="t ru">SQL-соответствие: 0 unsupported, 0 mismatch</div><div class="t en">SQL conformance: 0 unsupported, 0 mismatch</div></div>
   <div class="stat"><div class="n">215 / 215</div><div class="t ru">cargo test --release: unit + SQL + recovery + Raft + pgwire</div><div class="t en">cargo test --release: unit + SQL + recovery + Raft + pgwire</div></div>
   <div class="stat"><div class="n g">0 / 123 408</div><div class="t ru">потерь после kill -9 (fsync на каждый ack)</div><div class="t en">losses after kill -9 (fsync per ack)</div></div>
-  <div class="stat"><div class="n">1,05 <small>с</small></div><div class="t ru">Raft failover (SLA &lt; 2 c), 0 потерь закоммиченного</div><div class="t en">Raft failover (SLA &lt; 2 s), zero committed loss</div></div>
+  <div class="stat"><div class="n"><span class="ru">1,05 <small>с</small></span><span class="en">1.05 <small>s</small></span></div><div class="t ru">Raft failover (SLA &lt; 2 c), 0 потерь закоммиченного</div><div class="t en">Raft failover (SLA &lt; 2 s), zero committed loss</div></div>
 </div>
 
 <section id="features">
