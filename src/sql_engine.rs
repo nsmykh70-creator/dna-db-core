@@ -6906,7 +6906,7 @@ mod tests {
                 .unwrap()
                 .clone()
         };
-        assert_eq!(by_col("chromosome").get("storage_key"),
+        assert_eq!(by_col("sample_id").get("storage_key"),
                    Some(&Value::Text("chr_samples:7".into())));
         assert_eq!(by_col("sample_id").get("sql_type"),
                    Some(&Value::Text("INT".into())));
