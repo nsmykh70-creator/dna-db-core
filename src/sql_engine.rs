@@ -47,6 +47,11 @@ pub struct SqlEngine {
     /// v3.6: statement-scoped CTE materialisation store. Populated while a
     /// `WITH ... SELECT` runs, always emptied before the statement returns.
     cte_store: std::sync::Mutex<std::collections::HashMap<String, Vec<BTreeMap<String, Value>>>>,
+    /// CMS edition (branch cms-edition): per-table AUTO_INCREMENT sequences.
+    /// Shared Arc so the compat gate (`cms::compat::CmsSqlGate`) and the
+    /// engine observe one counter per table. Seeded lazily from MAX(pk).
+    #[cfg(feature = "cms")]
+    pub cms_sequences: std::sync::Arc<crate::cms::sequence::AutoIncrementRegistry>,
 }
 
 /// v3.6 session transaction buffer: DML inside `BEGIN ... COMMIT` is
@@ -1336,10 +1341,33 @@ impl SParser {
         let mut t = ChromosomeTable::new(table_name.clone(), "id");
         let mut fks: Vec<ForeignKeyConstraint> = Vec::new();
         loop {
+            // CMS edition: MySQL constraint lines inside CREATE TABLE —
+            // `KEY name (col(len))`, `INDEX name (col)`, `UNIQUE KEY name (col)`,
+            // `FULLTEXT KEY name (col)`. Single-column keys become engine
+            // secondary indexes; composite keys index their first column
+            // non-uniquely (engine single-PK limitation, CMS_EDITION_RU.md §4).
+            #[cfg(feature = "cms")]
+            if self.peek_is_cms_constraint() {
+                self.parse_cms_table_constraint(&mut t)?;
+                if matches!(self.peek(), STok::Comma) {
+                    self.next();
+                    continue;
+                } else {
+                    break;
+                }
+            }
             if self.kw("PRIMARY") {
                 self.expect_kw("KEY")?;
                 self.expect(STok::LParen)?;
                 let pk = self.ident()?;
+                // CMS edition: composite PRIMARY KEY (a, b) — the engine keys
+                // on the first column; extra key parts are consumed.
+                #[cfg(feature = "cms")]
+                while matches!(self.peek(), STok::Comma) {
+                    self.next();
+                    let _ = self.ident()?;
+                    self.consume_type_len()?;
+                }
                 t.primary_locus_column = pk;
                 self.expect(STok::RParen)?;
             } else if self.kw("FOREIGN") {
@@ -1371,19 +1399,51 @@ impl SParser {
                 });
             } else {
                 let col = self.ident()?;
-                let ty = if self.kw("INT") || self.kw("INTEGER") || self.kw("INT64") {
-                    ColumnType::Int64
-                } else if self.kw("FLOAT") || self.kw("FLOAT64") || self.kw("DOUBLE") {
-                    ColumnType::Float64
-                } else if self.kw("TEXT") || self.kw("VARCHAR") || self.kw("STRING") {
-                    ColumnType::Text
-                } else if self.kw("DNA") || self.kw("DNA2BIT") {
-                    ColumnType::Dna2Bit
-                } else if self.kw("TIMESTAMP") {
-                    ColumnType::Timestamp
-                } else {
-                    return Err(format!("SQL: unknown column type for '{}'", col));
-                };
+                let ty = self.parse_column_type()?;
+                // CMS edition: MySQL-dialect column flags in any order
+                // (UNSIGNED NOT NULL DEFAULT '…' AUTO_INCREMENT …).
+                // AUTO_INCREMENT records the sequence column (exec_insert_tx
+                // assigns values); lengths/defaults are consumed and dropped.
+                #[cfg(feature = "cms")]
+                {
+                    loop {
+                        if self.kw("UNSIGNED") || self.kw("ZEROFILL") {
+                            continue;
+                        }
+                        if self.kw("NOT") {
+                            if !self.kw("NULL") {
+                                return Err("SQL: expected NULL after NOT in column definition".into());
+                            }
+                            continue;
+                        }
+                        if self.kw("NULL") {
+                            continue;
+                        }
+                        if self.kw("AUTO_INCREMENT") {
+                            t.auto_increment_column = Some(col.clone());
+                            continue;
+                        }
+                        if self.kw("DEFAULT") {
+                            self.consume_default_value()?;
+                            continue;
+                        }
+                        if self.kw("CHARACTER") {
+                            self.kw("SET");
+                            let _ = self.ident();
+                            continue;
+                        }
+                        if self.kw("COLLATE") {
+                            let _ = self.ident();
+                            continue;
+                        }
+                        if self.kw("COMMENT") {
+                            self.consume_default_value()?;
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                #[cfg(not(feature = "cms"))]
                 let _ = self.kw("NOT") && self.kw("NULL"); // accepted, not enforced in v2.1
                 t.add_column(col, ty);
             }
@@ -1394,6 +1454,45 @@ impl SParser {
             }
         }
         self.expect(STok::RParen)?;
+        // CMS edition: MySQL table options after the column list —
+        // `ENGINE=InnoDB AUTO_INCREMENT=1 DEFAULT CHARSET=utf8mb4
+        // COLLATE=utf8mb4_unicode_520_ci` — consumed and ignored.
+        #[cfg(feature = "cms")]
+        {
+            loop {
+                // `=` is STok::Eq — kw() only matches Ident tokens, so Eq is
+                // consumed explicitly everywhere below.
+                if self.kw("ENGINE") {
+                    self.expect(STok::Eq)?;
+                    let _ = self.ident()?;
+                } else if self.kw("AUTO_INCREMENT") {
+                    self.expect(STok::Eq)?;
+                    let _ = self.next();
+                } else if self.kw("DEFAULT") {
+                    if !(self.kw("CHARSET") || self.kw("COLLATE") || self.kw("CHARACTER")) {
+                        return Err("SQL: unsupported DEFAULT table option".into());
+                    }
+                    self.kw("SET");
+                    if matches!(self.peek(), STok::Eq) {
+                        self.next();
+                    }
+                    let _ = self.ident()?;
+                } else if self.kw("CHARSET") || self.kw("COLLATE") {
+                    if matches!(self.peek(), STok::Eq) {
+                        self.next();
+                    }
+                    let _ = self.ident()?;
+                } else if self.kw("CHARACTER") {
+                    self.kw("SET");
+                    if matches!(self.peek(), STok::Eq) {
+                        self.next();
+                    }
+                    let _ = self.ident()?;
+                } else {
+                    break;
+                }
+            }
+        }
         if matches!(self.peek(), STok::Semi) {
             self.next();
         }
@@ -1402,6 +1501,151 @@ impl SParser {
             table: t,
             if_not_exists,
         })
+    }
+
+    /// Column type of a CREATE TABLE column. Without the cms feature this is
+    /// the original base-type grammar; with cms it also accepts the
+    /// MySQL-dialect names WordPress DDL uses (bigint/tinyint/datetime/
+    /// longtext/decimal/...), consuming optional `(n)` lengths.
+    fn parse_column_type(&mut self) -> Result<ColumnType, String> {
+        if self.kw("INT") || self.kw("INTEGER") || self.kw("INT64") {
+            #[cfg(feature = "cms")]
+            self.consume_type_len()?;
+            Ok(ColumnType::Int64)
+        } else if self.kw("FLOAT") || self.kw("FLOAT64") || self.kw("DOUBLE") {
+            Ok(ColumnType::Float64)
+        } else if self.kw("TEXT") || self.kw("VARCHAR") || self.kw("STRING") {
+            #[cfg(feature = "cms")]
+            self.consume_type_len()?; // VARCHAR(191), TEXT(65535)
+            Ok(ColumnType::Text)
+        } else if self.kw("DNA") || self.kw("DNA2BIT") {
+            Ok(ColumnType::Dna2Bit)
+        } else if self.kw("TIMESTAMP") {
+            Ok(ColumnType::Timestamp)
+        } else {
+            // CMS edition: MySQL-dialect names map onto base engine types.
+            #[cfg(feature = "cms")]
+            {
+                if self.kw("BIGINT")
+                    || self.kw("TINYINT")
+                    || self.kw("SMALLINT")
+                    || self.kw("MEDIUMINT")
+                {
+                    self.consume_type_len()?;
+                    return Ok(ColumnType::Int64);
+                }
+                if self.kw("DATETIME") || self.kw("DATE") || self.kw("TIME") {
+                    return Ok(ColumnType::Timestamp);
+                }
+                if self.kw("LONGTEXT")
+                    || self.kw("MEDIUMTEXT")
+                    || self.kw("TINYTEXT")
+                    || self.kw("CHAR")
+                    || self.kw("BLOB")
+                {
+                    self.consume_type_len()?;
+                    return Ok(ColumnType::Text);
+                }
+                if self.kw("DECIMAL") || self.kw("NUMERIC") || self.kw("REAL") {
+                    self.consume_type_len()?; // DECIMAL(10,2)
+                    return Ok(ColumnType::Float64);
+                }
+            }
+            Err("SQL: unknown column type".into())
+        }
+    }
+
+    /// Consumes an optional `(n)` / `(n,m)` type length (cms only).
+    #[cfg(feature = "cms")]
+    fn consume_type_len(&mut self) -> Result<(), String> {
+        if matches!(self.peek(), STok::LParen) {
+            self.next();
+            match self.next() {
+                STok::Int(_) | STok::Float(_) => {}
+                t => return Err(format!("SQL: expected length after '(', got {:?}", t)),
+            }
+            if matches!(self.peek(), STok::Comma) {
+                self.next();
+                match self.next() {
+                    STok::Int(_) | STok::Float(_) => {}
+                    t => return Err(format!("SQL: expected precision after ',', got {:?}", t)),
+                }
+            }
+            self.expect(STok::RParen)?;
+        }
+        Ok(())
+    }
+
+    /// Consumes a DEFAULT/COMMENT value literal: string, number, or bare
+    /// identifier (NULL / CURRENT_TIMESTAMP) (cms only).
+    #[cfg(feature = "cms")]
+    fn consume_default_value(&mut self) -> Result<(), String> {
+        match self.peek() {
+            STok::Str(_) | STok::Int(_) | STok::Float(_) | STok::Ident(_) => {
+                let _ = self.next();
+                Ok(())
+            }
+            t => Err(format!("SQL: bad DEFAULT value {:?}", t)),
+        }
+    }
+
+    /// True when the next token starts a MySQL constraint line inside
+    /// CREATE TABLE (cms only): KEY / INDEX / UNIQUE / FULLTEXT / SPATIAL.
+    #[cfg(feature = "cms")]
+    fn peek_is_cms_constraint(&self) -> bool {
+        matches!(self.peek(), STok::Ident(w) if matches!(
+            w.to_ascii_uppercase().as_str(),
+            "KEY" | "INDEX" | "UNIQUE" | "FULLTEXT" | "SPATIAL"
+        ))
+    }
+
+    /// Parses one MySQL constraint line into the table's secondary indexes
+    /// (cms only). Composite keys keep only the first column (non-unique) —
+    /// a unique composite would reject valid rows under the single-column
+    /// index model.
+    #[cfg(feature = "cms")]
+    fn parse_cms_table_constraint(&mut self, t: &mut ChromosomeTable) -> Result<(), String> {
+        let unique = self.kw("UNIQUE");
+        let fulltext = self.kw("FULLTEXT") || self.kw("SPATIAL");
+        // Optional second keyword: UNIQUE KEY / UNIQUE INDEX / FULLTEXT KEY /
+        // plain KEY / INDEX.
+        let _ = self.kw("KEY") || self.kw("INDEX");
+        // Optional index name (absent when the column list starts directly).
+        let mut name = String::new();
+        if !matches!(self.peek(), STok::LParen) {
+            name = self.ident()?;
+        }
+        self.expect(STok::LParen)?;
+        let mut first_col = String::new();
+        let mut composite = false;
+        loop {
+            let c = self.ident()?;
+            self.consume_type_len()?; // (191) prefix length — dropped
+            if first_col.is_empty() {
+                first_col = c;
+            } else {
+                composite = true;
+            }
+            if matches!(self.peek(), STok::Comma) {
+                self.next();
+            } else {
+                break;
+            }
+        }
+        self.expect(STok::RParen)?;
+        if first_col.is_empty() {
+            return Err("SQL: empty key column list".into());
+        }
+        if name.is_empty() {
+            name = format!("{}_{}_idx", t.name, first_col);
+        }
+        let enforced_unique = unique && !composite && !fulltext;
+        t.secondary_indexes.push(SecondaryIndexMeta {
+            name,
+            column: first_col,
+            unique: enforced_unique,
+        });
+        Ok(())
     }
 
     /// CREATE [UNIQUE handled above] INDEX [IF NOT EXISTS] name ON table (col)
@@ -1952,6 +2196,8 @@ impl SqlEngine {
             schemas: RwLock::new(BTreeMap::new()),
             complement_index: RwLock::new(ComplementIndex::new()),
             cte_store: std::sync::Mutex::new(std::collections::HashMap::new()),
+            #[cfg(feature = "cms")]
+            cms_sequences: std::sync::Arc::new(crate::cms::sequence::AutoIncrementRegistry::new()),
         };
         if let Err(error) = s.load_schemas_from_disk() {
             eprintln!("[SQL] Could not rebuild persisted schema/index state: {error}");
@@ -3822,6 +4068,48 @@ impl SqlEngine {
             std::collections::HashMap::new();
         for row in rows {
             let map: BTreeMap<String, Value> = row.into_iter().collect();
+            // CMS edition: AUTO_INCREMENT assignment. A missing / NULL / 0
+            // value for the sequence column gets the next generated id;
+            // an explicit id > 0 moves the counter forward (MySQL keeps
+            // monotonicity after explicit inserts). Seeded lazily from
+            // MAX(pk) so a restarted server resumes the sequence.
+            #[cfg(feature = "cms")]
+            let map = {
+                let mut map = map;
+                if let Some(auto_col) = schema.auto_increment_column.clone() {
+                    let needs_id = match map.get(&auto_col) {
+                        None | Some(Value::Null) => true,
+                        Some(Value::Int(0)) => true,
+                        _ => false,
+                    };
+                    if needs_id {
+                        let prefix = format!("{}:", table);
+                        let seed = || -> Result<u64, String> {
+                            let raw = self
+                                .engine
+                                .scan_prefix(prefix.as_bytes())
+                                .map_err(|e| e.to_string())?;
+                            let mut max = 0u64;
+                            for (k, _) in raw {
+                                let key = String::from_utf8_lossy(&k).to_string();
+                                if let Some(sfx) = key.strip_prefix(prefix.as_str()) {
+                                    if let Ok(v) = sfx.parse::<u64>() {
+                                        max = max.max(v);
+                                    }
+                                }
+                            }
+                            Ok(max)
+                        };
+                        let next_id = self.cms_sequences.next(table, seed)?;
+                        map.insert(auto_col, Value::Int(next_id as i64));
+                    } else if let Some(Value::Int(v)) = map.get(&auto_col) {
+                        if *v > 0 {
+                            self.cms_sequences.bump_to(table, *v as u64);
+                        }
+                    }
+                }
+                map
+            };
             let pk = Self::pk_of(&schema, &map)?;
             let key = Self::row_key(table, &pk);
             if !seen_keys.insert(key.clone()) {

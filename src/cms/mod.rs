@@ -24,11 +24,18 @@
 //!
 //! Build: `cargo build --release --features cms`
 
+pub mod compat;
+pub mod ddl_meta;
 pub mod errno;
 pub mod locks;
+pub mod sequence;
 pub mod session;
+pub mod wordpress;
 
+pub use compat::{CmsError, CmsQueryResult, CmsSqlGate};
+pub use ddl_meta::{CmsColumnMeta, CmsIndexMeta, CmsTableMeta};
 pub use locks::LockRegistry;
+pub use sequence::AutoIncrementRegistry;
 pub use session::{CmsSession, Charset, SqlModeFlag};
 
 /// Human-readable edition banner for `--version` output and startup logs.

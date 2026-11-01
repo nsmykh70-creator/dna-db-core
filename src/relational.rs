@@ -216,6 +216,12 @@ pub struct ChromosomeTable {
     /// Older persisted schemas decode with an empty list.
     #[serde(default)]
     pub secondary_indexes: Vec<SecondaryIndexMeta>,
+    /// CMS edition (branch cms-edition): name of the AUTO_INCREMENT column
+    /// when the table was created with one (`--features cms`). Serde default
+    /// keeps older persisted schemas decodable; builds without the cms
+    /// feature simply carry `None`.
+    #[serde(default)]
+    pub auto_increment_column: Option<String>,
 }
 
 impl ChromosomeTable {
@@ -226,6 +232,7 @@ impl ChromosomeTable {
             foreign_keys: Vec::new(),
             primary_locus_column: pk_col.into(),
             secondary_indexes: Vec::new(),
+            auto_increment_column: None,
         }
     }
 

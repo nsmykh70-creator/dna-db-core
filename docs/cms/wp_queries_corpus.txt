@@ -1,0 +1,143 @@
+# DNA-DB CMS Edition — корпус SQL-запросов WordPress / WooCommerce
+# =====================================================================
+# Ветка: cms-edition. Назначение: каноническое ТЗ для диалект-слоя
+# (cms::compat → sql_engine) и критерий полноты фазы 1.
+#
+# Источник: канонические паттерны wp-includes/* (wpdb, WP_Query,
+# wp-includes/taxonomy.php, option.php) и dbDelta (wp-admin/includes/upgrade.php).
+# Формат: [метка:подметка] SQL — комментарий (что упражняет).
+# Метки:  P1 = фаза 1 (drop-in MVP), P2 = фаза 2 (Woo/транзакции),
+#         DDL = dbDelta, SYS = системный слой (сессия/каталог).
+
+# ---------------------------------------------------------------------
+# SYS. Соединение и сессия (каждый запрос PHP-FPM открывает новое соед.)
+# ---------------------------------------------------------------------
+[P1:SYS] SET NAMES utf8mb4
+[P1:SYS] SET sql_mode = ''                       -- расслабленный режим, типичен для WP-хостингов
+[P1:SYS] SET autocommit = 1
+[P1:SYS] SELECT @@SESSION.sql_mode               -- wpdb::db_check / диагностические плагины
+[P1:SYS] SELECT VERSION()                        -- wpdb::db_version(), Site Health
+[P1:SYS] SHOW FULL COLUMNS FROM wp_options       -- dbDelta сравнивает вывод ПОЛЕ ЗА ПОЛЕМ
+[P1:SYS] SHOW INDEX FROM wp_options
+[P1:SYS] SHOW TABLES LIKE 'wp\\_%'               -- активация плагинов, Site Health
+[P2:SYS] SELECT GET_LOCK('wp_upgrade_lock', 0)   -- ядро/плагины: единственный прогон
+[P2:SYS] SELECT RELEASE_LOCK('wp_upgrade_lock')
+[P2:SYS] SELECT IS_FREE_LOCK('wp_cron_lock')
+
+# ---------------------------------------------------------------------
+# OPTIONS. wp_options: самая горячая таблица (autoload на каждый хит)
+# ---------------------------------------------------------------------
+[P1] SELECT option_name, option_value FROM wp_options WHERE autoload = 'yes'
+[P1] SELECT option_value FROM wp_options WHERE option_name = 'siteurl' LIMIT 1
+[P1] SELECT option_value FROM wp_options WHERE option_name IN ('template','stylesheet','blogname') -- get_option(массив)
+[P1] INSERT INTO wp_options (option_name, option_value, autoload) VALUES ('foo','bar','yes') -- без option_id → AUTO_INCREMENT
+[P1] SELECT LAST_INSERT_ID()                     -- wpdb::insert_id после каждой вставки
+[P1] UPDATE wp_options SET option_value = 'bar' WHERE option_name = 'foo'
+[P1] INSERT INTO wp_options (option_name, option_value, autoload) VALUES ('foo','bar','yes')
+     ON DUPLICATE KEY UPDATE option_value = VALUES(option_value), autoload = 'yes'   -- add/update_option
+[P1] DELETE FROM wp_options WHERE option_name = '_transient_timeout_foo'
+[P1] DELETE FROM wp_options WHERE option_name LIKE ('\_transient\_%')                -- очистка транзиентов
+[P1] SELECT COUNT(*) FROM wp_options WHERE option_name LIKE '_transient_%'           -- Site Health
+
+# ---------------------------------------------------------------------
+# POSTS. wp_posts / wp_postmeta: WP_Query, редактор, меты
+# ---------------------------------------------------------------------
+[P1] SELECT ID, post_author, post_date, post_content, post_title, post_status, post_name, post_parent, guid
+     FROM wp_posts WHERE ID = 42 LIMIT 1
+[P1] SELECT SQL_CALC_FOUND_ROWS wp_posts.ID FROM wp_posts
+     WHERE 1=1 AND wp_posts.post_type = 'post' AND (wp_posts.post_status = 'publish')
+     ORDER BY wp_posts.post_date DESC LIMIT 0, 10                                   -- список записей + пагинация
+[P1] SELECT FOUND_ROWS()                                         -- вторая половина SQL_CALC_FOUND_ROWS
+[P1] SELECT ID FROM wp_posts WHERE post_name = 'hello-world' AND post_type = 'post' -- get_page_by_path
+[P1] INSERT INTO wp_posts (post_author, post_date, post_date_gmt, post_content, post_title,
+     post_status, post_name, post_modified, post_modified_gmt, post_type)
+     VALUES (1, '2026-11-02 10:00:00', '2026-11-02 10:00:00', '<p>body</p>', 'Title',
+             'publish', 'title', '2026-11-02 10:00:00', '2026-11-02 10:00:00', 'post')
+[P1] UPDATE wp_posts SET post_content = '<p>new</p>', post_modified = '2026-11-02 11:00:00' WHERE ID = 42
+[P1] DELETE FROM wp_posts WHERE ID = 42                          -- + каскад мет/комментов на стороне PHP
+[P1] SELECT post_date_gmt FROM wp_posts WHERE post_status = 'auto-draft' AND post_date_gmt = '0000-00-00 00:00:00' LIMIT 1  -- нулевые даты черновиков!
+
+# meta-запросы (WP_Meta_Query): AND/сравнение/сортировка по мете
+[P1] SELECT wp_posts.ID FROM wp_posts
+     INNER JOIN wp_postmeta ON ( wp_posts.ID = wp_postmeta.post_id )
+     WHERE 1=1 AND wp_posts.post_type = 'post' AND wp_posts.post_status = 'publish'
+       AND ( ( wp_postmeta.meta_key = '_thumbnail_id' ) )
+     GROUP BY wp_posts.ID                                          -- DISTINCT-семантика
+[P1] SELECT post_id, meta_key, meta_value FROM wp_postmeta WHERE post_id = 42     -- get_post_meta(all)
+[P1] SELECT meta_value FROM wp_postmeta WHERE meta_key = '_wp_attached_file' AND post_id = 7
+[P1] INSERT INTO wp_postmeta (post_id, meta_key, meta_value) VALUES (42, '_edit_lock', '1762000000:1')
+[P1] UPDATE wp_postmeta SET meta_value = 'v2' WHERE meta_key = '_edit_lock' AND post_id = 42
+[P1] SELECT wp_posts.* FROM wp_posts
+     INNER JOIN wp_postmeta AS mt1 ON (wp_posts.ID = mt1.post_id)
+     INNER JOIN wp_postmeta AS mt2 ON (wp_posts.ID = mt2.post_id)
+     WHERE mt1.meta_key = 'color' AND mt1.meta_value = 'red'
+       AND mt2.meta_key = 'size'  AND mt2.meta_value = 'xl'                          -- два JOIN одной таблицы!
+[P1] SELECT SQL_CALC_FOUND_ROWS wp_posts.ID FROM wp_posts
+     INNER JOIN wp_postmeta ON (wp_posts.ID = wp_postmeta.post_id)
+     WHERE (wp_postmeta.meta_key = 'price' AND CAST(wp_postmeta.meta_value AS SIGNED) > 100)
+     ORDER BY wp_postmeta.meta_value+0 DESC LIMIT 0,20                               -- сортировка по мете (числ.)
+
+# ---------------------------------------------------------------------
+# TAXONOMY. wp_terms / wp_term_taxonomy / wp_term_relationships
+# ---------------------------------------------------------------------
+[P1] SELECT t.*, tt.* FROM wp_terms AS t
+     INNER JOIN wp_term_taxonomy AS tt ON t.term_id = tt.term_id
+     WHERE tt.taxonomy IN ('category') AND t.slug IN ('news') ORDER BY t.name ASC    -- get_terms
+[P1] SELECT tr.object_id FROM wp_term_relationships AS tr
+     INNER JOIN wp_term_taxonomy AS tt ON tr.term_taxonomy_id = tt.term_taxonomy_id
+     WHERE tt.term_id IN (4) AND tt.taxonomy = 'category'                            -- объекты терма
+[P1] SELECT term_id FROM wp_terms WHERE slug = 'news' OR name = 'News' LIMIT 1      -- term_exists (ci!)
+[P1] INSERT INTO wp_terms (name, slug, term_group) VALUES ('News', 'news', 0)
+[P1] INSERT INTO wp_term_relationships (object_id, term_taxonomy_id, term_order) VALUES (42, 7, 0)
+     ON DUPLICATE KEY UPDATE term_order = VALUES(term_order)     -- составной PK (object_id, term_taxonomy_id)!
+
+# ---------------------------------------------------------------------
+# USERS. wp_users / wp_usermeta
+# ---------------------------------------------------------------------
+[P1] SELECT * FROM wp_users WHERE user_login = 'admin'                              -- вход (ci?)
+[P1] SELECT user_id FROM wp_usermeta WHERE meta_key = 'wp_capabilities' AND meta_value LIKE '%administrator%'
+[P1] INSERT INTO wp_usermeta (user_id, meta_key, meta_value) VALUES (1, 'nickname', 'Admin')
+[P1] SELECT COUNT(*) FROM wp_users                                                  -- Site Health
+
+# ---------------------------------------------------------------------
+# COMMENTS. wp_comments / wp_commentmeta
+# ---------------------------------------------------------------------
+[P1] SELECT * FROM wp_comments WHERE comment_post_ID = 42 AND comment_approved = '1' ORDER BY comment_date_gmt
+[P1] SELECT COUNT(*) FROM wp_comments WHERE comment_post_ID = 42 AND comment_approved = '1'
+[P1] UPDATE wp_comments SET comment_approved = '1' WHERE comment_ID = 5
+
+# ---------------------------------------------------------------------
+# DDL. dbDelta: активация/обновление схемы (сравнение текстуальное!)
+# ---------------------------------------------------------------------
+[DDL]    CREATE TABLE wp_options ( option_id bigint(20) unsigned NOT NULL auto_increment,
+         option_name varchar(191) NOT NULL default '', option_value longtext NOT NULL,
+         autoload varchar(20) NOT NULL default 'yes',
+         PRIMARY KEY  (option_id), UNIQUE KEY option_name (option_name) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+[DDL]    SHOW FULL COLUMNS FROM wp_options   -- dbDelta требует ТОЧНО: Field/Type/Null/Key/Default/Extra
+[DDL]    ALTER TABLE wp_options ADD COLUMN new_col varchar(64) NOT NULL DEFAULT ''
+[DDL]    ALTER TABLE wp_options DROP COLUMN old_col
+[DDL]    CREATE INDEX option_name_idx ON wp_options (option_name)   -- dbDelta не делает DROP INDEX сам
+[DDL]    SHOW FULL COLUMNS FROM wp_postmeta  -- longtext/meta_value без длины: префиксный индекс 191
+
+# ---------------------------------------------------------------------
+# WOOCOMMERCE. Фаза 2: транзакции, FOR UPDATE, decimal, deadlock-retry
+# ---------------------------------------------------------------------
+[P2] START TRANSACTION
+[P2] SELECT stock_quantity FROM wp_wc_product_meta_lookup WHERE product_id = 42 FOR UPDATE
+[P2] UPDATE wp_wc_product_meta_lookup SET stock_quantity = stock_quantity - 1 WHERE product_id = 42
+[P2] COMMIT
+[P2] ROLLBACK                              -- при deadlock (errno 1213) WooCommerce повторяет
+[P2] SELECT TOTAL_SALES FROM wp_wc_product_meta_lookup WHERE product_id = 42   -- decimal (в нас: Float64)
+[P2] SELECT order_id FROM wp_wc_orders WHERE status = 'processing' ORDER BY date_created_gmt DESC LIMIT 25
+[P2] SELECT COUNT(DISTINCT customer_id) FROM wp_wc_orders WHERE status IN ('wc-completed','wc-processing')
+
+# ---------------------------------------------------------------------
+# Известные расширения диалекта, которые надо не сломать:
+#   ORDER BY wp_posts.post_date DESC, wp_posts.ID DESC   (multi-key)
+#   ORDER BY FIELD(post_status, 'publish','draft')       (редко, плагины)
+#   GROUP BY ... HAVING COUNT(*) > 2                     (sql_engine уже умеет)
+#   SELECT DISTINCT post_author FROM wp_posts
+#   IFNULL(meta_value, ''), CONCAT(...), NOW(), DATE_ADD(NOW(), INTERVAL 1 HOUR),
+#   UNIX_TIMESTAMP(), FROM_UNIXTIME(1762000000), CAST(x AS UNSIGNED)
+#   LIKE '%term%'  (без индекса — в DNA-DB точка расширения под триграммы)
+# ---------------------------------------------------------------------
