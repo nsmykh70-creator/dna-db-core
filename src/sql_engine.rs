@@ -18,7 +18,7 @@
 
 use crate::complement_index::ComplementIndex;
 use crate::engine::Engine;
-use crate::expr::{ArithOp, CmpOp, Expr};
+use crate::expr::{ArithOp, CastTy, CmpOp, Expr};
 use crate::relational::{
     encode_index_value, encode_ordered_value, ChromosomeTable, ColumnType, ForeignKeyConstraint,
     RowCodec, SecondaryIndexMeta, Value,
@@ -323,7 +323,9 @@ pub enum Stmt {
     },
     Update {
         table: String,
-        assignments: Vec<(String, Value)>,
+        /// v4.2-cms: SET rhs is a full expression evaluated against the OLD
+        /// row (MySQL semantics) — `SET stock = stock - 1` (WooCommerce).
+        assignments: Vec<(String, Expr)>,
         where_clause: Option<Expr>,
     },
     Delete {
@@ -1042,6 +1044,11 @@ impl SParser {
                 }
                 if matches!(self.peek(), STok::LParen) {
                     self.next();
+                    let mut distinct = false;
+                    if matches!(self.peek(), STok::Ident(d) if d.eq_ignore_ascii_case("DISTINCT")) {
+                        self.next();
+                        distinct = true;
+                    }
                     let arg = if matches!(self.peek(), STok::Star) {
                         self.next();
                         None
@@ -1049,7 +1056,7 @@ impl SParser {
                         Some(self.ident()?)
                     };
                     self.expect(STok::RParen)?;
-                    key = render_agg(&key, arg.as_deref());
+                    key = render_agg_distinct(&key, arg.as_deref(), distinct);
                 }
                 let asc = if self.kw("DESC") {
                     false
@@ -1242,6 +1249,11 @@ impl SParser {
             if matches!(self.peek_at(1), STok::LParen) && AggFunc::from_name(&s).is_ok() {
                 self.next();
                 self.next(); // (
+                let mut distinct = false;
+                if matches!(self.peek(), STok::Ident(d) if d.eq_ignore_ascii_case("DISTINCT")) {
+                    self.next();
+                    distinct = true;
+                }
                 let arg = if matches!(self.peek(), STok::Star) {
                     self.next();
                     None
@@ -1249,8 +1261,11 @@ impl SParser {
                     Some(self.ident()?)
                 };
                 self.expect(STok::RParen)?;
+                if distinct && arg.is_none() {
+                    return Err("SQL: DISTINCT aggregate requires a column argument".into());
+                }
                 let func = AggFunc::from_name(&s)?;
-                let canonical = render_agg(&s, arg.as_deref());
+                let canonical = render_agg_distinct(&s, arg.as_deref(), distinct);
                 let alias = self.maybe_as_alias()?;
                 let rendered = alias.clone().unwrap_or_else(|| canonical.clone());
                 return Ok(SelectItem::Agg {
@@ -1517,7 +1532,9 @@ impl SParser {
                 STok::Eq => {}
                 t => return Err(format!("SQL: expected = in SET, got {:?}", t)),
             }
-            let v = self.value()?;
+            // v4.2-cms: rhs may be a column/arithmetic expression — it is
+            // evaluated per-row against the pre-update values.
+            let v = self.parse_operand()?;
             assignments.push((col, v));
             if matches!(self.peek(), STok::Comma) {
                 self.next();
@@ -2195,11 +2212,55 @@ impl SParser {
                 Ok(Expr::Literal(typed_string_literal(&s)))
             }
             STok::Ident(s) => {
+                // MySQL `CAST(expr AS type)` (WordPress meta queries:
+                // `CAST(meta_value AS SIGNED) > 100`).
+                if s.eq_ignore_ascii_case("CAST") && matches!(self.peek_at(1), STok::LParen) {
+                    self.next();
+                    self.next(); // (
+                    let inner = self.parse_or()?;
+                    self.expect_kw("AS")?;
+                    let ty = match self.next() {
+                        STok::Ident(t) if t.eq_ignore_ascii_case("SIGNED") => CastTy::Signed,
+                        STok::Ident(t) if t.eq_ignore_ascii_case("UNSIGNED") => CastTy::Unsigned,
+                        STok::Ident(t)
+                            if t.eq_ignore_ascii_case("CHAR")
+                                || t.eq_ignore_ascii_case("NCHAR")
+                                || t.eq_ignore_ascii_case("BINARY") =>
+                        {
+                            CastTy::Char
+                        }
+                        t => {
+                            return Err(format!(
+                                "SQL: CAST expects SIGNED/UNSIGNED/CHAR, got {:?}",
+                                t
+                            ))
+                        }
+                    };
+                    // Optional CHAR(n) width / SIGNED INTEGER keyword.
+                    if matches!(self.peek(), STok::LParen) {
+                        self.next();
+                        let _ = self.next(); // width literal
+                        self.expect(STok::RParen)?;
+                    } else if matches!(self.peek(), STok::Ident(w) if w.eq_ignore_ascii_case("INTEGER"))
+                    {
+                        self.next();
+                    }
+                    self.expect(STok::RParen)?;
+                    return Ok(Expr::Cast {
+                        inner: Box::new(inner),
+                        ty,
+                    });
+                }
                 // aggregate reference (HAVING COUNT(*) > 2): resolves to the
                 // rendered aggregate column of the grouped result row.
                 if matches!(self.peek_at(1), STok::LParen) && AggFunc::from_name(&s).is_ok() {
                     self.next();
                     self.next(); // (
+                    let mut distinct = false;
+                    if matches!(self.peek(), STok::Ident(d) if d.eq_ignore_ascii_case("DISTINCT")) {
+                        self.next();
+                        distinct = true;
+                    }
                     let arg = if matches!(self.peek(), STok::Star) {
                         self.next();
                         None
@@ -2207,7 +2268,11 @@ impl SParser {
                         Some(self.ident()?)
                     };
                     self.expect(STok::RParen)?;
-                    return Ok(Expr::Column(render_agg(&s, arg.as_deref())));
+                    return Ok(Expr::Column(render_agg_distinct(
+                        &s,
+                        arg.as_deref(),
+                        distinct,
+                    )));
                 }
                 self.next();
                 if s.eq_ignore_ascii_case("NULL") {
@@ -2501,6 +2566,7 @@ fn collect_expr_tables(expr: &Expr, out: &mut Vec<String>) -> Result<(), String>
             collect_expr_tables(left, out)?;
             collect_expr_tables(right, out)?;
         }
+        Expr::Cast { inner, .. } => collect_expr_tables(inner, out)?,
         Expr::Literal(_) | Expr::Column(_) | Expr::InList { .. } => {}
     }
     Ok(())
@@ -3501,6 +3567,10 @@ impl SqlEngine {
                 left: Box::new(self.resolve_expr_for_row(left, row)?),
                 right: Box::new(self.resolve_expr_for_row(right, row)?),
             },
+            Expr::Cast { inner, ty } => Expr::Cast {
+                inner: Box::new(self.resolve_expr_for_row(inner, row)?),
+                ty: *ty,
+            },
             Expr::Literal(_) | Expr::Column(_) | Expr::InList { .. } => e.clone(),
         })
     }
@@ -3542,6 +3612,10 @@ impl SqlEngine {
                     op: *op,
                     left: Box::new(rewrite(left, row, refs)),
                     right: Box::new(rewrite(right, row, refs)),
+                },
+                Expr::Cast { inner, ty } => Expr::Cast {
+                    inner: Box::new(rewrite(inner, row, refs)),
+                    ty: *ty,
                 },
                 other => other.clone(),
             }
@@ -3670,7 +3744,7 @@ impl SqlEngine {
             } => {
                 let set = assignments
                     .iter()
-                    .map(|(k, v)| format!("{} = {}", k, v))
+                    .map(|(k, v)| format!("{} = {}", k, v.describe()))
                     .collect::<Vec<_>>()
                     .join(", ");
                 let w = where_clause
@@ -4766,7 +4840,7 @@ impl SqlEngine {
     fn exec_update_tx(
         &self,
         table: &str,
-        assignments: &[(String, Value)],
+        assignments: &[(String, Expr)],
         where_clause: Option<Expr>,
         mut sink: Option<&mut SqlTxBuffer>,
     ) -> Result<
@@ -4818,8 +4892,11 @@ impl SqlEngine {
             let old_pk = Self::pk_of(&schema, &row)?;
             let old_key = Self::row_key(table, &old_pk);
             let mut new_row = row.clone();
-            for (col, val) in assignments {
-                new_row.insert(col.clone(), val.clone());
+            for (col, e) in assignments {
+                // MySQL semantics: every SET rhs sees the row's OLD values
+                // (`stock_quantity = stock_quantity - 1`). Eval failure
+                // (unknown column/subquery) yields NULL — three-valued logic.
+                new_row.insert(col.clone(), e.eval(&row).unwrap_or(Value::Null));
             }
             let pk = Self::pk_of(&schema, &new_row)?;
             let key = Self::row_key(table, &pk);
@@ -5421,13 +5498,53 @@ impl SqlEngine {
                 for item in projection {
                     match item {
                         SelectItem::Column { source, alias } => {
+                            // v4.2-cms: resolve the projection column against
+                            // the JOIN universe (FROM + every JOIN table).
+                            // MySQL collations are case-insensitive —
+                            // `SELECT TOTAL_SALES` resolves to total_sales;
+                            // a truly unknown column is MySQL errno 1054,
+                            // not a silent NULL cell. When no schema is
+                            // reachable at all (system/dynamic sources) the
+                            // legacy pass-through applies.
+                            let mut universe: Vec<String> = vec![from.to_string()];
+                            universe.extend(joins.iter().map(|j| j.table.clone()));
+                            let mut resolved: Option<String> = None;
+                            let mut any_schema = false;
+                            for t in &universe {
+                                if let Some(schema) = self.get_schema(t) {
+                                    any_schema = true;
+                                    if schema.columns.contains_key(source.as_str()) {
+                                        resolved = Some(source.clone());
+                                        break;
+                                    }
+                                    if let Some(actual) = schema
+                                        .columns
+                                        .keys()
+                                        .find(|c| c.eq_ignore_ascii_case(source))
+                                    {
+                                        resolved = Some(actual.clone());
+                                        break;
+                                    }
+                                }
+                            }
+                            let resolved = match resolved {
+                                Some(r) => r,
+                                None if any_schema => {
+                                    return Err(format!(
+                                        "SQL: unknown column '{}' in SELECT projection (tables: {})",
+                                        source,
+                                        universe.join(", ")
+                                    ))
+                                }
+                                None => source.clone(),
+                            };
                             let out = alias.clone().unwrap_or_else(|| source.clone());
                             specs.push(if out == *source {
                                 source.clone()
                             } else {
                                 format!("{} AS {}", source, out)
                             });
-                            columns.push((source.clone(), out));
+                            columns.push((resolved, out));
                         }
                         SelectItem::ScalarSub { canonical, rendered, .. } => {
                             specs.push(format!("{} AS {}", canonical, rendered));
@@ -5782,6 +5899,10 @@ impl SqlEngine {
                     left: Box::new(walk(sql, left)?),
                     right: Box::new(walk(sql, right)?),
                 }),
+                Expr::Cast { inner, ty } => Ok(Expr::Cast {
+                    inner: Box::new(walk(sql, inner)?),
+                    ty: *ty,
+                }),
                 Expr::And(a, b) => Ok(Expr::And(Box::new(walk(sql, a)?), Box::new(walk(sql, b)?))),
                 Expr::Or(a, b) => Ok(Expr::Or(Box::new(walk(sql, a)?), Box::new(walk(sql, b)?))),
                 Expr::Cmp { op, left, right } => Ok(Expr::Cmp {
@@ -5836,8 +5957,16 @@ impl SqlEngine {
             saw_float: Vec<bool>,
             mins: Vec<Option<Value>>,
             maxs: Vec<Option<Value>>,
+            // DISTINCT aggregates (COUNT(DISTINCT col)): encoded values seen
+            // per group; duplicates do not count twice.
+            seen: Vec<std::collections::HashSet<Vec<u8>>>,
         }
         let n_agg = agg_items.len();
+        // "COUNT(DISTINCT customer_id)" — canonical carries the DISTINCT form.
+        let distinct: Vec<bool> = agg_items
+            .iter()
+            .map(|(canonical, _, _, _)| canonical.contains("(DISTINCT"))
+            .collect();
         let mut groups: std::collections::BTreeMap<Vec<u8>, GroupState> =
             std::collections::BTreeMap::new();
 
@@ -5862,6 +5991,7 @@ impl SqlEngine {
                 saw_float: vec![false; n_agg],
                 mins: vec![None; n_agg],
                 maxs: vec![None; n_agg],
+                seen: vec![std::collections::HashSet::new(); n_agg],
             });
             for (i, (_, _, func, arg)) in agg_items.iter().enumerate() {
                 state.counts[i] += 1;
@@ -5875,6 +6005,11 @@ impl SqlEngine {
                 };
                 if let Some(v) = value {
                     if !v.is_null() {
+                        if distinct[i] && !state.seen[i].insert(encode_index_value(v)) {
+                            // Duplicate value in the group — MySQL DISTINCT
+                            // semantics: counted/summed once.
+                            continue;
+                        }
                         state.non_null[i] += 1;
                         match (func, v) {
                             (AggFunc::Sum | AggFunc::Avg, Value::Int(n)) => {
@@ -5917,6 +6052,7 @@ impl SqlEngine {
                     saw_float: vec![false; n_agg],
                     mins: vec![None; n_agg],
                     maxs: vec![None; n_agg],
+                    seen: vec![std::collections::HashSet::new(); n_agg],
                 },
             );
         }
@@ -6244,7 +6380,9 @@ fn parse_rendered_agg(name: &str) -> Option<(AggFunc, Option<String>)> {
     let arg = if arg == "*" || arg.is_empty() {
         None
     } else {
-        Some(arg.to_string())
+        // COUNT(DISTINCT col): HAVING/ORDER BY references render the
+        // canonical form; the aggregation itself runs on the bare column.
+        Some(arg.strip_prefix("DISTINCT ").unwrap_or(arg).to_string())
     };
     Some((func, arg))
 }
@@ -6299,6 +6437,19 @@ fn render_agg(func: &str, arg: Option<&str>) -> String {
     format!("{}({})", func.to_ascii_uppercase(), arg.unwrap_or("*"))
 }
 
+/// Like render_agg, but emits the MySQL DISTINCT form `COUNT(DISTINCT col)`.
+fn render_agg_distinct(func: &str, arg: Option<&str>, distinct: bool) -> String {
+    if distinct {
+        format!(
+            "{}(DISTINCT {})",
+            func.to_ascii_uppercase(),
+            arg.unwrap_or("*")
+        )
+    } else {
+        render_agg(func, arg)
+    }
+}
+
 /// SQL rendering of a parsed expression (string literals re-quoted) — used
 /// to serialise IN-subqueries for re-execution.
 fn expr_to_sql(e: &Expr) -> String {
@@ -6349,6 +6500,9 @@ fn expr_to_sql(e: &Expr) -> String {
                 op.as_str(),
                 expr_to_sql(right)
             )
+        }
+        Expr::Cast { inner, ty } => {
+            format!("CAST({} AS {})", expr_to_sql(inner), ty.as_str())
         }
         Expr::InList { column, values } => format!(
             "{} IN ({})",
@@ -6636,6 +6790,7 @@ fn expr_has_subquery(e: &Expr) -> bool {
             expr_has_subquery(left) || expr_has_subquery(right)
         }
         Expr::Like { operand, .. } => expr_has_subquery(operand),
+        Expr::Cast { inner, .. } => expr_has_subquery(inner),
         Expr::Literal(_) | Expr::Column(_) | Expr::InList { .. } => false,
     }
 }

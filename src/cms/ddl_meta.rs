@@ -491,6 +491,11 @@ impl CmsTableMeta {
                 r.insert("Null".into(), Value::Text(String::new()));
                 r.insert("Index_type".into(), Value::Text("BTREE".into()));
                 r.insert("Comment".into(), Value::Text(String::new()));
+                // MariaDB reports these two on every index row (the last
+                // column is Ignored in the MariaDB shape, Is_visible in
+                // MySQL 8); dbDelta and Site Health read the full shape.
+                r.insert("Index_comment".into(), Value::Text(String::new()));
+                r.insert("Ignored".into(), Value::Text("NO".into()));
                 rows.push(r);
             }
         };

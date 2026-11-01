@@ -31,8 +31,9 @@ use crate::relational::{ColumnType, Value};
 use crate::sql_engine::SqlEngine;
 
 /// Version string reported to CMS clients (wpdb::db_version gate checks the
-/// numeric prefix; "8.0.36" keeps every version_compare branch happy).
-pub const MYSQL_COMPAT_VERSION: &str = "8.0.36";
+/// numeric prefix; the MariaDB form matches the reference engine used by the
+/// majority of WordPress hosting and the differential test corpus).
+pub const MYSQL_COMPAT_VERSION: &str = "10.11.11-MariaDB";
 
 /// Result envelope for the gate — a superset of what wpdb consumes.
 #[derive(Debug, Clone)]
@@ -506,7 +507,7 @@ impl CmsSqlGate {
                     "Table".into(), "Non_unique".into(), "Key_name".into(), "Seq_in_index".into(),
                     "Column_name".into(), "Collation".into(), "Cardinality".into(), "Sub_part".into(),
                     "Packed".into(), "Null".into(), "Index_type".into(), "Comment".into(),
-                    "Index_comment".into(), "Is_visible".into(),
+                    "Index_comment".into(), "Ignored".into(),
                 ],
                 rows,
                 message: Some(format!("{} index row(s)", found)),
@@ -635,7 +636,9 @@ impl CmsSqlGate {
             r.insert("Index_type".into(), Value::Text("BTREE".into()));
             r.insert("Comment".into(), Value::Text(String::new()));
             r.insert("Index_comment".into(), Value::Text(String::new()));
-            r.insert("Is_visible".into(), Value::Text("YES".into()));
+            // MariaDB form: the last SHOW INDEX column is Ignored (MySQL 8
+            // uses Is_visible — we follow the MariaDB shape like elsewhere).
+            r.insert("Ignored".into(), Value::Text("NO".into()));
             rows.push(r);
         };
         push("PRIMARY", 0, &schema.primary_locus_column, 1, None);

@@ -2,6 +2,40 @@
 
 ## Unreleased (CMS Edition — branch `cms-edition`)
 
+### Differential run #2 vs MariaDB 10.11.11 — 61/63 (2026-11-02)
+
+Reproduced the differential stand end-to-end (MariaDB 10.11.11 bintar,
+port 13306, `sql_mode=''` as on WP hosting; DNA-DB CMS release build,
+pgwire 15432) and closed five of the seven residual corpus divergences:
+
+- **`CAST(expr AS SIGNED|UNSIGNED|CHAR)`** — new `Expr::Cast` node
+  (`src/expr.rs`) with MySQL semantics: leading numeric prefix of text
+  (`'150abc'` → 150, `'abc'` → 0), rounding half away from zero, NULL
+  propagation; wired into the shared parser, eval, rewriters, DnaQL
+  rendering.
+- **`COUNT(DISTINCT col)`** (and SUM/AVG DISTINCT) — canonical DISTINCT
+  form in projections / HAVING / ORDER BY, per-group seen-sets in
+  `aggregate_rows` (WooCommerce admin queries).
+- **UPDATE SET expressions** — `SET stock_quantity = stock_quantity - 1`
+  parses as a full expression and evaluates against the OLD row (MySQL
+  semantics); `Stmt::Update` carries `Expr` rhs, pipeline (SQL→DnaQL)
+  still accepts literal-only assignments.
+- **Case-insensitive projection resolution + honest errno 1054** —
+  `SELECT TOTAL_SALES` resolves against the JOIN universe (FROM + all
+  joins, ci); a truly unknown column now returns MySQL errno 1054
+  instead of a silent NULL cell.
+- **`VERSION()` reports `10.11.11-MariaDB`** and **SHOW INDEX emits the
+  MariaDB 14-column shape** (`Index_comment=''` + `Ignored='NO'`, was
+  MySQL-8 `Is_visible`) — dbDelta/Site Health read the full row shape.
+
+Corpus result: **59 MATCH + 2 identical-error parities (1062/1091) =
+61/63 (97 %)** (was 56/63). Remaining documented gaps (фаза 2):
+`ORDER BY <expression>` (`meta_value+0` numeric-meta sort of WP_Query),
+`t.*, tt.*` column ORDER (engine returns BTreeMap order). Full report:
+`docs/cms/COMPARISON_MYSQL_REPORT.md`. ci column names in
+WHERE/GROUP BY and DECIMAL scale formatting stay on the фаза-2 collation
+track.
+
 ### Gate wiring + differential testing vs MySQL (2026-11-02)
 
 - **The compat gate is reachable from real clients now**: `CmsSqlGate` is

@@ -159,7 +159,18 @@ pub(crate) fn transpile(
             let locus = pk_locus(where_clause, &schema.primary_locus_column, table)?;
             let stmts = assignments
                 .iter()
-                .map(|(col, v)| Ok(format!("{}:{}.{} = {}", table, locus, col, literal(v)?)))
+                .map(|(col, e)| match e {
+                    // Pipeline form carries literals only; expression rhs
+                    // (`SET stock = stock - 1`) is engine-executable but has
+                    // no DnaQL pipeline rendering.
+                    Expr::Literal(v) => {
+                        Ok(format!("{}:{}.{} = {}", table, locus, col, literal(v)?))
+                    }
+                    _ => Err(format!(
+                        "SQL→DnaQL: UPDATE SET '{}' must be a literal (expression rhs is engine-only)",
+                        col
+                    )),
+                })
                 .collect::<Result<Vec<_>, String>>()?;
             if stmts.is_empty() {
                 return Err("SQL→DnaQL: UPDATE has no assignments".into());
@@ -449,6 +460,11 @@ fn expr(e: &Expr) -> Result<String, String> {
             "SQL→DnaQL: LIKE is not part of the DnaQL expression grammar; use exact comparisons"
                 .into(),
         ),
+        Expr::Cast { inner, ty } => Ok(format!(
+            "CAST({} AS {})",
+            expr(inner)?,
+            ty.as_str()
+        )),
     }
 }
 

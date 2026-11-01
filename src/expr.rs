@@ -65,6 +65,33 @@ pub enum Expr {
         pattern: String,
         negated: bool,
     },
+    /// `CAST(expr AS SIGNED|UNSIGNED|CHAR)` — typed conversion used by
+    /// WordPress meta queries (`CAST(meta_value AS SIGNED) > 100`).
+    /// MySQL rules: the numeric PREFIX of the text is taken ("150abc" ->
+    /// 150, "abc" -> 0), fractional values round half away from zero for
+    /// SIGNED, NULL propagates.
+    Cast {
+        inner: Box<Expr>,
+        ty: CastTy,
+    },
+}
+
+/// Target type of a `CAST(expr AS type)` conversion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CastTy {
+    Signed,
+    Unsigned,
+    Char,
+}
+
+impl CastTy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CastTy::Signed => "SIGNED",
+            CastTy::Unsigned => "UNSIGNED",
+            CastTy::Char => "CHAR",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,6 +199,13 @@ impl Expr {
                 let hit = like_match(pattern, &hay);
                 Some(Value::Int((hit != *negated) as i64))
             }
+            Expr::Cast { inner, ty } => {
+                let v = inner.eval(row)?;
+                if v.is_null() {
+                    return Some(Value::Null);
+                }
+                Some(cast_value(*ty, &v))
+            }
             Expr::Cmp { op, left, right } => {
                 let l = left.eval(row)?;
                 let r = right.eval(row)?;
@@ -240,6 +274,9 @@ impl Expr {
                 if *negated { "NOT " } else { "" },
                 pattern
             ),
+            Expr::Cast { inner, ty } => {
+                format!("CAST({} AS {})", inner.describe(), ty.as_str())
+            }
         }
     }
 
@@ -274,7 +311,89 @@ impl Expr {
                 right.collect_columns(out);
             }
             Expr::Like { operand, .. } => operand.collect_columns(out),
+            Expr::Cast { inner, .. } => inner.collect_columns(out),
         }
+    }
+}
+
+/// MySQL CAST semantics: numeric conversion reads the leading numeric
+/// prefix of the text ("150abc" -> 150, "abc" -> 0); SIGNED rounds
+/// fractional values half away from zero; CHAR stringifies.
+fn cast_value(ty: CastTy, v: &Value) -> Value {
+    match ty {
+        CastTy::Char => Value::Text(match v {
+            Value::Text(s) | Value::Dna(s) => s.clone(),
+            other => other.to_string(),
+        }),
+        CastTy::Signed | CastTy::Unsigned => {
+            let n = numeric_prefix(v);
+            let n = match n {
+                Some(f) => f,
+                None => return Value::Int(0),
+            };
+            // Round half away from zero (MySQL), saturating at i64 bounds.
+            let rounded = n.round();
+            let i = if rounded >= i64::MAX as f64 {
+                i64::MAX
+            } else if rounded <= i64::MIN as f64 {
+                i64::MIN
+            } else {
+                rounded as i64
+            };
+            if ty == CastTy::Unsigned && i < 0 {
+                Value::Int(0)
+            } else {
+                Value::Int(i)
+            }
+        }
+    }
+}
+
+/// Leading numeric prefix of a value per MySQL string-to-number rules.
+/// Returns None when there is no numeric prefix at all (caller maps it to
+/// 0); for text, parses an optional sign, digits, fraction and exponent.
+fn numeric_prefix(v: &Value) -> Option<f64> {
+    match v {
+        Value::Int(i) => Some(*i as f64),
+        Value::Float(f) => Some(*f),
+        Value::Text(s) | Value::Dna(s) => {
+            let t = s.trim_start();
+            let bytes = t.as_bytes();
+            let mut i = 0;
+            if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+                i += 1;
+            }
+            let digits_start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i < bytes.len() && bytes[i] == b'.' {
+                i += 1;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+            }
+            if i == digits_start {
+                return None; // no digits at all
+            }
+            // Optional exponent (only if at least one digit precedes it).
+            if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
+                let save = i;
+                i += 1;
+                if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+                    i += 1;
+                }
+                let exp_start = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                if i == exp_start {
+                    i = save; // not a valid exponent, rewind
+                }
+            }
+            t[..i].parse::<f64>().ok()
+        }
+        Value::Null => None,
     }
 }
 
@@ -424,5 +543,35 @@ mod tests {
             right: Box::new(Expr::Literal(Value::Int(0))),
         };
         assert!(!en.eval_bool(&r));
+    }
+
+    #[test]
+    fn cast_mysql_semantics() {
+        let signed = |lit: Value| Expr::Cast {
+            inner: Box::new(Expr::Literal(lit)),
+            ty: CastTy::Signed,
+        };
+        let r = BTreeMap::new();
+        // Numeric prefix: "150" -> 150, "19.9" -> 20 (rounds), "abc" -> 0.
+        assert_eq!(
+            signed(Value::Text("150".into())).eval(&r),
+            Some(Value::Int(150))
+        );
+        assert_eq!(
+            signed(Value::Text("19.9".into())).eval(&r),
+            Some(Value::Int(20))
+        );
+        assert_eq!(
+            signed(Value::Text("abc".into())).eval(&r),
+            Some(Value::Int(0))
+        );
+        // NULL propagates (SQL NULL, not "no value").
+        assert_eq!(signed(Value::Null).eval(&r), Some(Value::Null));
+        // CHAR stringifies.
+        let c = Expr::Cast {
+            inner: Box::new(Expr::Literal(Value::Int(42))),
+            ty: CastTy::Char,
+        };
+        assert_eq!(c.eval(&r), Some(Value::Text("42".into())));
     }
 }
