@@ -20,6 +20,22 @@
   tombstones); refuses a live data dir via the advisory lock (same as
   doctor). The resource benchmark now reports `disk_after_compact_mib`
   for DNA-DB alongside the raw footprint.
+- **Admin panel catches up with v4.1** (embedded SPA, `serve --admin-port`):
+  - `POST /api/explain` — SQL → DnaQL translation plus the physical storage
+    map for a statement **without executing it**. The SQL console shows the
+    block automatically after any mutating statement and on demand via the
+    new "SQL → DnaQL" button — the operator sees the exact chromosome,
+    locus, storage key and RowCodec representation before writing.
+  - "Физическое хранение" (🔬) button on every row of the table browser —
+    runs `SHOW STORAGE FOR <table> WHERE <pk> = …` and renders the
+    per-column map in a modal.
+  - `POST /api/compact` (admin only) — online full compaction safe under
+    concurrent readers; the new "Обслуживание" dashboard panel reports the
+    data-dir size before/after, freed bytes and removed-file count.
+  - `GET /api/health` now reports `data_dir_bytes`; the dashboard shows a
+    "Данные на диске" card (GiB-aware formatter, path in the tooltip).
+  - Tests: `admin::tests::panel_explain_compact_and_disk_size` (real
+    HTTP round-trips: ACL 403s for viewers, JOIN rejection, TX transpile).
 
 ## v4.0.0-GA (2026-10-31) — Enterprise production release
 

@@ -215,6 +215,8 @@ impl AdminPanel {
             ("GET", "/api/tables") => self.api_tables(&session),
             ("GET", "/api/browse") => self.api_browse(req, &session),
             ("POST", "/api/query") => self.api_query(&session, req),
+            ("POST", "/api/explain") => self.api_explain(&session, req),
+            ("POST", "/api/compact") => self.api_compact(&session),
             ("GET", "/api/me") => Response::json(
                 200,
                 &json!({
@@ -586,8 +588,107 @@ dnadb_stat_{key} {n}
                 "memtable_bytes": self.engine.memtable_size(),
                 "wal_bytes": self.engine.wal_size_bytes(),
                 "data_dir": self.engine.data_dir().display().to_string(),
+                "data_dir_bytes": dir_size(self.engine.data_dir()),
             }),
         )
+    }
+
+    /// v4.1: SQL → DnaQL translation plus the physical storage map for a
+    /// statement the operator is about to run — the panel-side counterpart of
+    /// the CLI `sql --to-dnaql` mode. Read-only: nothing is executed.
+    fn api_explain(&self, session: &Session, req: &Request) -> Response {
+        let body: J = match req.json_body() {
+            Some(b) => b,
+            None => return Response::json(400, &json!({"error": "invalid JSON body"})),
+        };
+        let query = body["query"].as_str().unwrap_or("").trim().to_string();
+        if query.is_empty() {
+            return Response::json(400, &json!({"error": "empty query"}));
+        }
+        // Same table ACL as /api/query: the storage map reveals where rows of
+        // a table live, so table-restricted users must not see foreign ones.
+        if session.role != "admin" && session.allowed_tables.is_some() {
+            let upper = query.to_ascii_uppercase();
+            if upper.starts_with("SHOW") || upper.starts_with("DESCRIBE") {
+                return Response::json(
+                    403,
+                    &json!({"error": "schema-wide queries are not available to table-restricted users"}),
+                );
+            }
+            match crate::sql_engine::referenced_tables(&query) {
+                Ok(tables) => {
+                    if let Err(message) = crate::access::authorize_tables(
+                        &session.role,
+                        &session.allowed_tables,
+                        &tables,
+                    ) {
+                        return Response::json(403, &json!({"error": message}));
+                    }
+                }
+                Err(message) => return Response::json(400, &json!({"error": message})),
+            }
+        }
+        // Both halves are best-effort: a statement may have no DnaQL
+        // equivalent (JOIN, CREATE INDEX) while still mapping to storage.
+        let (dnaql, dnaql_error) = match self.sql.sql_to_dnaql(&query) {
+            Ok(text) => (Some(text), None),
+            Err(e) => (None, Some(e)),
+        };
+        let (storage, storage_error) = match self.sql.explain_storage(&query) {
+            Ok(text) if !text.trim().is_empty() => (Some(text), None),
+            Ok(_) => (None, Some("no storage mapping for this statement".into())),
+            Err(e) => (None, Some(e)),
+        };
+        if dnaql.is_none() && storage.is_none() {
+            return Response::json(
+                400,
+                &json!({
+                    "error": dnaql_error.clone().unwrap_or_else(|| "cannot explain query".into()),
+                    "dnaql_error": dnaql_error,
+                    "storage_error": storage_error,
+                }),
+            );
+        }
+        Response::json(
+            200,
+            &json!({
+                "dnaql": dnaql,
+                "dnaql_error": dnaql_error,
+                "storage": storage,
+                "storage_error": storage_error,
+            }),
+        )
+    }
+
+    /// v4.1: online full compaction (admin only). Safe under concurrency —
+    /// readers use snapshots and the segment swap is atomic. Reports the data
+    /// directory size before/after so the panel can show the real win.
+    fn api_compact(&self, session: &Session) -> Response {
+        if let Some(response) = self.require_admin(session) {
+            return response;
+        }
+        let before = dir_size(self.engine.data_dir());
+        let started = Instant::now();
+        match self.engine.compact() {
+            Ok(removed) => {
+                let after = dir_size(self.engine.data_dir());
+                Response::json(
+                    200,
+                    &json!({
+                        "ok": true,
+                        "before_bytes": before,
+                        "after_bytes": after,
+                        "freed_bytes": before.saturating_sub(after),
+                        "removed_files": removed,
+                        "time_us": started.elapsed().as_micros() as u64,
+                    }),
+                )
+            }
+            Err(e) => Response::json(
+                500,
+                &json!({"error": format!("compaction failed: {e}")}),
+            ),
+        }
     }
 
     fn api_tables(&self, session: &Session) -> Response {
@@ -1037,6 +1138,24 @@ fn is_safe_ident(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Recursive size of a directory in bytes (files only). Used by /api/health
+/// ("data on disk" card) and /api/compact (before/after).
+fn dir_size(path: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        if meta.is_dir() {
+            total += dir_size(&entry.path());
+        } else {
+            total += meta.len();
+        }
+    }
+    total
+}
+
 /// CSP hashes for inline `<script>` blocks. Hash-based allowlisting keeps
 /// `script-src` free of `'unsafe-inline'` even though the SPA ships as one
 /// embedded HTML document.
@@ -1123,7 +1242,7 @@ mod tests {
         d
     }
 
-    fn start_panel() -> (u16, Arc<SqlEngine>) {
+    fn start_panel() -> (u16, Arc<SqlEngine>, Arc<SecurityManager>) {
         let engine = Engine::open(EngineConfig {
             dir_path: tempdir("panel"),
             memtable_capacity: 1024 * 1024,
@@ -1143,11 +1262,12 @@ mod tests {
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
+        let security = Arc::new(SecurityManager::new("admin", "s3cret-panel"));
         let panel = Arc::new(AdminPanel {
             engine,
             sql: sql.clone(),
             dnaql,
-            security: Arc::new(SecurityManager::new("admin", "s3cret-panel")),
+            security: security.clone(),
             tls: None,
             proxy: None,
             tokens: Mutex::new(HashMap::new()),
@@ -1162,7 +1282,7 @@ mod tests {
                 });
             }
         });
-        (port, sql)
+        (port, sql, security)
     }
 
     /// Raw HTTP/1.1 round-trip against the panel (real socket, real server).
@@ -1198,7 +1318,7 @@ mod tests {
 
     #[test]
     fn panel_requires_auth_and_serves_api() {
-        let (port, _sql) = start_panel();
+        let (port, _sql, _security) = start_panel();
 
         // SPA shell is public.
         let (status, body) = http(port, "GET", "/", None, "");
@@ -1294,5 +1414,129 @@ mod tests {
             "",
         );
         assert_eq!(status, 400);
+    }
+
+    /// v4.1 panel features: disk-size health, SQL → DnaQL explain endpoint
+    /// and the admin-only online compaction endpoint.
+    #[test]
+    fn panel_explain_compact_and_disk_size() {
+        let (port, sql, security) = start_panel();
+
+        let (status, body) = http(
+            port,
+            "POST",
+            "/api/login",
+            None,
+            r#"{"user":"admin","pass":"s3cret-panel"}"#,
+        );
+        assert_eq!(status, 200);
+        let token: J = serde_json::from_str(&body).unwrap();
+        let token = token["token"].as_str().unwrap().to_string();
+
+        // /api/health now reports the data directory size.
+        let (status, body) = http(port, "GET", "/api/health", Some(&token), "");
+        assert_eq!(status, 200);
+        let v: J = serde_json::from_str(&body).unwrap();
+        let disk = v["data_dir_bytes"].as_u64().unwrap();
+        assert!(disk > 0, "data dir must be non-empty: {body}");
+
+        // Explain: INSERT maps to a DnaQL TX block and a storage map.
+        let (status, body) = http(
+            port,
+            "POST",
+            "/api/explain",
+            Some(&token),
+            r#"{"query":"INSERT INTO chr_t (id = 3, name = 'gamma')"}"#,
+        );
+        assert_eq!(status, 200);
+        let v: J = serde_json::from_str(&body).unwrap();
+        let dnaql = v["dnaql"].as_str().unwrap();
+        assert!(dnaql.contains("TX"), "INSERT must transpile to TX: {dnaql}");
+        assert!(dnaql.contains("chr_t"));
+        let storage = v["storage"].as_str().unwrap();
+        assert!(
+            storage.contains("chr_t:3"),
+            "storage map must name the locus key: {storage}"
+        );
+        assert!(storage.contains("stored:"));
+
+        // Explain: SELECT — no DnaQL TX needed for this projection? The
+        // transpiler supports plain SELECT; JOIN is the rejected one.
+        let (status, body) = http(
+            port,
+            "POST",
+            "/api/explain",
+            Some(&token),
+            r#"{"query":"SELECT * FROM chr_t a JOIN chr_t b ON a.id = b.id"}"#,
+        );
+        assert_eq!(status, 200);
+        let v: J = serde_json::from_str(&body).unwrap();
+        assert!(v["dnaql"].is_null(), "JOIN must have no DnaQL form");
+        assert!(v["dnaql_error"].as_str().unwrap().contains("JOIN"));
+        assert!(v["storage"].as_str().unwrap().contains("chr_t"));
+
+        // Explain: garbage query -> 400 with both errors reported.
+        let (status, _) = http(
+            port,
+            "POST",
+            "/api/explain",
+            Some(&token),
+            r#"{"query":"FROBNICATE chr_t"}"#,
+        );
+        assert_eq!(status, 400);
+
+        // Compaction endpoint: admin may run it, response carries sizes.
+        sql.execute("INSERT INTO chr_t (id = 4, name = 'delta')").unwrap();
+        sql.execute("UPDATE chr_t SET name = 'beta2' WHERE id = 2").unwrap();
+        sql.execute("DELETE FROM chr_t WHERE id = 1").unwrap();
+        let (status, body) = http(port, "POST", "/api/compact", Some(&token), "");
+        assert_eq!(status, 200);
+        let v: J = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["ok"], json!(true));
+        assert!(v["before_bytes"].as_u64().unwrap() > 0);
+        assert!(v["after_bytes"].as_u64().unwrap() > 0);
+        assert!(v["removed_files"].as_u64().unwrap() <= 1);
+
+        // A viewer must be rejected from compaction.
+        security
+            .users
+            .create_user_with_tables("view", "viewer-pass-1", "viewer", false, None)
+            .unwrap();
+        let (status, body) = http(
+            port,
+            "POST",
+            "/api/login",
+            None,
+            r#"{"user":"view","pass":"viewer-pass-1"}"#,
+        );
+        assert_eq!(status, 200);
+        let vtoken: J = serde_json::from_str(&body).unwrap();
+        let vtoken = vtoken["token"].as_str().unwrap().to_string();
+        let (status, _) = http(port, "POST", "/api/compact", Some(&vtoken), "");
+        assert_eq!(status, 403);
+
+        // …and from explaining statements on tables outside its ACL.
+        security
+            .users
+            .set_allowed_tables("view", Some(vec!["chr_other".into()]))
+            .unwrap();
+        let (status, body) = http(
+            port,
+            "POST",
+            "/api/login",
+            None,
+            r#"{"user":"view","pass":"viewer-pass-1"}"#,
+        );
+        assert_eq!(status, 200);
+        let vtoken: J = serde_json::from_str(&body).unwrap();
+        let vtoken = vtoken["token"].as_str().unwrap().to_string();
+        let (status, _) = http(
+            port,
+            "POST",
+            "/api/explain",
+            Some(&vtoken),
+            r#"{"query":"INSERT INTO chr_t (id = 9, name = 'x')"}"#,
+        );
+        assert_eq!(status, 403);
     }
 }

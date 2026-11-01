@@ -101,7 +101,7 @@ A general-purpose, high-performance embeddable and client/server database engine
 | `LIMIT` / `OFFSET` | pagination | used by the web panel |
 | **Secondary indexes** | `CREATE INDEX idx ON t (col)` / `DROP INDEX` — stored in the schema, honoured by DML | index unit tests |
 | **IndexScan plans** | equality/`IN`/range on an indexed column → `IndexScan(...)` instead of `SeqScan` | plan unit tests |
-| **Web panel** | `serve --admin-port 8080`: overview/health, tables + paginated browser, indexes, SQL and DnaQL consoles, user administration | HTTPS/API integration + security probe |
+| **Web panel** | `serve --admin-port 8080`: overview/health + disk-usage card, tables + paginated browser with per-row `SHOW STORAGE` (🔬), indexes, SQL and DnaQL consoles, SQL → DnaQL explain block, online compaction (admin), user administration | HTTPS/API integration + security probe |
 | **Row editing** | click a row → modal dialog (phpMyAdmin-style): schema-driven fields, NULL checkboxes, live SQL preview, UPDATE/DELETE with confirmation | manual e2e scenario in the browser |
 | **SQL tokenizer** | negative numbers (`-25.5`) and standard quote escaping (`'O''Brien'`) | `tokenizer_negative_numbers_and_escaped_quotes`, `update_with_negative_and_quoted_values` |
 
@@ -177,7 +177,7 @@ A high-performance embeddable and client/server database engine written in Rust,
 | Atomic transactions | batched WAL write (one fsync = one atomic interval) | `write_batch_is_atomic_on_recovery` |
 | DnaQL (Standard + Quick) | tokenizer → parser → executor over real storage | 8 unit tests + live smoke |
 | SQL subset | SELECT/JOIN(WHERE/IN-subqueries)/GROUP BY/HAVING/ORDER BY/LIMIT/OFFSET, aggregates, INSERT, UPDATE, DELETE (CASCADE), CREATE/DROP TABLE, **CREATE/DROP INDEX + IndexScan** | 40+ unit tests |
-| Web admin panel | HTTPS + SPA (no external dependencies): overview, tables, SQL/DnaQL consoles, user management | `admin::tests::panel_requires_auth_and_serves_api` + `scripts/security_probe.py` |
+| Web admin panel | HTTPS + SPA (no external dependencies): overview, tables, SQL/DnaQL consoles, user management, explain/compact/disk-size API | `admin::tests::panel_requires_auth_and_serves_api`, `admin::tests::panel_explain_compact_and_disk_size` + `scripts/security_probe.py` |
 | Bitap/Myers fuzzy search | correct Wu-Manber, **true** distance, Levenshtein + Hamming | 8000-case fuzz vs a reference DP |
 | Bio plugins | real Smith-Waterman, PAM scanner, ORF-finder, GC windows | unit tests |
 | TCP server | thread-per-connection, TLS, 16 MiB frame cap (64 KiB pre-auth), Argon2id, persistent IP/username lockout | unit tests + `scripts/security_probe.py` |

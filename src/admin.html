@@ -159,6 +159,14 @@
         <h2>Диагностика <span class="badge" id="diag-badge">…</span></h2>
         <div class="grid-wrap" style="max-height:340px"><table class="grid" id="health-table"><tbody></tbody></table></div>
       </div>
+      <div class="panel">
+        <h2>Обслуживание <span class="badge" id="maint-badge">—</span></h2>
+        <div class="console-bar">
+          <button class="act admin-only" id="compact-run">🧬 Компакция</button>
+          <span style="color:var(--muted);font-size:12px">Слияние сегментов в один: убирает затёртые версии строк и освобождает место на диске. Безопасно при активных клиентах (снимки чтения, атомарная подмена).</span>
+        </div>
+        <div id="compact-out"></div>
+      </div>
     </section>
 
     <!-- ---------- tables ---------- -->
@@ -202,7 +210,9 @@
         <div class="console-bar">
           <button class="act" id="sql-run">Выполнить <kbd style="opacity:.6">Ctrl+Enter</kbd></button>
           <button class="act ghost" id="sql-clear">Очистить</button>
+          <button class="act ghost" id="sql-tx" title="Показать эквивалент на DnaQL и физическую карту хранения (без выполнения)">SQL → DnaQL</button>
         </div>
+        <div id="sql-tx-out"></div>
         <div class="examples" id="sql-examples"></div>
         <div id="sql-out"></div>
       </div>
@@ -278,6 +288,18 @@
   </div>
 </div>
 
+<!-- ================= STORAGE MODAL ================= -->
+<div id="store-modal" class="modal-back hidden">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="sm-title">
+    <div class="modal-head">
+      <h3 id="sm-title">🔬 Физическое хранение</h3>
+      <span style="flex:1"></span>
+      <button class="act ghost" id="sm-close" title="Закрыть (Esc)">✕</button>
+    </div>
+    <div id="sm-out" style="padding:14px 18px;max-height:60vh;overflow:auto"></div>
+  </div>
+</div>
+
 <script>
 "use strict";
 const $ = s => document.querySelector(s);
@@ -311,6 +333,7 @@ function showApp(user, role, mustChange) {
   sessionStorage.setItem("dnadb_role", ROLE);
   sessionStorage.setItem("dnadb_must_change", MUST_CHANGE ? "1" : "0");
   $("#who-user").textContent = "👤 " + (user || "admin") + " · " + ROLE;
+  document.querySelectorAll(".admin-only").forEach(el => el.classList.toggle("hidden", ROLE !== "admin"));
   if (MUST_CHANGE) {
     document.querySelector('#nav button[data-view="users"]').click();
     setTimeout(() => $("#pw-old") && $("#pw-old").focus(), 50);
@@ -376,13 +399,16 @@ function cellHtml(v) {
     return '<span class="dna" title="2-bit DNA payload">' + esc(v) + "</span>";
   return esc(v);
 }
-function renderGrid(tableEl, columns, rows) {
+function renderGrid(tableEl, columns, rows, opts) {
+  opts = opts || {};
   if (!columns || !columns.length) { tableEl.innerHTML = ""; return; }
-  let h = "<thead><tr>" + columns.map(c => "<th>" + esc(c) + "</th>").join("") + "</tr></thead><tbody>";
+  const actHead = opts.actionCell ? '<th style="width:34px"></th>' : "";
+  let h = "<thead><tr>" + columns.map(c => "<th>" + esc(c) + "</th>").join("") + actHead + "</tr></thead><tbody>";
   for (const row of rows) {
-    h += "<tr>" + columns.map(c => "<td>" + cellHtml(row[c]) + "</td>").join("") + "</tr>";
+    h += "<tr>" + columns.map(c => "<td>" + cellHtml(row[c]) + "</td>").join("") +
+      (opts.actionCell ? '<td><button class="act ghost store-btn" title="Физическое хранение (SHOW STORAGE)">🔬</button></td>' : "") + "</tr>";
   }
-  if (!rows.length) h += '<tr><td colspan="' + columns.length + '" style="color:var(--muted)">пусто (0 строк)</td></tr>';
+  if (!rows.length) h += '<tr><td colspan="' + (columns.length + 1) + '" style="color:var(--muted)">пусто (0 строк)</td></tr>';
   tableEl.innerHTML = h + "</tbody>";
 }
 function kvTable(el, obj) {
@@ -406,14 +432,15 @@ async function loadHealth() {
     ["Сегменты", h.segments],
     ["Memtable", fmtBytes(h.memtable_bytes)],
     ["WAL", fmtBytes(h.wal_bytes)],
+    ["Данные на диске", fmtBytes(h.data_dir_bytes), "Каталог: " + (h.data_dir || "—")],
     ["Операций (puts)", fmtNum(st.puts)],
     ["Лезий найдено", fmtNum(st.lesions_found)],
     ["Лезий исправлено", fmtNum(st.lesions_repaired)],
     ["Rescue-ов зеркала", fmtNum(st.mirror_rescues)],
     ["Аптайм", fmtNum(st.uptime_secs) + " с"],
   ];
-  $("#health-cards").innerHTML = cards.map(([k, v]) =>
-    '<div class="card"><div class="k">' + k + '</div><div class="v">' + v + "</div></div>").join("");
+  $("#health-cards").innerHTML = cards.map(([k, v, title]) =>
+    '<div class="card"' + (title ? ' title="' + esc(title) + '"' : "") + '><div class="k">' + k + '</div><div class="v">' + v + "</div></div>").join("");
   kvTable($("#stats-table"), st);
   const flat = {};
   for (const [k, v] of Object.entries(hj)) flat[k] = v;
@@ -423,7 +450,8 @@ function fmtBytes(n) {
   n = Number(n || 0);
   if (n < 1024) return n + " B";
   if (n < 1048576) return (n / 1024).toFixed(1) + " KiB";
-  return (n / 1048576).toFixed(1) + " MiB";
+  if (n < 1073741824) return (n / 1048576).toFixed(1) + " MiB";
+  return (n / 1073741824).toFixed(2) + " GiB";
 }
 function fmtNum(n) { return Number(n || 0).toLocaleString("ru-RU"); }
 
@@ -481,7 +509,7 @@ async function browse() {
   const r = await api("/api/browse?table=" + encodeURIComponent(CURRENT) + "&limit=" + LIMIT + "&offset=" + OFFSET);
   if (!r.ok) { $("#tbl-grid").innerHTML = "<tbody><tr><td class='errbox'>" + esc((r.body && r.body.error) || "error") + "</td></tr></tbody>"; return; }
   const b = r.body;
-  renderGrid($("#tbl-grid"), b.columns, b.rows);
+  renderGrid($("#tbl-grid"), b.columns, b.rows, { actionCell: true });
   BROWSE_ROWS = b.rows || [];
   const tb = $("#tbl-grid").querySelector("tbody");
   if (tb) tb.querySelectorAll("tr").forEach((tr, i) => { if (BROWSE_ROWS[i]) tr.dataset.idx = i; tr.classList.add("rowedit"); });
@@ -496,9 +524,9 @@ $("#pg-next").addEventListener("click", () => { OFFSET += LIMIT; browse(); });
 $("#pg-size").addEventListener("change", e => { LIMIT = +e.target.value; OFFSET = 0; browse(); });
 
 /* ---------------- row editor modal ---------------- */
-function sqlLiteral(col, raw, isNull) {
+function sqlLiteral(col, raw, isNull, cols) {
   if (isNull) return "NULL";
-  const ty = String((RM_COLS && RM_COLS[col]) || "");
+  const ty = String((cols || RM_COLS || {})[col] || "");
   if (ty.includes("Int")) {
     const n = Number(raw);
     if (!Number.isFinite(n) || !Number.isInteger(n)) throw new Error("колонка " + col + ": ожидается целое число");
@@ -558,10 +586,51 @@ $("#rm-cancel").addEventListener("click", closeRowEditor);
 $("#row-modal").addEventListener("click", e => { if (e.target.id === "row-modal") closeRowEditor(); });
 document.addEventListener("keydown", e => { if (e.key === "Escape" && !$("#row-modal").classList.contains("hidden")) closeRowEditor(); });
 $("#tbl-grid").addEventListener("click", e => {
+  const btn = e.target.closest(".store-btn");
+  if (btn) {
+    e.stopPropagation();
+    const tr = btn.closest("tr[data-idx]");
+    const row = tr && BROWSE_ROWS[+tr.dataset.idx];
+    if (row) openStorage(row);
+    return;
+  }
   const tr = e.target.closest("tr[data-idx]"); if (!tr) return;
   const row = BROWSE_ROWS[+tr.dataset.idx]; if (!row) return;
   openRowEditor(row, (schemaOf(CURRENT) || {}).columns);
 });
+
+/* ---------------- storage modal (SHOW STORAGE per row) ---------------- */
+function openStorageModal() { $("#store-modal").classList.remove("hidden"); }
+function closeStorageModal() { $("#store-modal").classList.add("hidden"); }
+$("#sm-close").addEventListener("click", closeStorageModal);
+$("#store-modal").addEventListener("click", e => { if (e.target.id === "store-modal") closeStorageModal(); });
+document.addEventListener("keydown", e => { if (e.key === "Escape" && !$("#store-modal").classList.contains("hidden")) closeStorageModal(); });
+
+async function openStorage(row) {
+  const s = schemaOf(CURRENT); if (!s) return;
+  $("#sm-title").textContent = "🔬 Физическое хранение · " + CURRENT;
+  $("#sm-out").innerHTML = '<div class="result-meta">запрос SHOW STORAGE…</div>';
+  openStorageModal();
+  let q;
+  try {
+    const pkv = row[s.pk];
+    if (pkv === null || pkv === undefined) throw new Error("строка без значения PK — SHOW STORAGE недоступен");
+    q = "SHOW STORAGE FOR " + CURRENT + " WHERE " + s.pk + " = " + sqlLiteral(s.pk, pkv, false, s.columns);
+  } catch (err) {
+    $("#sm-out").innerHTML = '<div class="errbox">' + esc(err.message) + "</div>";
+    return;
+  }
+  const r = await api("/api/query", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ kind: "sql", query: q }) });
+  const out = $("#sm-out");
+  if (!r.ok) { out.innerHTML = '<div class="errbox">' + esc((r.body && r.body.error) || ("HTTP " + r.status)) + "</div>"; return; }
+  const b = r.body;
+  let h = '<div class="plan">' + esc(q) + "</div>";
+  h += '<div class="result-meta">⏱ ' + (b.time_us / 1000).toFixed(2) + " мс · " + esc(b.plan || "") + "</div>";
+  h += '<div class="grid-wrap"><table class="grid out-grid"></table></div>';
+  out.innerHTML = h;
+  renderGrid(out.querySelector(".out-grid"), b.columns || [], b.rows || []);
+}
 $("#rm-save").addEventListener("click", async () => {
   let sql;
   try {
@@ -617,9 +686,9 @@ function renderResult(outEl, r) {
   if (b.note) meta.push(esc(b.note));
   if (b.columns) meta.push(b.rows.length + " строк · " + b.columns.length + " колонок");
   h += '<div class="result-meta">' + meta.join(" · ") + "</div>";
-  h += '<div class="grid-wrap"><table class="grid" id="out-grid"></table></div>';
+  h += '<div class="grid-wrap"><table class="grid out-grid"></table></div>';
   outEl.innerHTML = h;
-  renderGrid(outEl.querySelector("#out-grid"), b.columns || [], b.rows || []);
+  renderGrid(outEl.querySelector(".out-grid"), b.columns || [], b.rows || []);
 }
 async function runSql() {
   const q = $("#sql-input").value.trim(); if (!q) return;
@@ -628,6 +697,7 @@ async function runSql() {
     body: JSON.stringify({ kind: "sql", query: q }) });
   renderResult($("#sql-out"), r);
   saveRecent("dnadb_sql_recent", q);
+  if (r.ok && /^(INSERT|UPDATE|DELETE|CREATE|DROP|REPLACE)\b/i.test(q)) showTranspile();
 }
 async function runQl() {
   const q = $("#ql-input").value.trim(); if (!q) return;
@@ -644,6 +714,50 @@ $("#ql-clear").addEventListener("click", () => { $("#ql-input").value = ""; $("#
 $("#sql-input").addEventListener("keydown", e => { if (e.ctrlKey && e.key === "Enter") runSql(); });
 $("#ql-input").addEventListener("keydown", e => { if (e.ctrlKey && e.key === "Enter") runQl(); });
 
+/* ---------------- SQL → DnaQL + физическая карта (без выполнения) ---------------- */
+async function showTranspile() {
+  const q = $("#sql-input").value.trim(); if (!q) return;
+  const out = $("#sql-tx-out");
+  out.innerHTML = '<div class="result-meta">перевод в DnaQL…</div>';
+  const r = await api("/api/explain", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query: q }) });
+  if (!r.ok) {
+    const msg = (r.body && (r.body.error || r.body.dnaql_error)) || ("HTTP " + r.status);
+    out.innerHTML = '<div class="errbox">Перевод невозможен: ' + esc(msg) + "</div>";
+    return;
+  }
+  const b = r.body;
+  let h = "";
+  if (b.dnaql) h += '<div class="plan">DnaQL:\n' + esc(b.dnaql) + "</div>";
+  else if (b.dnaql_error) h += '<div class="result-meta">DnaQL: ' + esc(b.dnaql_error) + "</div>";
+  if (b.storage) h += '<div class="plan">Физическое хранение:\n' + esc(b.storage) + "</div>";
+  else if (b.storage_error) h += '<div class="result-meta">Хранение: ' + esc(b.storage_error) + "</div>";
+  out.innerHTML = h || '<div class="result-meta">нет данных для перевода</div>';
+}
+$("#sql-tx").addEventListener("click", showTranspile);
+
+/* ---------------- обслуживание: онлайн-компакция (только admin) ---------------- */
+async function runCompact() {
+  if (ROLE !== "admin") return;
+  if (!confirm("Запустить полную компакцию? Сегменты будут слиты; панель покажет размер данных до и после.")) return;
+  const out = $("#compact-out");
+  $("#maint-badge").className = "badge"; $("#maint-badge").textContent = "…";
+  out.innerHTML = '<div class="result-meta">компакция выполняется…</div>';
+  const r = await api("/api/compact", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+  if (!r.ok) {
+    $("#maint-badge").className = "badge err"; $("#maint-badge").textContent = "ОШИБКА";
+    out.innerHTML = '<div class="errbox">' + esc((r.body && r.body.error) || ("HTTP " + r.status)) + "</div>";
+    return;
+  }
+  const b = r.body;
+  $("#maint-badge").className = "badge ok"; $("#maint-badge").textContent = "OK";
+  out.innerHTML = '<div class="result-meta">🧬 было ' + fmtBytes(b.before_bytes) + " → стало " + fmtBytes(b.after_bytes) +
+    " · освобождено <b>" + fmtBytes(b.freed_bytes) + "</b> · удалено файлов: " + fmtNum(b.removed_files) +
+    " · ⏱ " + (b.time_us / 1000).toFixed(0) + " мс</div>";
+  loadHealth();
+}
+$("#compact-run").addEventListener("click", runCompact);
+
 function saveRecent(key, q) {
   try {
     let arr = JSON.parse(localStorage.getItem(key) || "[]");
@@ -659,6 +773,8 @@ const SQL_EXAMPLES = [
   ["INDEX Range + IN", "SELECT * FROM chr_orders WHERE status IN ('paid','shipped') AND total_usd > 50 ORDER BY total_usd"],
   ["CREATE INDEX", "CREATE INDEX idx_orders_status ON chr_orders (status)"],
   ["INSERT", "INSERT INTO chr_users (user_id = 1001, username = 'panel_user', balance = 12.5)"],
+  ["Физическое хранение строки", "SHOW STORAGE FOR chr_orders WHERE order_id = 1042"],
+  ["Карта хранения таблицы", "SHOW STORAGE FOR chr_orders"],
 ];
 const QL_EXAMPLES = [
   ["GC + температура плавления", "ANALYZE SEQUENCE 'ATGGCCTAA' |> GC_CONTENT() |> MELTING_TEMP()"],
@@ -666,6 +782,7 @@ const QL_EXAMPLES = [
   ["Быстрый нечёткий поиск (Levenshtein ≤1)", "chr_variants ? 'GATCGATC' ~1"],
   ["Стандартный поиск + LINK по FK", "FIND PATTERN 'GATCGATC' IN chr_variants WHERE LEVENSHTEIN_DISTANCE <= 1 LINK chr_patients VIA COMPLEMENT(patient_id) EMIT locus, mismatches, variant_name, name"],
   ["Пайплайн FROM |> WHERE |> EMIT", "FROM chr_variants |> WHERE variant_id >= 2 |> EMIT variant_id, variant_name, sequence"],
+  ["Физическая карта значения (ACGT)", "ANALYZE LOCUS chr_orders:1042 |> STORAGE_MAP()"],
   ["Проверка целостности хромосомы", "VERIFY CHROMOSOME chr_variants"],
 ];
 function mountExamples(sel, items, target) {
