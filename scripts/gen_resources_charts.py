@@ -86,22 +86,36 @@ def chart_ram(systems, out_dir, rows, suffix=""):
 
 
 def chart_disk(systems, out_dir, rows, suffix="", value_bytes=160, key_len=12):
-    """Bars: data-directory growth after a clean shutdown, MiB."""
+    """Bars: data-directory growth after a clean shutdown, MiB.
+
+    When the JSON carries `disk_after_compact_mib` for DNA-DB (v4.1 offline
+    compaction), a lighter fourth bar shows the post-compaction footprint.
+    """
     delta = [systems[s]["disk_delta_mib"] for s in ORDER]
     raw = rows * (value_bytes + key_len) / (1024 * 1024)
 
+    compact = systems["dnadb"].get("disk_after_compact_mib")
+    entries = [("DNA-DB", delta[0], COLORS["dnadb"], False)]
+    if compact is not None:
+        entries.append(("DNA-DB\nafter compaction", compact, "#86efac", True))
+    entries.append(("MySQL", delta[1], COLORS["mysql"], False))
+    entries.append(("PostgreSQL", delta[2], COLORS["postgres"], False))
+
     fig, ax = plt.subplots(figsize=(8.2, 4.6), constrained_layout=True)
-    xs = range(len(ORDER))
-    bars = ax.bar(xs, delta, 0.55, color=[COLORS[s] for s in ORDER])
-    for rect in bars:
-        v = rect.get_height()
-        ax.text(rect.get_x() + rect.get_width() / 2, v, "%g" % v,
+    xs = range(len(entries))
+    bars = ax.bar(xs, [e[1] for e in entries], 0.55,
+                  color=[e[2] for e in entries])
+    for (label, v, color, faded), rect in zip(entries, bars):
+        txt = "%g" % v
+        if faded and compact:
+            txt += "  (−%g MiB)" % (delta[0] - compact)
+        ax.text(rect.get_x() + rect.get_width() / 2, v, txt,
                 ha="center", va="bottom", fontsize=10, fontweight="bold")
     ax.axhline(raw, color="#64748b", linestyle="--", linewidth=1.2)
-    ax.text(len(ORDER) - 0.52, raw, " raw payload %.1f MiB" % raw,
+    ax.text(len(entries) - 0.52, raw, " raw payload %.1f MiB" % raw,
             va="bottom", ha="right", fontsize=9, color="#475569")
     ax.set_xticks(list(xs))
-    ax.set_xticklabels([NAMES[s] for s in ORDER], fontsize=11)
+    ax.set_xticklabels([e[0] for e in entries], fontsize=10.5)
     ax.set_ylabel("Disk growth, MiB (lower is better)")
     ax.set_title("Disk: data directory growth (clean shutdown), %s rows x 172 B" %
                  "{:,}".format(rows).replace(",", " "), fontsize=12)

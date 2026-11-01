@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased (v4.1)
+
+- **Transparent storage for SQL operators** — the operator writes plain SQL
+  and never has to read A/C/G/T chains:
+  - `SHOW STORAGE FOR <table> [WHERE <pk> = <literal>]` (SQL): the
+    SQL→DnaQL→DNA storage map. Without a predicate — one summary row per
+    stored locus (chromosome, locus, storage key, payload size, DNA columns);
+    with a PK filter — per-column detail with every value decoded to the
+    human-readable form next to its physical RowCodec representation
+    (nucleotide chains included). PK-only filter, read-only.
+  - `ANALYZE LOCUS <table>:<pk> |> STORAGE_MAP();` (DnaQL): the same map,
+    works on any row (no sequence field required).
+  - `dna-db-core sql2dnaql --sql "INSERT ..."` now also prints a
+    "storage map" section: which chromosome/locus/key the row will land at
+    and how each value is physically stored — before anything is written.
+- **Offline compaction CLI:** `dna-db-core compact --data-dir DIR [--json]` —
+  checkpoint + full segment merge (drops shadowed versions and consumed
+  tombstones); refuses a live data dir via the advisory lock (same as
+  doctor). The resource benchmark now reports `disk_after_compact_mib`
+  for DNA-DB alongside the raw footprint.
+
 ## v4.0.0-GA (2026-10-31) — Enterprise production release
 
 Full implementation of the roadmap on top of the audited v3.5.0 baseline

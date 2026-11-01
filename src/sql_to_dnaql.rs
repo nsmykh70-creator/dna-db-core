@@ -244,6 +244,11 @@ pub(crate) fn transpile(
                 .into(),
         ),
         Stmt::ShowTables => Err("SQL→DnaQL: SHOW TABLES is SQL-only (DnaQL: SHOW CHROMOSOMES)".into()),
+        Stmt::ShowStorage { table, .. } => Err(format!(
+            "SQL→DnaQL: SHOW STORAGE is SQL-only; the DnaQL equivalent for one locus is \
+             ANALYZE LOCUS <table>:<pk> |> STORAGE_MAP() (table '{}')",
+            table
+        )),
         Stmt::Tx { action } => Err(format!(
             "SQL→DnaQL: {:?} is SQL-only (DnaQL wraps writes in TX {{ ... }} blocks)",
             action

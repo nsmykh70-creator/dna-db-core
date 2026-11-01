@@ -196,6 +196,16 @@ enum Command {
         #[arg(long)]
         sql: Option<String>,
     },
+    /// v4.1: offline full compaction — merge all segments into one, drop
+    /// shadowed versions and consumed tombstones. Refuses a live data dir
+    /// (advisory lock, same as doctor). Reports the freed disk space.
+    Compact {
+        #[arg(long, default_value = "./dna_data")]
+        data_dir: String,
+        /// Machine-readable summary (single JSON line)
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Offline payload-key rotation (re-encrypts every logical row)
     #[command(name = "rotate-key")]    RotateKey {
         #[arg(long, default_value = "./dna_data")]
@@ -421,6 +431,7 @@ fn main() {
             *erasure_m,
         ),
         Command::Sql2Dnaql { data_dir, sql } => run_sql2dnaql(data_dir, sql.as_deref()),
+        Command::Compact { data_dir, json } => run_compact(data_dir, *json),
         Command::RotateKey {
             data_dir,
             old_key_file,
@@ -681,6 +692,18 @@ fn run_sql2dnaql(data_dir: &str, sql: Option<&str>) -> i32 {
     match sql_engine.sql_to_dnaql(&text) {
         Ok(out) => {
             println!("{}", out);
+            // v4.1: also show WHERE the data physically lands — chromosome
+            // (table), locus (PK), exact storage key and the physical
+            // representation of every value. Best effort: the translation
+            // itself already succeeded.
+            match sql_engine.explain_storage(&text) {
+                Ok(map) if !map.trim().is_empty() => {
+                    println!("\n-- storage map (where the data physically lives) --");
+                    println!("{}", map);
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("[WARN] storage map unavailable: {}", e),
+            }
             0
         }
         Err(e) => {
@@ -688,6 +711,97 @@ fn run_sql2dnaql(data_dir: &str, sql: Option<&str>) -> i32 {
             2
         }
     }
+}
+
+/// v4.1: offline full compaction (`dna-db-core compact`). Same safety rules
+/// as the doctor: an advisory lock refuses to touch a live data dir. The
+/// engine is opened read-write (WAL replay brings the memtable back), then
+/// checkpoint() flushes everything into segments and compact() merges them.
+fn run_compact(data_dir: &str, json: bool) -> i32 {
+    let dir = std::path::Path::new(data_dir);
+    if !dir.exists() {
+        eprintln!("[FATAL] data dir '{}' does not exist", data_dir);
+        return 2;
+    }
+    let _dir_lock = match acquire_dir_lock(dir, "compact") {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("[FATAL] {}", e);
+            return 2;
+        }
+    };
+    let crypto =
+        match dna_db_core::crypto::Crypto::load_existing(dir, None) {
+            Ok(crypto) => crypto,
+            Err(e) => {
+                eprintln!("[FATAL] cannot load encryption key: {e}");
+                return 2;
+            }
+        };
+    let engine = match Engine::open(EngineConfig {
+        dir_path: dir.to_path_buf(),
+        memtable_capacity: 8 * 1024 * 1024,
+        sync_mode: SyncMode::Strict,
+        mirror_disk_path: None,
+        crypto,
+        ..Default::default()
+    }) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("[FATAL] cannot open data dir '{}': {}", data_dir, e);
+            return 2;
+        }
+    };
+    if let Err(e) = engine.checkpoint() {
+        eprintln!("[FATAL] checkpoint before compaction failed: {e}");
+        return 1;
+    }
+    let deleted = match engine.compact() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("[FATAL] compaction failed: {e}");
+            return 1;
+        }
+    };
+    let bytes = dir_size(dir);
+    if json {
+        println!(
+            "{{\"data_dir\":{},\"deleted_files\":{},\"bytes_after\":{}}}",
+            serde_json::to_string(data_dir).unwrap_or_else(|_| "\"?\"".into()),
+            deleted,
+            bytes
+        );
+    } else {
+        println!(
+            "[COMPACT] {} superseded file(s) removed; data dir now {:.1} MiB ({} B)",
+            deleted,
+            bytes as f64 / (1024.0 * 1024.0),
+            bytes
+        );
+    }
+    0
+}
+
+/// Recursively sum the byte size of every file under `dir`.
+fn dir_size(dir: &std::path::Path) -> u64 {
+    fn walk(p: &std::path::Path, acc: &mut u64) {
+        if let Ok(rd) = std::fs::read_dir(p) {
+            for e in rd.flatten() {
+                match e.file_type() {
+                    Ok(ft) if ft.is_dir() => walk(&e.path(), acc),
+                    Ok(_) => {
+                        if let Ok(m) = e.metadata() {
+                            *acc += m.len();
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+    }
+    let mut acc = 0;
+    walk(dir, &mut acc);
+    acc
 }
 
 fn valid_header_name(name: &str) -> bool {

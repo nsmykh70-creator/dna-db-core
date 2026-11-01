@@ -19,6 +19,9 @@
      до создания базы (после чистого старта сервера). Для MySQL в каталог
      попадают и binlog, для PostgreSQL — WAL, для DNA-DB — WAL и сегменты:
      сравнивается полный прирост занятого места каталогом каждой СУБД.
+  6. v4.1, только DNA-DB: после замера диска выполняется офлайн-компакция
+     (checkpoint + слияние всех сегментов в один, `dna-db-core compact`),
+     и размер каталога фиксируется ещё раз — disk_after_compact_mib.
 
 Результаты: docs/resources_compare_linux.json + таблица в stdout.
 Скрипт должен запускаться с правами root (sudo): нужны чтение
@@ -194,6 +197,15 @@ def measure_dnadb(out, rows, reads):
     time.sleep(1)
     # an empty data dir held 0 bytes before the server started
     disk_after = du_bytes(data_dir)
+    # v4.1: offline compaction — checkpoint + full segment merge
+    compact = subprocess.run(
+        [bc.find_binary(), "compact", "--data-dir", data_dir, "--json"],
+        capture_output=True, text=True)
+    if compact.returncode != 0:
+        raise RuntimeError("dna-db-core compact failed: %s"
+                           % (compact.stderr.strip() or compact.stdout.strip()))
+    disk_compact = du_bytes(data_dir)
+    print("  [dnadb] compact: %s" % compact.stdout.strip())
     out["dnadb"] = {
         "version": adapter.version,
         "idle_pss_mib": mib(idle_pss * 1024),
@@ -203,13 +215,14 @@ def measure_dnadb(out, rows, reads):
         "disk_baseline_mib": 0.0,
         "disk_after_mib": mib(disk_after),
         "disk_delta_mib": mib(disk_after),
+        "disk_after_compact_mib": mib(disk_compact),
         "setup_secs": round(setup_secs, 2),
         "load_secs": load["secs"], "load_ops_s": load["ops_s"],
         "read_ops_s": read["ops_s"],
     }
-    print("  [dnadb] idle %.1f MiB | peak %.1f MiB | disk %.1f MiB"
+    print("  [dnadb] idle %.1f MiB | peak %.1f MiB | disk %.1f MiB -> %.1f MiB after compact"
           % (out["dnadb"]["idle_pss_mib"], out["dnadb"]["peak_pss_mib"],
-             out["dnadb"]["disk_delta_mib"]))
+             out["dnadb"]["disk_delta_mib"], out["dnadb"]["disk_after_compact_mib"]))
     return data_dir
 
 
@@ -357,6 +370,8 @@ def main():
         "method": ("defaults everywhere; idle = sum of process PSS after setup; "
                    "peak = max sum of PSS sampled every 50 ms during load+reads; "
                    "disk = data directory growth (clean shutdown) incl. WAL/binlog; "
+                   "dnadb disk_after_compact = after offline `dna-db-core compact` "
+                   "(checkpoint + full segment merge); "
                    "same deterministic dataset as bench_compare.py (seed 42)"),
     }}
     out["systems"] = {}

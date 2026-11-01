@@ -107,6 +107,22 @@ ANALYZE SEQUENCE 'CGCGCGATCGATCGCGC'
 (кодоны → аминокислоты до стоп-кодона). Также поддерживается
 `ANALYZE LOCUS chr_variants:1 |> ...` — анализ последовательности из строки.
 
+### Карта хранения локуса: STORAGE_MAP() (v4.1)
+
+Цепочки A/C/G/T — внутреннее представление; человеку их читать не нужно.
+`STORAGE_MAP()` возвращает карту хранения одного локуса: хромосому, локус,
+точный ключ, тип колонки, значение в человекочитаемом виде и физическое
+представление (тег RowCodec, размер). Работает с любой строкой,
+последовательность не требуется — это DnaQL-эквивалент SQL-команды
+`SHOW STORAGE ... WHERE <pk> = <literal>`.
+
+```dnaql
+ANALYZE LOCUS chr_orders:1042 |> STORAGE_MAP();
+-- function    chromosome  locus  storage_key       column   sql_type  value    stored_as
+-- STORAGE_MAP chr_orders  1042   chr_orders:1042   order_id INT       1042     RowCodec tag 1: i64 little-endian (8 B) = 1042
+-- STORAGE_MAP chr_orders  1042   chr_orders:1042   status   TEXT      PENDING  RowCodec tag 3: UTF-8 text, u32 length + 7 B
+```
+
 ---
 
 ## Глава 4. Шпаргалка Rosetta Stone: SQL vs DnaQL

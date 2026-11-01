@@ -254,6 +254,35 @@ SHOW HEALTH;
 Ключевые слова-алиасы `FROM WHERE GROUP HAVING ORDER LIMIT OFFSET JOIN ON`
 не могут служить алиасами — парсер останавливается на них корректно.
 
+### 3.3a. SHOW STORAGE — карта хранения (v4.1)
+
+Данные внутри DNA-DB хранятся в «хромосомах» (таблицы), «локусах» (строки)
+и типизированном бинарном RowCodec — цепочки A/C/G/T машина читает сама.
+Оператору не нужно разбирать их вручную: `SHOW STORAGE` показывает,
+куда именно попадает каждая строка, и возвращает все значения в
+человекочитаемом виде рядом с их физическим представлением.
+
+```sql
+-- сводка по всем строкам таблицы: локус, ключ, размер payload,
+-- сколько DNA-колонок
+SHOW STORAGE FOR chr_orders;
+
+-- детальная карта одной строки (фильтр — строго по первичному ключу):
+-- chromosome | locus | storage_key | column | sql_type | value | stored_as
+SHOW STORAGE FOR chr_orders WHERE order_id = 1042;
+-- chromosome | locus | storage_key   | column  | sql_type | value    | stored_as
+-- chr_orders | 1042  | chr_orders:1042 | order_id | INT      | 1042     | RowCodec tag 1: i64 little-endian (8 B) = 1042
+-- chr_orders | 1042  | chr_orders:1042 | status   | TEXT     | PENDING  | RowCodec tag 3: UTF-8 text, u32 length + 7 B
+-- chr_orders | 1042  | chr_orders:1042 | seq      | DNA      | CGCG...  | RowCodec tag 4: nucleotide chain A/C/G/T, 18 nt (18 B ASCII)
+
+-- то же работает до записи: где окажутся данные этого INSERT?
+-- (CLI: dna-db-core sql2dnaql --data-dir ./dna_data --sql "INSERT ...")
+```
+
+Фильтр только по PK — это адрес отдельного локуса, как в DnaQL
+(`<хромосома>:<локус>`); фильтр по обычной колонке отклоняется.
+Эквивалент в DnaQL: `ANALYZE LOCUS chr_orders:1042 |> STORAGE_MAP();`.
+
 ### 3.4. Secondary-индексы и планы
 
 ```sql

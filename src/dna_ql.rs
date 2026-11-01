@@ -1774,6 +1774,23 @@ impl DnaQlEngine {
         locus: Option<(String, i64)>,
         functions: &[String],
     ) -> Result<(Vec<DnaQlRow>, String), String> {
+        // v4.1: STORAGE_MAP() — the per-column storage map of one locus.
+        // Works on ANY row (no sequence field required) and decodes every
+        // value back to the human-readable form — the DnaQL counterpart of
+        // the SQL statement SHOW STORAGE ... WHERE <pk> = <literal>.
+        if functions.iter().any(|f| f == "STORAGE_MAP") {
+            if functions.len() != 1 {
+                return Err(
+                    "DnaQL: STORAGE_MAP() must be the only pipeline function".into(),
+                );
+            }
+            let Some((table, id)) = locus else {
+                return Err(
+                    "DnaQL: STORAGE_MAP() needs ANALYZE LOCUS <table>:<locus>".into(),
+                );
+            };
+            return self.exec_storage_map(&table, id);
+        }
         let seq_str = match (sequence, locus) {
             (Some(s), _) => s,
             (None, Some((table, id))) => {
@@ -1825,6 +1842,65 @@ impl DnaQlEngine {
             out.push(DnaQlRow { fields });
         }
         Ok((out, format!("real bio-analysis of {} bp", packed.len)))
+    }
+
+    /// v4.1: ANALYZE LOCUS <table>:<id> |> STORAGE_MAP() — per-column map of
+    /// one stored row: chromosome, locus, exact storage key, SQL type, the
+    /// decoded human-readable value and the physical RowCodec representation.
+    /// Same report as SQL `SHOW STORAGE ... WHERE <pk> = <literal>`.
+    fn exec_storage_map(
+        &self,
+        table: &str,
+        id: i64,
+    ) -> Result<(Vec<DnaQlRow>, String), String> {
+        let key = format!("{}:{}", table, id);
+        let row = self
+            .read_row(&key)?
+            .ok_or_else(|| format!("DnaQL: locus {} not found", key))?;
+        let schema = self.sql.get_schema(table);
+        let mut out = Vec::new();
+        let mut payload_bytes = 0usize;
+        for (fname, value) in row {
+            // approximate the per-field wire size the way RowCodec does:
+            // 4 B key length + key + 1 B tag + payload
+            payload_bytes += 4 + fname.len() + 1
+                + match &value {
+                    Value::Null => 0,
+                    Value::Int(_) | Value::Float(_) => 8,
+                    Value::Text(s) | Value::Dna(s) => 4 + s.len(),
+                };
+            let mut fields = BTreeMap::new();
+            fields.insert(
+                "function".to_string(),
+                Value::Text("STORAGE_MAP".to_string()),
+            );
+            fields.insert(
+                "chromosome".to_string(),
+                Value::Text(table.to_string()),
+            );
+            fields.insert("locus".to_string(), Value::Int(id));
+            fields.insert("storage_key".to_string(), Value::Text(key.clone()));
+            fields.insert("column".to_string(), Value::Text(fname.clone()));
+            fields.insert(
+                "sql_type".to_string(),
+                Value::Text(match &schema {
+                    Some(s) => s.column_type_name(&fname),
+                    None => value.type_name().to_string(),
+                }),
+            );
+            fields.insert("value".to_string(), Value::Text(value.to_string()));
+            fields.insert(
+                "stored_as".to_string(),
+                Value::Text(value.stored_as()),
+            );
+            out.push(DnaQlRow { fields });
+        }
+        let note = format!(
+            "storage map of locus {}:{} ({} column(s), ~{} B payload); values are \
+             decoded for the operator, stored_as describes the physical bytes",
+            table, id, out.len(), payload_bytes
+        );
+        Ok((out, note))
     }
 }
 
@@ -2015,6 +2091,78 @@ mod tests {
         // Hamming mode
         let res3 = ql.execute("chr_variants ? 'GATCGATC' ~1").unwrap();
         assert!(!res3.rows.is_empty());
+    }
+
+    // ---------- v4.1: STORAGE_MAP ----------
+
+    #[test]
+    fn storage_map_decodes_locus_without_sequence() {
+        let (_e, ql) = setup();
+        // chr_patients rows have NO sequence field — STORAGE_MAP must still
+        // produce the full per-column map (unlike the sequence bio functions).
+        let res = ql
+            .execute("ANALYZE LOCUS chr_patients:12 |> STORAGE_MAP();")
+            .unwrap();
+        assert_eq!(res.rows.len(), 2, "{:?}", res.engine_note);
+        let by_col = |name: &str| {
+            res.rows
+                .iter()
+                .find(|r| r.fields.get("column") == Some(&Value::Text(name.into())))
+                .unwrap()
+        };
+        assert_eq!(
+            by_col("patient_id").fields.get("value"),
+            Some(&Value::Text("12".into()))
+        );
+        assert_eq!(
+            by_col("patient_id").fields.get("sql_type"),
+            Some(&Value::Text("INT".into()))
+        );
+        assert_eq!(
+            by_col("patient_id").fields.get("storage_key"),
+            Some(&Value::Text("chr_patients:12".into()))
+        );
+        assert!(matches!(
+            by_col("patient_id").fields.get("stored_as"),
+            Some(Value::Text(s)) if s.contains("tag 1")
+        ));
+        assert_eq!(
+            by_col("name").fields.get("value"),
+            Some(&Value::Text("patient_12".into()))
+        );
+        assert!(res.engine_note.contains("storage map of locus chr_patients:12"));
+    }
+
+    #[test]
+    fn storage_map_shows_dna_chain_and_rejects_misuse() {
+        let (_e, ql) = setup();
+        let res = ql
+            .execute("ANALYZE LOCUS chr_variants:1 |> STORAGE_MAP();")
+            .unwrap();
+        let seq_row = res
+            .rows
+            .iter()
+            .find(|r| r.fields.get("column") == Some(&Value::Text("sequence".into())))
+            .unwrap();
+        assert_eq!(
+            seq_row.fields.get("value"),
+            Some(&Value::Text("ATGCGATCGATCGACCATGCGATCGATCATGCGATCAATC".into()))
+        );
+        assert!(matches!(
+            seq_row.fields.get("stored_as"),
+            Some(Value::Text(s)) if s.contains("tag 4")
+        ));
+
+        // Needs a LOCUS, not a literal SEQUENCE.
+        assert!(ql
+            .execute("ANALYZE SEQUENCE 'ACGT' |> STORAGE_MAP();")
+            .is_err());
+        // Cannot be combined with the sequence functions.
+        assert!(ql
+            .execute("ANALYZE LOCUS chr_variants:1 |> STORAGE_MAP() |> GC_CONTENT();")
+            .is_err());
+        // Unknown locus is a clean error.
+        assert!(ql.execute("ANALYZE LOCUS chr_variants:999 |> STORAGE_MAP();").is_err());
     }
 
     #[test]

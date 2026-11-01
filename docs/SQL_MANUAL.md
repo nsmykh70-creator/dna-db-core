@@ -261,6 +261,32 @@ The keyword aliases
 `FROM WHERE GROUP HAVING ORDER LIMIT OFFSET JOIN ON` cannot serve as
 aliases — the parser stops on them correctly.
 
+### 3.3a. SHOW STORAGE — the storage map (v4.1)
+
+Inside DNA-DB data lives in "chromosomes" (tables), "loci" (rows) and a
+typed binary RowCodec — the machine reads the A/C/G/T chains for you.
+An operator never has to decode them manually: `SHOW STORAGE` shows exactly
+where every row lands and returns all values in the human-readable form
+next to their physical representation.
+
+```sql
+-- summary over every stored row: locus, key, payload size, DNA columns
+SHOW STORAGE FOR chr_orders;
+
+-- per-column detail of one row (the filter is strictly the primary key):
+-- chromosome | locus | storage_key | column | sql_type | value | stored_as
+SHOW STORAGE FOR chr_orders WHERE order_id = 1042;
+-- chr_orders | 1042 | chr_orders:1042 | status | TEXT | PENDING | RowCodec tag 3: UTF-8 text, u32 length + 7 B
+-- chr_orders | 1042 | chr_orders:1042 | seq    | DNA  | CGCG... | RowCodec tag 4: nucleotide chain A/C/G/T, 18 nt (18 B ASCII)
+
+-- it also works BEFORE the write: where would this INSERT land?
+-- (CLI: dna-db-core sql2dnaql --data-dir ./dna_data --sql "INSERT ...")
+```
+
+The PK-only filter addresses a single locus, exactly like DnaQL
+(`<chromosome>:<locus>`); filtering by a non-PK column is rejected.
+The DnaQL equivalent: `ANALYZE LOCUS chr_orders:1042 |> STORAGE_MAP();`.
+
 ### 3.4. Secondary indexes and plans
 
 ```sql

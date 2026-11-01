@@ -332,6 +332,16 @@ pub enum Stmt {
     },
     /// v3.6: `SHOW TABLES` (alias `SHOW CHROMOSOMES`) — table introspection.
     ShowTables,
+    /// v4.1: `SHOW STORAGE FOR <table> [WHERE <pk> = <literal>]` — the
+    /// SQL→DnaQL→DNA storage map. Without a predicate: one row per stored
+    /// locus (chromosome, locus, storage key, payload size, DNA columns).
+    /// With `WHERE <pk-col> = <literal>`: per-column detail for that locus —
+    /// every value decoded back to the human-readable form next to its
+    /// physical RowCodec representation (nucleotide chains included).
+    ShowStorage {
+        table: String,
+        pk: Option<(String, Value)>,
+    },
     /// v3.6: `BEGIN | COMMIT | ROLLBACK` — session transaction control.
     /// DML inside an active transaction is buffered and applied as ONE
     /// atomic WAL batch on COMMIT (single fsync durability interval).
@@ -656,8 +666,21 @@ impl SParser {
             if self.kw("TABLES") || self.kw("CHROMOSOMES") {
                 self.eat_semi();
                 Ok(Stmt::ShowTables)
+            } else if self.kw("STORAGE") {
+                // v4.1: SHOW STORAGE FOR <table> [WHERE <pk> = <literal>]
+                self.expect_kw("FOR")?;
+                let table = self.ident()?;
+                let mut pk = None;
+                if self.kw("WHERE") {
+                    let col = self.ident()?;
+                    self.expect(STok::Eq)?;
+                    let lit = self.value()?;
+                    pk = Some((col, lit));
+                }
+                self.eat_semi();
+                Ok(Stmt::ShowStorage { table, pk })
             } else {
-                Err("SQL: unsupported SHOW target (supported: SHOW TABLES / SHOW CHROMOSOMES)".into())
+                Err("SQL: unsupported SHOW target (supported: SHOW TABLES / SHOW CHROMOSOMES / SHOW STORAGE FOR <table>)".into())
             }
         } else if self.kw("ALTER") {
             self.expect_kw("TABLE")?;
@@ -1746,6 +1769,7 @@ fn collect_stmt_tables(stmt: &Stmt, out: &mut Vec<String>) -> Result<(), String>
             collect_stmt_tables(body, out)?;
         }
         Stmt::ShowTables | Stmt::Tx { .. } => {}
+        Stmt::ShowStorage { table, .. } => out.push(table.clone()),
         Stmt::AddColumn { table, .. } => out.push(table.clone()),
         Stmt::Insert { table, rows, on_conflict } => {
             out.push(table.clone());
@@ -2012,6 +2036,143 @@ impl SqlEngine {
         Ok(out.join("\n"))
     }
 
+    /// v4.1: human-readable storage map for one or more parsed SQL
+    /// statements: which chromosome (table) and locus (PK) every row lands
+    /// at, the exact storage key, and how each value is physically
+    /// represented. Read-only — nothing is executed. Used by
+    /// `dna-db-core sql2dnaql` (the "storage map" section) and documented
+    /// in SQL_MANUAL.
+    pub fn explain_storage(&self, sql: &str) -> Result<String, String> {
+        let toks = stokenize(sql)?;
+        let mut p = SParser { toks, pos: 0, depth: 0 };
+        let mut out = Vec::new();
+        while p.peek() != &STok::Eof {
+            let stmt = p.parse_stmt()?;
+            out.push(self.storage_map_stmt(&stmt)?);
+        }
+        if out.is_empty() {
+            return Err("SQL: nothing to map (empty statement)".into());
+        }
+        Ok(out.join("\n\n"))
+    }
+
+    fn storage_map_stmt(&self, stmt: &Stmt) -> Result<String, String> {
+        match stmt {
+            Stmt::Insert { table, rows, .. } => {
+                let schema = self.get_schema(table).ok_or_else(|| {
+                    format!(
+                        "SQL: relation '{}' does not exist (CREATE TABLE first)",
+                        table
+                    )
+                })?;
+                let mut lines = vec![format!(
+                    "INSERT into chromosome '{}' — every row becomes one locus \
+                     under the key '<table>:<pk>' (DnaQL: <chromosome>:<locus>):",
+                    table
+                )];
+                for row in rows {
+                    let pk = row
+                        .iter()
+                        .find(|(c, _)| *c == schema.primary_locus_column)
+                        .map(|(_, v)| v.clone())
+                        .ok_or_else(|| {
+                            format!(
+                                "SQL: INSERT is missing the primary key column '{}'",
+                                schema.primary_locus_column
+                            )
+                        })?;
+                    let key = Self::row_key(table, &pk);
+                    lines.push(format!(
+                        "  locus {} -> key \"{}\" ({} B payload):",
+                        pk,
+                        key,
+                        RowCodec::encode(row).len()
+                    ));
+                    for (col, value) in row {
+                        lines.push(format!(
+                            "    {} [{}] = {} | stored: {}",
+                            col,
+                            schema.column_type_name(col),
+                            value,
+                            value.stored_as()
+                        ));
+                    }
+                }
+                Ok(lines.join("\n"))
+            }
+            Stmt::Update {
+                table,
+                where_clause,
+                ..
+            }
+            | Stmt::Delete {
+                table,
+                where_clause,
+                ..
+            } => {
+                let schema = self.get_schema(table).ok_or_else(|| {
+                    format!(
+                        "SQL: relation '{}' does not exist (CREATE TABLE first)",
+                        table
+                    )
+                })?;
+                let pkcol = &schema.primary_locus_column;
+                let locus = where_clause.as_ref().and_then(|e| match e {
+                    Expr::Cmp {
+                        op: CmpOp::Eq,
+                        left,
+                        right,
+                    } => match (&**left, &**right) {
+                        (Expr::Column(c), Expr::Literal(v)) if c == pkcol => Some(v.clone()),
+                        (Expr::Literal(v), Expr::Column(c)) if c == pkcol => Some(v.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                });
+                let verb = if matches!(stmt, Stmt::Update { .. }) {
+                    "UPDATE"
+                } else {
+                    "DELETE"
+                };
+                match locus {
+                    Some(v) => {
+                        let key = Self::row_key(table, &v);
+                        Ok(format!(
+                            "{} addresses exactly one locus: key \"{}\" \
+                             (chromosome '{}', locus {})",
+                            verb, key, table, v
+                        ))
+                    }
+                    None => Ok(format!(
+                        "{} scans chromosome '{}' (key prefix \"{}:\") and \
+                         touches every locus matching the predicate; add \
+                         WHERE {} = <literal> to address exactly one locus",
+                        verb, table, table, pkcol
+                    )),
+                }
+            }
+            Stmt::Select { from, .. } if !from.is_empty() => Ok(format!(
+                "SELECT reads loci of chromosome '{}' — point gets on \
+                     \"{}:<pk>\" or a prefix scan \"{}:\"",
+                from, from, from
+            )),
+            Stmt::CreateTable { table, .. } => Ok(format!(
+                "table '{}' -> chromosome '{}'; the schema itself is a \
+                     meta-row under the key \"{}:schema\"",
+                table.name, table.name, table.name
+            )),
+            Stmt::DropTable { table, .. } => Ok(format!(
+                "DROP removes chromosome '{}' with all its loci \
+                     (keys \"{}:<pk>\") and the meta-row \"{}:schema\"",
+                table, table, table
+            )),
+            other => Ok(format!(
+                "({} — does not address row storage directly)",
+                Self::describe_stmt(other)
+            )),
+        }
+    }
+
     pub fn execute(&self, sql: &str) -> Result<QueryResult, String> {
         let mut tx = None;
         self.execute_in_tx(sql, &mut tx)
@@ -2146,6 +2307,7 @@ impl SqlEngine {
             } => self.exec_union(*left, *right, all, order_by, limit, offset),
             Stmt::Cte { ctes, body } => self.exec_cte(ctes, *body, tx),
             Stmt::ShowTables => self.exec_show_tables(),
+            Stmt::ShowStorage { table, pk } => self.exec_show_storage(&table, pk.as_ref()),
             Stmt::Tx { action } => self.exec_tx(action, tx),
             Stmt::Insert { table, rows, on_conflict } => {
                 match tx {
@@ -2246,6 +2408,139 @@ impl SqlEngine {
             format!("ShowTables({} table(s))", n),
             Some(format!("{} table(s)", n)),
         ))
+    }
+
+    /// v4.1: SHOW STORAGE — the SQL→DnaQL→DNA storage map. Read-only:
+    /// explains where rows physically live, never mutates anything.
+    /// Without a PK predicate: one summary row per stored locus. With
+    /// `WHERE <pk-col> = <literal>`: per-column detail for that locus,
+    /// values decoded to the human-readable form next to the physical
+    /// RowCodec representation (nucleotide chains included).
+    fn exec_show_storage(
+        &self,
+        table: &str,
+        pk: Option<&(String, Value)>,
+    ) -> Result<
+        (
+            Vec<String>,
+            Vec<BTreeMap<String, Value>>,
+            String,
+            Option<String>,
+        ),
+        String,
+    > {
+        let schema = self.get_schema(table).ok_or_else(|| {
+            format!(
+                "SQL: relation '{}' does not exist (CREATE TABLE first)",
+                table
+            )
+        })?;
+        match pk {
+            Some((col, lit)) => {
+                if *col != schema.primary_locus_column {
+                    return Err(format!(
+                        "SQL: SHOW STORAGE filters by the primary key '{}' — '{}' is not the PK of '{}'",
+                        schema.primary_locus_column, col, table
+                    ));
+                }
+                let key = Self::row_key(table, lit);
+                let payload = self
+                    .engine
+                    .get(key.as_bytes())
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("SQL: locus {} not found", key))?;
+                let fields = RowCodec::decode(&payload)
+                    .map_err(|e| format!("row {} unreadable: {}", key, e))?;
+                let mut rows = Vec::new();
+                for (fname, value) in fields {
+                    let mut r = BTreeMap::new();
+                    r.insert("chromosome".to_string(), Value::Text(table.to_string()));
+                    r.insert("locus".to_string(), Value::Text(lit.to_string()));
+                    r.insert("storage_key".to_string(), Value::Text(key.clone()));
+                    r.insert("column".to_string(), Value::Text(fname.clone()));
+                    r.insert(
+                        "sql_type".to_string(),
+                        Value::Text(schema.column_type_name(&fname)),
+                    );
+                    r.insert("value".to_string(), Value::Text(value.to_string()));
+                    r.insert("stored_as".to_string(), Value::Text(value.stored_as()));
+                    rows.push(r);
+                }
+                let n = rows.len();
+                Ok((
+                    vec![
+                        "chromosome".into(),
+                        "locus".into(),
+                        "storage_key".into(),
+                        "column".into(),
+                        "sql_type".into(),
+                        "value".into(),
+                        "stored_as".into(),
+                    ],
+                    rows,
+                    format!("ShowStorage(point {})", key),
+                    Some(format!(
+                        "locus {}:{}: {} column(s); values are shown decoded, \
+                         stored_as describes the physical RowCodec bytes",
+                        table, lit, n
+                    )),
+                ))
+            }
+            None => {
+                let prefix = format!("{}:", table);
+                let raw = self
+                    .engine
+                    .scan_prefix(prefix.as_bytes())
+                    .map_err(|e| e.to_string())?;
+                let mut rows = Vec::new();
+                for (key, payload) in raw {
+                    if String::from_utf8_lossy(&key).ends_with(":schema") {
+                        continue;
+                    }
+                    let fields = RowCodec::decode(&payload).map_err(|e| {
+                        format!("row {} unreadable: {}", String::from_utf8_lossy(&key), e)
+                    })?;
+                    let dna_columns = fields
+                        .iter()
+                        .filter(|(_, v)| matches!(v, Value::Dna(_)))
+                        .count();
+                    let key_s = String::from_utf8_lossy(&key).to_string();
+                    let locus = key_s
+                        .strip_prefix(&prefix)
+                        .unwrap_or("?")
+                        .to_string();
+                    let mut r = BTreeMap::new();
+                    r.insert("chromosome".to_string(), Value::Text(table.to_string()));
+                    r.insert("locus".to_string(), Value::Text(locus));
+                    r.insert("storage_key".to_string(), Value::Text(key_s));
+                    r.insert("fields".to_string(), Value::Int(fields.len() as i64));
+                    r.insert(
+                        "payload_bytes".to_string(),
+                        Value::Int(payload.len() as i64),
+                    );
+                    r.insert("dna_columns".to_string(), Value::Int(dna_columns as i64));
+                    rows.push(r);
+                }
+                let n = rows.len();
+                Ok((
+                    vec![
+                        "chromosome".into(),
+                        "locus".into(),
+                        "storage_key".into(),
+                        "fields".into(),
+                        "payload_bytes".into(),
+                        "dna_columns".into(),
+                    ],
+                    rows,
+                    format!("ShowStorage(scan {})", table),
+                    Some(format!(
+                        "chromosome '{}': {} stored locus/loci; add \
+                         WHERE <pk> = <literal> for the per-column detail",
+                        table, n
+                    )),
+                ))
+            }
+        }
     }
 
     fn exec_tx(
@@ -2861,6 +3156,10 @@ impl SqlEngine {
                 Self::describe_stmt(right)
             ),
             Stmt::ShowTables => "ShowTables()".into(),
+            Stmt::ShowStorage { table, pk } => match pk {
+                Some(_) => format!("ShowStorage(point {})", table),
+                None => format!("ShowStorage(scan {})", table),
+            },
             Stmt::AddColumn { table, column, .. } => {
                 format!("AlterTable({} ADD COLUMN {})", table, column)
             }
@@ -6721,5 +7020,95 @@ mod security_regression_tests {
         // (both kept with NULLs on the right side).
         let left_joined = hash_join_left(&left, &right, "id", "id");
         assert_eq!(left_joined.len(), 4);
+    }
+
+    // ---------- v4.1: SHOW STORAGE ----------
+
+    #[test]
+    fn show_storage_maps_row_to_locus_and_decodes_values() {
+        let (_e, sql) = setup();
+        sql.execute(
+            "CREATE TABLE chr_samples (sample_id INT, label TEXT, seq DNA, \
+             PRIMARY KEY (sample_id))",
+        )
+        .unwrap();
+        sql.execute(
+            "INSERT INTO chr_samples (sample_id = 7, label = 'demo', seq = 'CGCGCGATCGATCGCGC')",
+        )
+        .unwrap();
+
+        // Point mode: one row per column, values decoded, chains included.
+        let res = sql
+            .execute("SHOW STORAGE FOR chr_samples WHERE sample_id = 7")
+            .unwrap();
+        assert_eq!(
+            res.columns,
+            vec![
+                "chromosome".to_string(),
+                "locus".to_string(),
+                "storage_key".to_string(),
+                "column".to_string(),
+                "sql_type".to_string(),
+                "value".to_string(),
+                "stored_as".to_string(),
+            ]
+        );
+        let by_col = |name: &str| {
+            res.rows
+                .iter()
+                .find(|r| r.get("column") == Some(&Value::Text(name.into())))
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(by_col("chromosome").get("storage_key"),
+                   Some(&Value::Text("chr_samples:7".into())));
+        assert_eq!(by_col("sample_id").get("sql_type"),
+                   Some(&Value::Text("INT".into())));
+        assert_eq!(by_col("sample_id").get("value"),
+                   Some(&Value::Text("7".into())));
+        assert_eq!(by_col("label").get("value"),
+                   Some(&Value::Text("demo".into())));
+        assert_eq!(by_col("seq").get("sql_type"),
+                   Some(&Value::Text("DNA".into())));
+        // The chain is shown decoded AND its physical form is described.
+        assert_eq!(by_col("seq").get("value"),
+                   Some(&Value::Text("CGCGCGATCGATCGCGC".into())));
+        assert!(matches!(
+            by_col("seq").get("stored_as"),
+            Some(Value::Text(s)) if s.contains("tag 4") && s.contains("18 nt")
+        ));
+
+        // Scan mode: one summary row per stored locus.
+        let res2 = sql.execute("SHOW STORAGE FOR chr_samples").unwrap();
+        assert_eq!(res2.rows.len(), 1);
+        assert_eq!(res2.rows[0].get("storage_key"),
+                   Some(&Value::Text("chr_samples:7".into())));
+        assert_eq!(res2.rows[0].get("dna_columns"),
+                   Some(&Value::Int(1)));
+        assert_eq!(res2.rows[0].get("payload_bytes").map(|v| matches!(v, Value::Int(n) if *n > 0)), Some(true));
+
+        // Filtering by a non-PK column is rejected, unknown locus errors.
+        assert!(sql
+            .execute("SHOW STORAGE FOR chr_samples WHERE label = 'demo'")
+            .is_err());
+        assert!(sql
+            .execute("SHOW STORAGE FOR chr_samples WHERE sample_id = 999")
+            .is_err());
+        assert!(sql.execute("SHOW STORAGE FOR no_such_table").is_err());
+    }
+
+    #[test]
+    fn explain_storage_maps_insert_before_execution() {
+        let (_e, sql) = setup();
+        let map = sql
+            .explain_storage(
+                "INSERT INTO chr_users (user_id, username, balance) VALUES (5, 'ada', 100.0)",
+            )
+            .unwrap();
+        assert!(map.contains("chromosome 'chr_users'"), "{}", map);
+        assert!(map.contains("locus 5"), "{}", map);
+        assert!(map.contains("chr_users:5"), "{}", map);
+        assert!(map.contains("balance [FLOAT] = 100"), "{}", map);
+        assert!(map.contains("RowCodec tag 2"), "{}", map);
     }
 }

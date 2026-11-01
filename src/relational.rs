@@ -77,6 +77,43 @@ impl Value {
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
     }
+
+    /// SQL-ish name of the value's variant (SHOW STORAGE / storage maps).
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Value::Int(_) => "INT",
+            Value::Float(_) => "FLOAT",
+            Value::Text(_) => "TEXT",
+            Value::Dna(_) => "DNA",
+            Value::Null => "NULL",
+        }
+    }
+
+    /// v4.1: human-readable description of the physical (RowCodec)
+    /// representation of this value — the "stored_as" column of the
+    /// SHOW STORAGE / STORAGE_MAP reports. Honest down to the tag bytes.
+    pub fn stored_as(&self) -> String {
+        match self {
+            Value::Null => "RowCodec tag 0: NULL".to_string(),
+            Value::Int(i) => {
+                format!("RowCodec tag 1: i64 little-endian (8 B) = {}", i)
+            }
+            Value::Float(x) => format!(
+                "RowCodec tag 2: f64 IEEE-754 little-endian (8 B) = {}",
+                x
+            ),
+            Value::Text(s) => format!(
+                "RowCodec tag 3: UTF-8 text, u32 length + {} B",
+                s.len()
+            ),
+            Value::Dna(s) => format!(
+                "RowCodec tag 4: nucleotide chain A/C/G/T, {} nt ({} B ASCII); \
+                 decoded value shown in the value column",
+                s.len(),
+                s.len()
+            ),
+        }
+    }
 }
 
 /// Order-preserving byte encoding for secondary-index keys.
@@ -206,6 +243,23 @@ impl ChromosomeTable {
 
     pub fn column_type(&self, name: &str) -> Option<&ColumnType> {
         self.columns.get(name)
+    }
+
+    /// SQL-ish name of a column type (SHOW STORAGE / storage maps).
+    /// Defined here so every reporter uses the exact schema wording.
+    pub fn column_type_name(&self, column: &str) -> String {
+        match self.column_type(column) {
+            Some(ColumnType::Int64) => "INT".to_string(),
+            Some(ColumnType::Float64) => "FLOAT".to_string(),
+            Some(ColumnType::Text) => "TEXT".to_string(),
+            Some(ColumnType::Dna2Bit) => "DNA".to_string(),
+            Some(ColumnType::Timestamp) => "TIMESTAMP".to_string(),
+            Some(ColumnType::ForeignLink {
+                target_chromosome,
+                target_column,
+            }) => format!("FK->{}({})", target_chromosome, target_column),
+            None => "?".to_string(),
+        }
     }
 }
 

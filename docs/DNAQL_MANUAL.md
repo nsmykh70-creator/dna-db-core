@@ -114,6 +114,22 @@ formula), `REV_COMP()` (bitwise), `TRANSCRIBE()` (T→U), `TRANSLATE()`
 chr_variants:1 |> ...` is also supported — analyze a sequence taken
 from a row.
 
+### Locus storage map: STORAGE_MAP() (v4.1)
+
+A/C/G/T chains are the internal representation — humans do not need to
+read them. `STORAGE_MAP()` returns the storage map of one locus:
+chromosome, locus, exact key, column type, the human-readable value and
+its physical representation (RowCodec tag, size). It works on ANY row —
+a sequence field is not required; this is the DnaQL counterpart of the
+SQL statement `SHOW STORAGE ... WHERE <pk> = <literal>`.
+
+```dnaql
+ANALYZE LOCUS chr_orders:1042 |> STORAGE_MAP();
+-- function    chromosome  locus  storage_key       column   sql_type  value    stored_as
+-- STORAGE_MAP chr_orders  1042   chr_orders:1042   order_id INT       1042     RowCodec tag 1: i64 little-endian (8 B) = 1042
+-- STORAGE_MAP chr_orders  1042   chr_orders:1042   status   TEXT      PENDING  RowCodec tag 3: UTF-8 text, u32 length + 7 B
+```
+
 ---
 
 ## Chapter 4. Rosetta Stone cheat sheet: SQL vs DnaQL
