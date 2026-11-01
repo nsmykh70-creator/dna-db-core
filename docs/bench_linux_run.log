@@ -1,37 +1,37 @@
 
-=== DNA-DB v3.3 ===
-  load 10000 ... 3542 ops/s, avg 0.28 ms
-  load-mt 8000 rows x 8 threads ... 3704 rows/s, p50 1.77 ms, errors=0, verified=True
-  load-batch 8000 rows, batch=200 ... 166266 rows/s (40 batches), p50 1.15 ms/batch, errors=0, verified=True
-  point-read 4000 ... 18871 ops/s, p50 0.05 / p95 0.07 / p99 0.08 ms, errors=0
-  mixed 8 threads x 500 ops (80/20) ... 10142 ops/s, p50 0.37 / p99 1.31 ms
-  sql load 3000 rows ... 3178 ops/s, avg 0.31 ms
-  sql SELECT WHERE pk x 1500 ... 12895 ops/s, p50 0.06 / p95 0.09 / p99 0.11 ms, errors=0
+=== DNA-DB v4.0.0 ===
+  load 10000 ... 2726 ops/s, avg 0.37 ms
+  load-mt 8000 rows x 8 threads ... 3089 rows/s, p50 2.23 ms, errors=0, verified=True
+  load-batch 8000 rows, batch=200 ... 155083 rows/s (40 batches), p50 1.22 ms/batch, errors=0, verified=True
+  point-read 4000 ... 19675 ops/s, p50 0.05 / p95 0.07 / p99 0.08 ms, errors=0
+  mixed 8 threads x 500 ops (80/20) ... 9128 ops/s, p50 0.45 / p99 1.98 ms
+  sql load 3000 rows ... 2516 ops/s, avg 0.39 ms
+  sql SELECT WHERE pk x 1500 ... 11215 ops/s, p50 0.08 / p95 0.10 / p99 0.13 ms, errors=0
 
 === MySQL ===
-  load 10000 ... 1430 ops/s, avg 0.70 ms
-  load-mt 8000 rows x 8 threads ... 4833 rows/s, p50 1.36 ms, errors=0, verified=True
-  load-batch 8000 rows, batch=200 ... 66805 rows/s (40 batches), p50 2.83 ms/batch, errors=0, verified=True
-  point-read 4000 ... 5343 ops/s, p50 0.16 / p95 0.21 / p99 0.24 ms, errors=0
-  mixed 8 threads x 500 ops (80/20) ... 7415 ops/s, p50 0.75 / p99 2.43 ms
-  sql load 3000 rows ... 1465 ops/s, avg 0.68 ms
-  sql SELECT WHERE pk x 1500 ... 5396 ops/s, p50 0.17 / p95 0.22 / p99 0.25 ms, errors=0
+  load 10000 ... 1131 ops/s, avg 0.88 ms
+  load-mt 8000 rows x 8 threads ... 5134 rows/s, p50 1.32 ms, errors=0, verified=True
+  load-batch 8000 rows, batch=200 ... 68632 rows/s (40 batches), p50 2.53 ms/batch, errors=0, verified=True
+  point-read 4000 ... 5089 ops/s, p50 0.17 / p95 0.23 / p99 0.24 ms, errors=0
+  mixed 8 threads x 500 ops (80/20) ... 7448 ops/s, p50 0.77 / p99 2.35 ms
+  sql load 3000 rows ... 1097 ops/s, avg 0.91 ms
+  sql SELECT WHERE pk x 1500 ... 4951 ops/s, p50 0.21 / p95 0.24 / p99 0.26 ms, errors=0
 
 === PostgreSQL ===
-  load 10000 ... 4110 ops/s, avg 0.24 ms
-  load-mt 8000 rows x 8 threads ... 13888 rows/s, p50 0.50 ms, errors=0, verified=True
-  load-batch 8000 rows, batch=200 ... 160611 rows/s (40 batches), p50 1.16 ms/batch, errors=0, verified=True
-  point-read 4000 ... 7516 ops/s, p50 0.12 / p95 0.17 / p99 0.19 ms, errors=0
-  mixed 8 threads x 500 ops (80/20) ... 14106 ops/s, p50 0.40 / p99 1.70 ms
-  sql load 3000 rows ... 3902 ops/s, avg 0.26 ms
-  sql SELECT WHERE pk x 1500 ... 7409 ops/s, p50 0.12 / p95 0.17 / p99 0.19 ms, errors=0
+  load 10000 ... 3588 ops/s, avg 0.28 ms
+  load-mt 8000 rows x 8 threads ... 13290 rows/s, p50 0.52 ms, errors=0, verified=True
+  load-batch 8000 rows, batch=200 ... 163643 rows/s (40 batches), p50 1.19 ms/batch, errors=0, verified=True
+  point-read 4000 ... 7270 ops/s, p50 0.13 / p95 0.18 / p99 0.19 ms, errors=0
+  mixed 8 threads x 500 ops (80/20) ... 13713 ops/s, p50 0.38 / p99 2.18 ms
+  sql load 3000 rows ... 3259 ops/s, avg 0.31 ms
+  sql SELECT WHERE pk x 1500 ... 7594 ops/s, p50 0.12 / p95 0.16 / p99 0.18 ms, errors=0
 
 JSON report: docs/bench_compare_results_linux.json
 
 ================================================================================================
 system / metric      load1/s   loadMT/s   batch/s    read/s   mixed/s  sqlsel/s
 ------------------------------------------------------------------------------------------------
-DNA-DB                  3542       3704    166266     18871     10142     12895
-MySQL                   1430       4833     66805      5343      7415      5396
-PostgreSQL              4110      13888    160611      7516     14106      7409
+DNA-DB                  2726       3089    155083     19675      9128     11215
+MySQL                   1131       5134     68632      5089      7448      4951
+PostgreSQL              3588      13290    163643      7270     13713      7594
 ================================================================================================
