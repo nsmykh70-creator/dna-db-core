@@ -74,6 +74,12 @@ pub fn classify_error(message: &str) -> u16 {
         errno::ER_BAD_NULL_ERROR
     } else if m.contains("fk violation") {
         errno::ER_NO_REFERENCED_ROW_2
+    } else if m.contains("can't drop") || m.contains("cannot drop") {
+        errno::ER_CANT_DROP_FIELD_OR_KEY
+    } else if m.contains("unknown column") || m.contains("no such column") {
+        errno::ER_BAD_FIELD_ERROR
+    } else if m.contains("already has an index") {
+        1061 // ER_DUP_KEYNAME
     } else if m.starts_with("sql:") {
         errno::ER_PARSE_ERROR
     } else {
@@ -89,6 +95,9 @@ pub struct CmsSqlGate {
     next_session: AtomicU64,
     /// Catalog overlay: MySQL-exact schema metadata per table (dbDelta).
     meta: RwLock<HashMap<String, CmsTableMeta>>,
+    /// Active BEGIN..COMMIT buffers per session (taken out for each
+    /// statement, put back after — the engine mutates it in place).
+    txs: Mutex<HashMap<u64, crate::sql_engine::SqlTxBuffer>>,
 }
 
 impl CmsSqlGate {
@@ -99,6 +108,7 @@ impl CmsSqlGate {
             sessions: Mutex::new(HashMap::new()),
             next_session: AtomicU64::new(1),
             meta: RwLock::new(HashMap::new()),
+            txs: Mutex::new(HashMap::new()),
         }
     }
 
@@ -117,6 +127,9 @@ impl CmsSqlGate {
     /// the session record. Returns the number of locks freed.
     pub fn close_session(&self, id: u64) -> usize {
         let freed = self.locks.release_all(id);
+        // Uncommitted transaction state dies with the connection (MySQL
+        // rolls an open transaction back on disconnect).
+        self.txs.lock().expect("tx map poisoned").remove(&id);
         self.sessions.lock().expect("session map poisoned").remove(&id);
         freed
     }
@@ -175,7 +188,10 @@ impl CmsSqlGate {
 
     /// Executes one statement in the CMS dialect.
     pub fn execute(&self, session: u64, sql: &str) -> Result<CmsQueryResult, CmsError> {
-        let sql = sql.trim();
+        // MySQL-dialect preprocessing before any dispatch: backtick-quoted
+        // identifiers, `DESCRIBE` → SHOW FULL COLUMNS, `NOW()` in DML.
+        let pre = preprocess_mysql_dialect(sql);
+        let sql = pre.trim();
         let sql = sql.strip_suffix(';').unwrap_or(sql).trim();
         if sql.is_empty() {
             return Err(CmsError { errno: errno::ER_PARSE_ERROR, message: "empty query".into() });
@@ -206,21 +222,52 @@ impl CmsSqlGate {
             }
         }
 
+        // ---------- CREATE TABLE: register the MySQL-dialect overlay ----------
+        // The engine parses the raw DDL itself (cms grammar); the overlay
+        // keeps the exact MySQL types so SHOW FULL COLUMNS / SHOW INDEX are
+        // byte-for-byte dbDelta-compatible for plugin tables too.
+        if upper.starts_with("CREATE TABLE") {
+            if let Ok(meta) = CmsTableMeta::parse_create_table(sql) {
+                self.register_table_meta(meta);
+            }
+        }
+
         // ---------- SQL_CALC_FOUND_ROWS ----------
-        let mut calc_found = false;
         let mut forwarded = sql.to_string();
         if let Some(pos) = find_ci(&forwarded, "SQL_CALC_FOUND_ROWS") {
-            calc_found = true;
             forwarded.replace_range(pos..pos + "SQL_CALC_FOUND_ROWS".len(), "");
             forwarded = forwarded.split_whitespace().collect::<Vec<_>>().join(" ");
         }
 
         // ---------- real execution ----------
         let is_select = upper.starts_with("SELECT") || upper.starts_with("WITH");
-        let res = self
-            .engine
-            .execute(&forwarded)
-            .map_err(|e| CmsError { errno: classify_error(&e), message: e })?;
+        // The session owns the BEGIN..COMMIT buffer: while a transaction is
+        // active, DML is buffered here and applied as one atomic WAL batch
+        // on COMMIT (v3.6 transaction semantics, one buffer per connection).
+        let mut tx_buf = self.txs.lock().expect("tx map poisoned").remove(&session);
+        let res = match self.engine.execute_in_tx(&forwarded, &mut tx_buf) {
+            Ok(res) => {
+                if let Some(buf) = tx_buf.take() {
+                    self.txs
+                        .lock()
+                        .expect("tx map poisoned")
+                        .insert(session, buf);
+                }
+                res
+            }
+            Err(e) => {
+                // MySQL parity: a failed statement does NOT abort the open
+                // transaction (only the statement itself is rolled back) —
+                // WooCommerce retry loops rely on the tx surviving 1213s.
+                if let Some(buf) = tx_buf.take() {
+                    self.txs
+                        .lock()
+                        .expect("tx map poisoned")
+                        .insert(session, buf);
+                }
+                return Err(CmsError { errno: classify_error(&e), message: e });
+            }
+        };
 
         let mut out = CmsQueryResult {
             columns: res.columns,
@@ -245,24 +292,26 @@ impl CmsSqlGate {
         }
         // LAST_INSERT_ID bookkeeping after INSERT.
         if upper.starts_with("INSERT") {
-            let mut max_pk = 0u64;
+            // MySQL: LAST_INSERT_ID is the FIRST id generated by the most
+            // recent INSERT — multi-row inserts return the first row's id,
+            // and an ODKU-update leaves it unchanged (no pk rows).
+            let mut first_pk: Option<u64> = None;
             for r in &out.rows {
                 if let Some(v) = r.get("pk") {
-                    if let Value::Text(t) = v {
-                        if let Ok(n) = t.parse::<u64>() {
-                            max_pk = max_pk.max(n);
-                        }
-                    }
-                    if let Value::Int(i) = v {
-                        if *i > 0 {
-                            max_pk = max_pk.max(*i as u64);
-                        }
+                    let n = match v {
+                        Value::Text(t) => t.parse::<u64>().ok(),
+                        Value::Int(i) if *i > 0 => Some(*i as u64),
+                        _ => None,
+                    };
+                    if n.is_some() {
+                        first_pk = n;
+                        break;
                     }
                 }
             }
-            if max_pk > 0 {
-                out.last_insert_id = max_pk;
-                self.with_session(session, |s| s.last_insert_id = max_pk);
+            if let Some(pk) = first_pk {
+                out.last_insert_id = pk;
+                self.with_session(session, |s| s.last_insert_id = pk);
             }
         }
         Ok(out)
@@ -397,7 +446,9 @@ impl CmsSqlGate {
     ) -> Result<Option<CmsQueryResult>, CmsError> {
         // SHOW TABLES [LIKE 'pat'] — engine's own SHOW TABLES has no LIKE.
         if upper.starts_with("SHOW TABLES") {
-            let like = find_like_pattern(sql);
+            // The pattern is a MySQL string literal: decode escapes first
+            // ('wp\\_%' → wp\_% — one backslash, as LIKE expects).
+            let like = find_like_pattern(sql).map(|p| decode_mysql_string(&p));
             let db = self
                 .with_session(session, |s| s.database.clone().unwrap_or_default())
                 .unwrap_or_default();
@@ -455,6 +506,7 @@ impl CmsSqlGate {
                     "Table".into(), "Non_unique".into(), "Key_name".into(), "Seq_in_index".into(),
                     "Column_name".into(), "Collation".into(), "Cardinality".into(), "Sub_part".into(),
                     "Packed".into(), "Null".into(), "Index_type".into(), "Comment".into(),
+                    "Index_comment".into(), "Is_visible".into(),
                 ],
                 rows,
                 message: Some(format!("{} index row(s)", found)),
@@ -582,6 +634,8 @@ impl CmsSqlGate {
             r.insert("Null".into(), Value::Text(String::new()));
             r.insert("Index_type".into(), Value::Text("BTREE".into()));
             r.insert("Comment".into(), Value::Text(String::new()));
+            r.insert("Index_comment".into(), Value::Text(String::new()));
+            r.insert("Is_visible".into(), Value::Text("YES".into()));
             rows.push(r);
         };
         push("PRIMARY", 0, &schema.primary_locus_column, 1, None);
@@ -680,21 +734,179 @@ fn find_like_pattern(sql: &str) -> Option<String> {
 }
 
 /// MySQL LIKE with % (any run) and _ (one char), case-insensitive.
+/// The matcher lives in `expr` so the WHERE evaluator shares it.
 pub fn like_match(pattern: &str, text: &str) -> bool {
-    let p = pattern.to_ascii_lowercase();
-    let t = text.to_ascii_lowercase();
-    like_rec(p.as_bytes(), t.as_bytes())
+    crate::expr::like_match(pattern, text)
 }
 
-fn like_rec(p: &[u8], t: &[u8]) -> bool {
-    match (p.first(), t.first()) {
-        (None, None) => true,
-        (Some(b'%'), _) => like_rec(&p[1..], t) || (!t.is_empty() && like_rec(p, &t[1..])),
-        (Some(b'\\'), Some(&c)) if p.len() >= 2 => c == t[0] && like_rec(&p[2..], &t[1..]),
-        (Some(b'_'), Some(_)) => like_rec(&p[1..], &t[1..]),
-        (Some(&c), Some(&d)) => c == d && like_rec(&p[1..], &t[1..]),
-        _ => false,
+/// MySQL-dialect preprocessing applied to every statement before dispatch:
+/// 1) backtick-quoted identifiers are unquoted (the engine tokenizer has no
+///    backtick token; CMS identifiers never need escaping);
+/// 2) `DESCRIBE tbl` / `DESC tbl` → `SHOW FULL COLUMNS FROM tbl` (dbDelta
+///    actually sends DESCRIBE);
+/// 3) `NOW()` inside INSERT/UPDATE → the current timestamp as a literal
+///    (engine INSERT values are literals; Woo order timestamps use NOW()).
+fn preprocess_mysql_dialect(sql: &str) -> String {
+    let stripped = strip_backticks(sql);
+    let upper = stripped.trim_start().to_ascii_uppercase();
+    let mut out = if upper.starts_with("DESCRIBE ") || upper.starts_with("DESC ") {
+        let off = if upper.starts_with("DESCRIBE ") { 9 } else { 5 };
+        let t = stripped.trim_start()[off..]
+            .trim()
+            .trim_end_matches(';')
+            .trim()
+            .trim_matches('`')
+            .to_string();
+        format!("SHOW FULL COLUMNS FROM {}", t)
+    } else {
+        stripped
+    };
+    let upper = out.to_ascii_uppercase();
+    if upper.starts_with("INSERT") || upper.starts_with("UPDATE") {
+        // The literal must be quoted — the engine values are SQL literals.
+        out = replace_fn_ci_outside_strings(&out, "NOW()", &format!("'{}'", now_mysql()));
     }
+    out
+}
+
+/// Removes MySQL backtick quoting from identifiers. String literals are
+/// respected (single/double quoted, backslash escapes), doubled backticks
+/// inside an identifier decode to a literal backtick.
+fn strip_backticks(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    let mut in_string: Option<char> = None;
+    let mut in_backtick = false;
+    while let Some(c) = chars.next() {
+        match in_string {
+            Some(q) => {
+                out.push(c);
+                if c == '\\' {
+                    if let Some(&n) = chars.peek() {
+                        out.push(n);
+                        chars.next();
+                    }
+                } else if c == q {
+                    if chars.peek() == Some(&q) {
+                        out.push(q);
+                        chars.next();
+                    } else {
+                        in_string = None;
+                    }
+                }
+            }
+            None => {
+                if in_backtick {
+                    if c == '`' {
+                        if chars.peek() == Some(&'`') {
+                            out.push('`');
+                            chars.next();
+                        } else {
+                            in_backtick = false;
+                        }
+                    } else {
+                        out.push(c);
+                    }
+                } else if c == '`' {
+                    in_backtick = true;
+                } else {
+                    if c == '\'' || c == '"' {
+                        in_string = Some(c);
+                    }
+                    out.push(c);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Case-insensitive replacement of a function call token (`NOW()`) outside
+/// string literals; string contents are never touched.
+fn replace_fn_ci_outside_strings(s: &str, needle: &str, replacement: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let nchars: Vec<char> = needle.chars().collect();
+    let mut out = String::with_capacity(s.len() + replacement.len());
+    let mut i = 0usize;
+    let mut in_string: Option<char> = None;
+    while i < chars.len() {
+        let c = chars[i];
+        if let Some(q) = in_string {
+            out.push(c);
+            if c == '\\' && i + 1 < chars.len() {
+                out.push(chars[i + 1]);
+                i += 2;
+                continue;
+            }
+            if c == q {
+                if i + 1 < chars.len() && chars[i + 1] == q {
+                    out.push(q);
+                    i += 2;
+                    continue;
+                }
+                in_string = None;
+            }
+            i += 1;
+            continue;
+        }
+        let mut matched = c.to_ascii_lowercase() == nchars[0].to_ascii_lowercase();
+        if matched {
+            for (k, nc) in nchars.iter().enumerate() {
+                if i + k >= chars.len()
+                    || chars[i + k].to_ascii_lowercase() != nc.to_ascii_lowercase()
+                {
+                    matched = false;
+                    break;
+                }
+            }
+        }
+        if matched {
+            out.push_str(replacement);
+            i += nchars.len();
+            continue;
+        }
+        if c == '\'' || c == '"' {
+            in_string = Some(c);
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// Current server time in the MySQL literal format `YYYY-MM-DD HH:MM:SS`
+/// (UTC; the CMS edition does not model per-server time zones yet).
+fn now_mysql() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        y,
+        m,
+        d,
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
+}
+
+/// Howard Hinnant's civil_from_days: days since 1970-01-01 → (y, m, d).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 /// Table name after one of the SHOW … FROM <table> heads.
@@ -714,21 +926,58 @@ fn show_target(sql: &str, upper: &str, heads: &[&str]) -> Option<String> {
     None
 }
 
-/// "N row(s) inserted/updated/deleted" → N.
+/// "N row(s) inserted/updated/deleted" → N; also the engine's DELETE form
+/// "N deleted, M cascaded".
 fn extract_row_count(message: &str) -> u64 {
     let m = message.to_ascii_lowercase();
-    if let Some(pos) = m.find(" row(s)") {
-        let start = m[..pos]
-            .chars()
-            .rev()
-            .take_while(|c| c.is_ascii_digit())
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect::<String>();
-        return start.parse::<u64>().unwrap_or(0);
+    for marker in [" row(s)", " deleted"] {
+        if let Some(pos) = m.find(marker) {
+            let start = m[..pos]
+                .chars()
+                .rev()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>();
+            if let Ok(n) = start.parse::<u64>() {
+                return n;
+            }
+        }
     }
     0
+}
+
+/// Decodes a MySQL string literal body (the text between the quotes):
+/// backslash escapes per the MySQL manual, `\%` and `\_` stay two chars.
+fn decode_mysql_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] == '\\' && i + 1 < chars.len() {
+            let e = chars[i + 1];
+            match e {
+                '0' => out.push('\0'),
+                'n' => out.push('\n'),
+                't' => out.push('\t'),
+                'r' => out.push('\r'),
+                'b' => out.push('\u{0008}'),
+                'Z' => out.push('\u{001a}'),
+                '\'' | '"' | '\\' => out.push(e),
+                '%' | '_' => {
+                    out.push('\\');
+                    out.push(e);
+                }
+                other => out.push(other),
+            }
+            i += 2;
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 /// Fallback Type rendering for tables without overlay metadata.
@@ -984,14 +1233,13 @@ mod tests {
         assert_eq!(v(&r.rows[0], "FOUND_ROWS()"), "1");
 
         // Row exists with generated ID; post_date_gmt was never provided →
-        // stored sparse (NULL/absent). Phase-1 note: engine-level DEFAULT
-        // fill for omitted columns is backlog (CMS_EDITION_RU.md §4, item 11);
-        // WordPress core always sends date columns explicitly.
+        // filled with the effective DEFAULT (NOT NULL zero-date), exactly
+        // what MySQL does for an omitted column on INSERT (§4.11 done).
         let r = g.execute(s, "SELECT post_date_gmt FROM wp_posts WHERE ID = 1").unwrap();
-        assert!(matches!(
-            r.rows[0].get("post_date_gmt"),
-            None | Some(Value::Null)
-        ));
+        assert_eq!(
+            r.rows[0].get("post_date_gmt").map(|v| v.to_string()).as_deref(),
+            Some("0000-00-00 00:00:00")
+        );
         let r = g.execute(s, "SELECT ID FROM wp_posts WHERE post_name = 't1'").unwrap();
         assert_eq!(v(&r.rows[0], "ID"), "1");
     }
@@ -1018,9 +1266,10 @@ mod tests {
         let r = g.execute(s, "SELECT value FROM wp_myplugin_data WHERE id = 1").unwrap();
         assert_eq!(v(&r.rows[0], "value"), "19.99");
 
-        // Fallback catalog (no overlay): engine-derived types. Note: the
-        // engine stores columns in BTreeMap (alphabetical) order, so look
-        // rows up by Field, not by index.
+        // CREATE TABLE through the gate registers the MySQL-dialect overlay
+        // automatically, so SHOW FULL COLUMNS returns the EXACT original
+        // types (dbDelta parity for plugin tables). Columns live in the
+        // DDL's declared order; look rows up by Field regardless.
         let r = g.execute(s, "SHOW FULL COLUMNS FROM wp_myplugin_data").unwrap();
         assert_eq!(r.rows.len(), 5);
         let row = |name: &str| {
@@ -1029,10 +1278,12 @@ mod tests {
                 .find(|row| v(row, "Field") == name)
                 .unwrap_or_else(|| panic!("column {} not shown", name))
         };
-        assert_eq!(v(row("id"), "Type"), "bigint(20)");
+        assert_eq!(v(row("id"), "Type"), "bigint(20) unsigned");
         assert_eq!(v(row("id"), "Key"), "PRI");
-        assert_eq!(v(row("value"), "Type"), "double");
+        assert_eq!(v(row("id"), "Extra"), "auto_increment");
+        assert_eq!(v(row("value"), "Type"), "decimal(10,2)");
         assert_eq!(v(row("created"), "Type"), "datetime");
+        assert_eq!(v(row("note"), "Default"), "");
     }
 
     #[test]
@@ -1050,5 +1301,120 @@ mod tests {
         let r = g.execute(s, "SHOW INDEX FROM chr_plain").unwrap();
         assert_eq!(r.rows.len(), 1);
         assert_eq!(v(&r.rows[0], "Key_name"), "PRIMARY");
+    }
+
+    #[test]
+    fn transactions_and_mysql_dialect_via_gate() {
+        let g = gate("dialect_tx");
+        g.bootstrap_wordpress().unwrap();
+        let s = g.open_session();
+
+        // Backticked identifiers (wpdb sends them everywhere).
+        g.execute(
+            s,
+            "INSERT INTO `wp_options` (`option_name`, `option_value`, `autoload`) VALUES ('bt', '1', 'yes')",
+        )
+        .unwrap();
+
+        // ON DUPLICATE KEY UPDATE on the UNIQUE option_name (add_option path).
+        g.execute(
+            s,
+            "INSERT INTO wp_options (option_name, option_value, autoload) VALUES ('bt', '2', 'yes') \
+             ON DUPLICATE KEY UPDATE option_value = VALUES(option_value)",
+        )
+        .unwrap();
+        let r = g
+            .execute(s, "SELECT option_value FROM wp_options WHERE option_name = 'bt'")
+            .unwrap();
+        assert_eq!(v(&r.rows[0], "option_value"), "2");
+        assert_eq!(r.rows.len(), 1, "upsert must not duplicate the row");
+
+        // DESCRIBE is dbDelta's actual probe.
+        let r = g.execute(s, "DESCRIBE wp_options").unwrap();
+        assert_eq!(r.columns.first().map(String::as_str), Some("Field"));
+        assert_eq!(r.rows.len(), 4);
+
+        // LIMIT offset, count (WP_Query pagination form).
+        g.execute(
+            s,
+            "INSERT INTO wp_options (option_name, option_value, autoload) VALUES ('p1','1','yes'),('p2','2','yes'),('p3','3','yes'),('p4','4','yes'),('p5','5','yes')",
+        )
+        .unwrap();
+        let r = g
+            .execute(
+                s,
+                "SELECT option_name FROM wp_options WHERE option_name != 'bt' ORDER BY option_name ASC LIMIT 2, 2",
+            )
+            .unwrap();
+        assert_eq!(v(&r.rows[0], "option_name"), "p3");
+        assert_eq!(v(&r.rows[1], "option_name"), "p4");
+        assert_eq!(r.rows.len(), 2);
+
+        // NOW() literal rewrite in UPDATE.
+        g.execute(
+            s,
+            "UPDATE wp_options SET option_value = NOW() WHERE option_name = 'p1'",
+        )
+        .unwrap();
+        let r = g
+            .execute(s, "SELECT option_value FROM wp_options WHERE option_name = 'p1'")
+            .unwrap();
+        let val = v(&r.rows[0], "option_value");
+        assert_eq!(val.len(), 19, "NOW() must render as 'YYYY-MM-DD HH:MM:SS', got {val}");
+        assert_eq!(&val[4..5], "-");
+
+        // Transaction: ROLLBACK discards, COMMIT persists.
+        g.execute(s, "START TRANSACTION").unwrap();
+        g.execute(
+            s,
+            "INSERT INTO wp_options (option_name, option_value, autoload) VALUES ('txrow', '1', 'yes')",
+        )
+        .unwrap();
+        g.execute(s, "ROLLBACK").unwrap();
+        let r = g
+            .execute(s, "SELECT option_name FROM wp_options WHERE option_name = 'txrow'")
+            .unwrap();
+        assert_eq!(r.rows.len(), 0, "ROLLBACK must discard the INSERT");
+
+        g.execute(s, "BEGIN").unwrap();
+        g.execute(
+            s,
+            "INSERT INTO wp_options (option_name, option_value, autoload) VALUES ('txrow2', '1', 'yes')",
+        )
+        .unwrap();
+        g.execute(s, "COMMIT").unwrap();
+        let r = g
+            .execute(s, "SELECT option_name FROM wp_options WHERE option_name = 'txrow2'")
+            .unwrap();
+        assert_eq!(r.rows.len(), 1, "COMMIT must persist the INSERT");
+
+        // Escaped quotes inside string literals (MySQL backslash escapes).
+        g.execute(
+            s,
+            "INSERT INTO wp_options (option_name, option_value, autoload) VALUES ('esc', 'don\\'t \\\\ stop', 'yes')",
+        )
+        .unwrap();
+        let r = g
+            .execute(s, "SELECT option_value FROM wp_options WHERE option_name = 'esc'")
+            .unwrap();
+        assert_eq!(v(&r.rows[0], "option_value"), "don't \\ stop");
+    }
+
+    #[test]
+    fn wp_like_transient_cleanup_pattern() {
+        // The escaped-wildcard LIKE from delete_expired_transients: backslash
+        // escapes must survive tokenization so '\_%' matches a literal '_'.
+        let g = gate("transient");
+        g.bootstrap_wordpress().unwrap();
+        let s = g.open_session();
+        g.execute(
+            s,
+            "INSERT INTO wp_options (option_name, option_value, autoload) VALUES ('_transient_x', '1', 'yes'), ('_transient_timeout_x', '1', 'no'), ('_transient_y', '2', 'no')",
+        )
+        .unwrap();
+        let r = g
+            .execute(s, "SELECT option_name FROM wp_options WHERE option_name LIKE '\\_transient\\_%' AND option_name NOT LIKE '%timeout%' ORDER BY option_name ASC")
+            .unwrap();
+        assert_eq!(r.rows.len(), 2, "\\_ must anchor the pattern to the literal underscore");
     }
 }

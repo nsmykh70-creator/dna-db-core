@@ -43,6 +43,7 @@ pub(crate) fn transpile(
         Stmt::Select {
             projection,
             from,
+            from_alias: _,
             joins,
             where_clause,
             group_by,
@@ -257,6 +258,10 @@ pub(crate) fn transpile(
             "SQL→DnaQL: ALTER TABLE {} ADD COLUMN {} has no DnaQL equivalent",
             table, column
         )),
+        Stmt::DropColumn { table, column } => Err(format!(
+            "SQL→DnaQL: ALTER TABLE {} DROP COLUMN {} has no DnaQL equivalent",
+            table, column
+        )),
     }
 }
 
@@ -283,6 +288,12 @@ fn emit_columns(
         match item {
             SelectItem::Star => {
                 cols.extend(schema.columns.keys().cloned());
+            }
+            SelectItem::AliasStar(qual) => {
+                return Err(format!(
+                    "SQL→DnaQL: '{}' projection alias .* is not expressible in DnaQL EMIT",
+                    qual
+                ));
             }
             SelectItem::Column { source, alias } => {
                 if let Some(a) = alias {
@@ -432,6 +443,10 @@ fn expr(e: &Expr) -> Result<String, String> {
         Expr::ScalarSubquery { .. } | Expr::Exists { .. } => Err(
             "SQL→DnaQL: scalar/EXISTS subqueries are not expressible in DnaQL; run the inner \
              SELECT separately"
+                .into(),
+        ),
+        Expr::Like { .. } => Err(
+            "SQL→DnaQL: LIKE is not part of the DnaQL expression grammar; use exact comparisons"
                 .into(),
         ),
     }

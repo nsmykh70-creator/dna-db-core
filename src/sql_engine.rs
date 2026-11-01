@@ -165,6 +165,35 @@ fn stokenize(input: &str) -> Result<Vec<STok>, String> {
                 i += 1;
                 let mut closed = false;
                 while i < b.len() {
+                    // CMS edition: MySQL string-literal escapes. `\%` and
+                    // `\_` stay two characters so LIKE patterns keep their
+                    // escaped wildcards ('\_transient\_%'); the rest map per
+                    // the MySQL manual, unknown escapes drop the backslash.
+                    #[cfg(feature = "cms")]
+                    {
+                        if b[i] == '\\' {
+                            if i + 1 >= b.len() {
+                                return Err("SQL: dangling backslash in string literal".into());
+                            }
+                            let e = b[i + 1];
+                            match e {
+                                '0' => s.push('\0'),
+                                'n' => s.push('\n'),
+                                't' => s.push('\t'),
+                                'r' => s.push('\r'),
+                                'b' => s.push('\u{0008}'),
+                                'Z' => s.push('\u{001a}'),
+                                '\'' | '"' | '\\' => s.push(e),
+                                '%' | '_' => {
+                                    s.push('\\');
+                                    s.push(e);
+                                }
+                                other => s.push(other),
+                            }
+                            i += 2;
+                            continue;
+                        }
+                    }
                     if b[i] == quote {
                         // standard SQL escape: doubled quote inside a string is a literal quote
                         if i + 1 < b.len() && b[i + 1] == quote {
@@ -276,6 +305,8 @@ pub enum Stmt {
     Select {
         projection: Vec<SelectItem>, // empty = *
         from: String,
+        /// Alias of the FROM table (AS t) — for `t.*` expansion.
+        from_alias: Option<String>,
         joins: Vec<JoinSpec>,
         where_clause: Option<Expr>,
         group_by: Vec<String>,
@@ -359,11 +390,18 @@ pub enum Stmt {
         body: Box<Stmt>,
     },
     /// v3.9 Online DDL: instant metadata-only `ALTER TABLE t ADD COLUMN c T`
-    /// (no row rewrite; existing rows read the new column as NULL).
+    /// (no row rewrite; existing rows read the new column as NULL, or the
+    /// DEFAULT literal captured for MySQL-dialect tables).
     AddColumn {
         table: String,
         column: String,
         col_type: ColumnType,
+        col_default: Option<String>,
+    },
+    /// CMS edition: `ALTER TABLE t DROP COLUMN c` (dbDelta revert path).
+    DropColumn {
+        table: String,
+        column: String,
     },
 }
 
@@ -399,6 +437,8 @@ pub(crate) enum TxAction {
 #[derive(Debug, Clone)]
 pub(crate) enum SelectItem {
     Star,
+    /// CMS edition: `t.*` — expanded at execution (see exec_select).
+    AliasStar(String),
     Column {
         source: String,
         alias: Option<String>,
@@ -492,6 +532,8 @@ impl AggFunc {
 pub(crate) struct JoinSpec {
     pub(crate) join_type: JoinType,
     pub(crate) table: String,
+    /// Table alias (AS t) — kept for `t.*` projection expansion.
+    pub(crate) alias: Option<String>,
     pub(crate) left_col: String, // qualified or bare (resolved later)
     pub(crate) right_col: String,
 }
@@ -530,8 +572,11 @@ struct SParser {
 }
 
 /// Maximum nesting accepted by the SQL parser (parenthesised expressions,
-/// nested subqueries, or any mix of both).
-const MAX_PARSE_DEPTH: usize = 128;
+/// nested subqueries, or any mix of both). 128 was the original value; the
+/// CMS edition added parser branches whose debug-build stack frames made a
+/// 128-deep recursion overflow the 2 MiB test-thread stack BEFORE the guard
+/// fired, so the limit now sits at a safer 100 (real CMS queries nest < 10).
+const MAX_PARSE_DEPTH: usize = 100;
 
 impl SParser {
     /// Enter one recursion level; errors out instead of smashing the stack.
@@ -592,11 +637,19 @@ impl SParser {
             Err(format!("SQL: expected {:?}, got {:?}", t, self.peek()))
         }
     }
-    /// Consume an optional table alias ('FROM chr_orders o').
-    /// Aliases are parsed and dropped: the row model is single-namespace
-    /// (qualified refs alias.col are stripped at parse time).
-    fn maybe_alias(&mut self) {
-        if let STok::Ident(s) = self.peek() {
+    /// Consume an optional table alias ('FROM chr_orders o' / 'AS t').
+    /// The row model stays single-namespace (qualified refs alias.col are
+    /// stripped at parse time); the alias is still RETURNED so `t.*`
+    /// projections can resolve it to the underlying table.
+    fn maybe_alias(&mut self) -> Option<String> {
+        // WordPress always writes explicit aliases: `FROM wp_terms AS t`.
+        if self.kw("AS") {
+            if let STok::Ident(name) = self.peek().clone() {
+                self.next();
+                return Some(name);
+            }
+        }
+        if let STok::Ident(s) = self.peek().clone() {
             let lower = s.to_ascii_lowercase();
             if !matches!(
                 lower.as_str(),
@@ -618,8 +671,10 @@ impl SParser {
                     | "having"
             ) {
                 self.next();
+                return Some(s.clone());
             }
         }
+        None
     }
 
     fn value(&mut self) -> Result<Value, String> {
@@ -690,24 +745,83 @@ impl SParser {
         } else if self.kw("ALTER") {
             self.expect_kw("TABLE")?;
             let table = self.ident()?;
+            if self.kw("DROP") {
+                // MySQL revert path: ALTER TABLE t DROP COLUMN c.
+                self.kw("COLUMN");
+                let column = self.ident()?;
+                self.eat_semi();
+                return Ok(Stmt::DropColumn { table, column });
+            }
             self.expect_kw("ADD")?;
-            self.expect_kw("COLUMN")?;
+            self.kw("COLUMN");
             let column = self.ident()?;
-            let col_type = if self.kw("INT") || self.kw("INTEGER") || self.kw("INT64") {
-                ColumnType::Int64
-            } else if self.kw("FLOAT") || self.kw("FLOAT64") || self.kw("DOUBLE") {
-                ColumnType::Float64
-            } else if self.kw("TEXT") || self.kw("VARCHAR") || self.kw("STRING") {
-                ColumnType::Text
-            } else if self.kw("DNA") || self.kw("DNA2BIT") {
-                ColumnType::Dna2Bit
-            } else if self.kw("TIMESTAMP") {
-                ColumnType::Timestamp
-            } else {
-                return Err(format!("SQL: unknown column type for '{}'", column));
-            };
-            self.eat_semi();
-            Ok(Stmt::AddColumn { table, column, col_type })
+            let col_type = self.parse_column_type()?;
+            // CMS edition: trailing column flags — the DEFAULT literal
+            // (or the NOT NULL zero-value) becomes the new column's
+            // effective default, exactly like CREATE TABLE.
+            #[cfg(feature = "cms")]
+            {
+                let mut col_default: Option<String> = None;
+                let mut not_null = false;
+                loop {
+                    if self.kw("UNSIGNED") || self.kw("ZEROFILL") {
+                        continue;
+                    }
+                    if self.kw("NOT") {
+                        if !self.kw("NULL") {
+                            return Err("SQL: expected NULL after NOT in column definition".into());
+                        }
+                        not_null = true;
+                        continue;
+                    }
+                    if self.kw("NULL") {
+                        continue;
+                    }
+                    if self.kw("DEFAULT") {
+                        col_default = Some(match self.peek().clone() {
+                            STok::Str(s) => {
+                                self.next();
+                                s
+                            }
+                            STok::Int(v) => {
+                                self.next();
+                                v.to_string()
+                            }
+                            STok::Float(v) => {
+                                self.next();
+                                v.to_string()
+                            }
+                            STok::Ident(s) => {
+                                self.next();
+                                s
+                            }
+                            t => return Err(format!("SQL: bad DEFAULT value {:?}", t)),
+                        });
+                        continue;
+                    }
+                    if self.kw("COMMENT") {
+                        self.consume_default_value()?;
+                        continue;
+                    }
+                    break;
+                }
+                if col_default.is_none() && not_null {
+                    col_default = Some(match &col_type {
+                        ColumnType::Timestamp => "0000-00-00 00:00:00".to_string(),
+                        ColumnType::Text | ColumnType::Dna2Bit => String::new(),
+                        ColumnType::Int64 | ColumnType::Float64
+                        | ColumnType::ForeignLink { .. } => "0".to_string(),
+                    });
+                }
+                self.eat_semi();
+                return Ok(Stmt::AddColumn { table, column, col_type, col_default });
+            }
+            #[cfg(not(feature = "cms"))]
+            {
+                let _ = self.kw("NOT") && self.kw("NULL");
+                self.eat_semi();
+                return Ok(Stmt::AddColumn { table, column, col_type, col_default: None });
+            }
         } else if self.kw("EXPLAIN") {
             // kw() already consumed the EXPLAIN token.
             let inner = self.parse_stmt()?;
@@ -823,7 +937,7 @@ impl SParser {
         } else {
             String::new()
         };
-        self.maybe_alias();
+        let from_alias = self.maybe_alias();
         let mut joins = Vec::new();
         loop {
             let join_type = if self.kw("INNER") {
@@ -847,8 +961,14 @@ impl SParser {
                 break;
             };
             let table = self.ident()?;
-            self.maybe_alias();
+            let jalias = self.maybe_alias();
             self.expect_kw("ON")?;
+            // WordPress always sends parenthesized join conditions:
+            // ON (a.id = b.id) — accept the optional parens.
+            let paren = matches!(self.peek(), STok::LParen);
+            if paren {
+                self.next();
+            }
             let left_col = self.ident()?;
             // optional qualified name a.col
             let mut lc = left_col;
@@ -866,9 +986,13 @@ impl SParser {
                 self.next();
                 right_col = self.ident()?;
             }
+            if paren {
+                self.expect(STok::RParen)?;
+            }
             joins.push(JoinSpec {
                 join_type,
                 table,
+                alias: jalias,
                 left_col: lc,
                 right_col,
             });
@@ -882,7 +1006,13 @@ impl SParser {
             self.expect_kw("BY")?;
             let mut cols = Vec::new();
             loop {
-                cols.push(self.ident()?);
+                let mut col = self.ident()?;
+                // qualified reference a.col — the qualifier is stripped.
+                if matches!(self.peek(), STok::Dot) {
+                    self.next();
+                    col = self.ident()?;
+                }
+                cols.push(col);
                 if matches!(self.peek(), STok::Comma) {
                     self.next();
                 } else {
@@ -938,28 +1068,72 @@ impl SParser {
         } else {
             Vec::new()
         };
-        let limit = if self.kw("LIMIT") {
+        let mut limit: Option<usize> = None;
+        let mut offset: usize = 0;
+        if self.kw("LIMIT") {
             match self.next() {
-                STok::Int(i) => Some(i as usize),
+                STok::Int(i) => {
+                    // MySQL pagination form `LIMIT offset, count` — WordPress
+                    // (WP_Query) sends it everywhere; == LIMIT count OFFSET
+                    // offset. Without the cms feature the comma stays a
+                    // parse error (original strict grammar).
+                    #[cfg(feature = "cms")]
+                    if matches!(self.peek(), STok::Comma) {
+                        self.next();
+                        offset = i as usize;
+                        match self.next() {
+                            STok::Int(c) => limit = Some(c as usize),
+                            t => return Err(format!("SQL: LIMIT expects int, got {:?}", t)),
+                        }
+                    } else {
+                        limit = Some(i as usize);
+                    }
+                    #[cfg(not(feature = "cms"))]
+                    {
+                        limit = Some(i as usize);
+                    }
+                }
                 t => return Err(format!("SQL: LIMIT expects int, got {:?}", t)),
             }
-        } else {
-            None
-        };
-        let offset = if self.kw("OFFSET") {
+        }
+        if self.kw("OFFSET") {
             match self.next() {
-                STok::Int(i) => i as usize,
+                STok::Int(i) => offset = i as usize,
                 t => return Err(format!("SQL: OFFSET expects int, got {:?}", t)),
             }
-        } else {
-            0
-        };
+        }
+        // MySQL row-locking tail: `FOR UPDATE` / `FOR SHARE` [OF …] [NOWAIT
+        // | SKIP LOCKED]. The engine has no row-level locks yet (lock wait /
+        // deadlock detection is CMS_EDITION_RU.md §4 item 2); inside the
+        // gate's transaction buffer the statement is still correct, just
+        // not serialized — accept and ignore (WooCommerce stock paths).
+        #[cfg(feature = "cms")]
+        if self.kw("FOR") {
+            if !(self.kw("UPDATE") || self.kw("SHARE")) {
+                return Err("SQL: expected UPDATE or SHARE after FOR".into());
+            }
+            if self.kw("OF") {
+                loop {
+                    let _ = self.ident()?;
+                    if matches!(self.peek(), STok::Comma) {
+                        self.next();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            if self.kw("NOWAIT") {
+            } else if self.kw("SKIP") {
+                self.kw("LOCKED");
+            }
+        }
         if matches!(self.peek(), STok::Semi) {
             self.next();
         }
         Ok(Stmt::Select {
             projection,
             from,
+            from_alias,
             joins,
             where_clause,
             group_by,
@@ -977,6 +1151,16 @@ impl SParser {
         if matches!(self.peek(), STok::Star) {
             self.next();
             return Ok(SelectItem::Star);
+        }
+        // CMS edition: `t.*` — every column of one FROM/JOIN table
+        // (expanded at execution against the alias → table map).
+        if let STok::Ident(qual) = self.peek().clone() {
+            if matches!(self.peek_at(1), STok::Dot) && matches!(self.peek_at(2), STok::Star) {
+                self.next();
+                self.next();
+                self.next();
+                return Ok(SelectItem::AliasStar(qual));
+            }
         }
         // v3.6: scalar subquery `(SELECT ...) [AS alias]`.
         if matches!(self.peek(), STok::LParen)
@@ -1080,6 +1264,13 @@ impl SParser {
         let expr = self.parse_operand()?;
         match expr {
             Expr::Column(source) => {
+                // Qualified reference t.col — the qualifier is stripped
+                // (single-namespace row model), as in ORDER BY / GROUP BY.
+                let mut source = source;
+                if matches!(self.peek(), STok::Dot) {
+                    self.next();
+                    source = self.ident()?;
+                }
                 let alias = self.maybe_as_alias()?;
                 Ok(SelectItem::Column { source, alias })
             }
@@ -1226,6 +1417,52 @@ impl SParser {
     fn parse_on_conflict_tail(&mut self) -> Result<Option<OnConflict>, String> {
         if !self.kw("ON") {
             return Ok(None);
+        }
+        // CMS edition: MySQL `ON DUPLICATE KEY UPDATE col = VALUES(col), …`
+        // — the same DO UPDATE machinery as ON CONFLICT, but firing on ANY
+        // unique-key conflict (PK or secondary UNIQUE), which exec_insert_tx
+        // resolves through the unique-index entry.
+        #[cfg(feature = "cms")]
+        if self.kw("DUPLICATE") {
+            self.expect_kw("KEY")?;
+            self.expect_kw("UPDATE")?;
+            let mut assignments = Vec::new();
+            loop {
+                let col = self.ident()?;
+                match self.next() {
+                    STok::Eq => {}
+                    t => {
+                        return Err(format!(
+                            "SQL: expected '=' in ON DUPLICATE KEY UPDATE, got {:?}",
+                            t
+                        ))
+                    }
+                }
+                // VALUES(col) — the conflicting row's proposed value.
+                if let STok::Ident(s) = self.peek().clone() {
+                    if s.eq_ignore_ascii_case("VALUES")
+                        && matches!(self.peek_at(1), STok::LParen)
+                    {
+                        self.next();
+                        self.next();
+                        let source = self.ident()?;
+                        self.expect(STok::RParen)?;
+                        assignments.push((col, UpsertValue::Excluded(source)));
+                        if matches!(self.peek(), STok::Comma) {
+                            self.next();
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                assignments.push((col, UpsertValue::Literal(self.value()?)));
+                if matches!(self.peek(), STok::Comma) {
+                    self.next();
+                } else {
+                    break;
+                }
+            }
+            return Ok(Some(OnConflict::DoUpdate { assignments }));
         }
         self.expect_kw("CONFLICT")?;
         self.expect(STok::LParen)?;
@@ -1406,6 +1643,8 @@ impl SParser {
                 // assigns values); lengths/defaults are consumed and dropped.
                 #[cfg(feature = "cms")]
                 {
+                    let mut not_null = false;
+                    let mut default: Option<String> = None;
                     loop {
                         if self.kw("UNSIGNED") || self.kw("ZEROFILL") {
                             continue;
@@ -1414,6 +1653,7 @@ impl SParser {
                             if !self.kw("NULL") {
                                 return Err("SQL: expected NULL after NOT in column definition".into());
                             }
+                            not_null = true;
                             continue;
                         }
                         if self.kw("NULL") {
@@ -1424,7 +1664,25 @@ impl SParser {
                             continue;
                         }
                         if self.kw("DEFAULT") {
-                            self.consume_default_value()?;
+                            default = Some(match self.peek().clone() {
+                                STok::Str(s) => {
+                                    self.next();
+                                    s
+                                }
+                                STok::Int(v) => {
+                                    self.next();
+                                    v.to_string()
+                                }
+                                STok::Float(v) => {
+                                    self.next();
+                                    v.to_string()
+                                }
+                                STok::Ident(s) => {
+                                    self.next();
+                                    s
+                                }
+                                t => return Err(format!("SQL: bad DEFAULT value {:?}", t)),
+                            });
                             continue;
                         }
                         if self.kw("CHARACTER") {
@@ -1441,6 +1699,25 @@ impl SParser {
                             continue;
                         }
                         break;
+                    }
+                    // Effective column default (MySQL dialect): the explicit
+                    // DEFAULT literal wins; a NOT NULL column without one
+                    // gets MySQL's implicit zero-value ('' / 0 / zero-date,
+                    // non-strict mode — WordPress hosting default). Nullable
+                    // columns stay sparse (NULL) on INSERT. exec_insert_tx
+                    // fills omitted columns from this map.
+                    let effective = match default {
+                        Some(d) => Some(d),
+                        None if not_null => Some(match &ty {
+                            ColumnType::Timestamp => "0000-00-00 00:00:00".to_string(),
+                            ColumnType::Text | ColumnType::Dna2Bit => String::new(),
+                            ColumnType::Int64 | ColumnType::Float64
+                            | ColumnType::ForeignLink { .. } => "0".to_string(),
+                        }),
+                        None => None,
+                    };
+                    if let Some(d) = effective {
+                        t.column_defaults.insert(col.clone(), d);
                     }
                 }
                 #[cfg(not(feature = "cms"))]
@@ -1822,7 +2099,44 @@ impl SParser {
             self.expect_kw("NULL")?;
             return Ok(Expr::IsNull(Box::new(left)));
         }
+        // MySQL `expr [NOT] LIKE 'pattern'` (postfix NOT — distinct from the
+        // prefix `NOT <predicate>` handled above). WordPress core uses LIKE
+        // for transient cleanup, slug lookups and meta searches.
+        if self.kw("NOT") {
+            self.expect_kw("LIKE")?;
+            let pattern = self.like_pattern()?;
+            return Ok(Expr::Like {
+                operand: Box::new(left),
+                pattern,
+                negated: true,
+            });
+        }
+        if self.kw("LIKE") {
+            let pattern = self.like_pattern()?;
+            return Ok(Expr::Like {
+                operand: Box::new(left),
+                pattern,
+                negated: false,
+            });
+        }
         Ok(left)
+    }
+
+    /// Pattern literal of a LIKE predicate (quoted string, optionally
+    /// parenthesized — WordPress sends both `LIKE 'x'` and `LIKE ('x')`).
+    fn like_pattern(&mut self) -> Result<String, String> {
+        let paren = matches!(self.peek(), STok::LParen);
+        if paren {
+            self.next();
+        }
+        let pattern = match self.next() {
+            STok::Str(s) => s,
+            t => return Err(format!("SQL: LIKE expects a quoted pattern, got {:?}", t)),
+        };
+        if paren {
+            self.expect(STok::RParen)?;
+        }
+        Ok(pattern)
     }
     /// Additive level of an arithmetic expression: `a + b - c`.
     fn parse_operand(&mut self) -> Result<Expr, String> {
@@ -1972,6 +2286,9 @@ pub(crate) fn referenced_tables(sql: &str) -> Result<Vec<String>, String> {
 
 fn collect_stmt_tables(stmt: &Stmt, out: &mut Vec<String>) -> Result<(), String> {
     match stmt {
+        Stmt::DropColumn { table, .. } => {
+            out.push(table.clone());
+        }
         Stmt::Select {
             projection,
             from,
@@ -2110,7 +2427,7 @@ fn collect_stmt_columns(stmt: &Stmt, out: &mut Vec<String>) -> Result<(), String
                             }
                         }
                     }
-                    SelectItem::Star => {}
+                    SelectItem::AliasStar(_) | SelectItem::Star => {}
                 }
             }
             if let Some(e) = where_clause {
@@ -2166,6 +2483,7 @@ fn collect_stmt_columns(stmt: &Stmt, out: &mut Vec<String>) -> Result<(), String
 
 fn collect_expr_tables(expr: &Expr, out: &mut Vec<String>) -> Result<(), String> {
     match expr {
+        Expr::Like { operand, .. } => collect_expr_tables(operand, out)?,
         Expr::InSubquery { query, .. } => {
             let nested = referenced_tables(query)?;
             out.extend(nested);
@@ -2525,6 +2843,7 @@ impl SqlEngine {
             Stmt::Select {
                 projection,
                 from,
+                from_alias,
                 joins,
                 where_clause,
                 group_by,
@@ -2535,6 +2854,7 @@ impl SqlEngine {
             } => self.exec_select(
                 &projection,
                 &from,
+                from_alias.as_deref(),
                 &joins,
                 where_clause,
                 &group_by,
@@ -2613,7 +2933,9 @@ impl SqlEngine {
                 table,
                 column,
                 col_type,
-            } => self.exec_add_column(&table, &column, col_type),
+                col_default,
+            } => self.exec_add_column(&table, &column, col_type, col_default.as_deref()),
+            Stmt::DropColumn { table, column } => self.exec_drop_column(&table, &column),
             Stmt::Explain(inner) => self.exec_explain(*inner),
         }
     }
@@ -3030,6 +3352,7 @@ impl SqlEngine {
             Stmt::Select {
                 projection,
                 from,
+                from_alias,
                 joins,
                 where_clause,
                 group_by,
@@ -3040,6 +3363,7 @@ impl SqlEngine {
             } => self.exec_select(
                 projection,
                 from,
+                from_alias.as_deref(),
                 joins,
                 where_clause.clone(),
                 group_by,
@@ -3104,6 +3428,11 @@ impl SqlEngine {
     /// Non-subquery subtrees are evaluated directly (they stay intact).
     fn resolve_expr_for_row(&self, e: &Expr, row: &BTreeMap<String, Value>) -> Result<Expr, String> {
         Ok(match e {
+            Expr::Like { operand, pattern, negated } => Expr::Like {
+                operand: Box::new(self.resolve_expr_for_row(operand, row)?),
+                pattern: pattern.clone(),
+                negated: *negated,
+            },
             Expr::ScalarSubquery { stmt } => {
                 match self.eval_scalar_sub_for_row(stmt, row)? {
                     Some(v) => Expr::Literal(v),
@@ -3264,6 +3593,7 @@ impl SqlEngine {
             Stmt::Select {
                 projection,
                 from,
+                from_alias,
                 joins,
                 where_clause,
                 group_by,
@@ -3275,6 +3605,7 @@ impl SqlEngine {
                 let (_, rows, plan, _) = self.exec_select(
                     &projection,
                     &from,
+                    from_alias.as_deref(),
                     &joins,
                     where_clause,
                     &group_by,
@@ -3326,6 +3657,9 @@ impl SqlEngine {
     fn describe_stmt(stmt: &Stmt) -> String {
         match stmt {
             Stmt::Select { from, .. } => format!("Select(FROM {})", from),
+            Stmt::DropColumn { table, column } => {
+                format!("AlterTable({} DROP COLUMN {})", table, column)
+            }
             Stmt::Insert { table, rows, on_conflict: _ } => {
                 format!("Insert({}, {} row(s))", table, rows.len())
             }
@@ -3632,10 +3966,15 @@ impl SqlEngine {
             return Err(format!("index '{}' already exists", name));
         }
         if table_schema.secondary_index_on(column).is_some() {
+            // CMS edition: MySQL happily keeps several indexes over one
+            // column (dbDelta churn creates them); allow duplicates there.
+            #[cfg(not(feature = "cms"))]
             return Err(format!(
                 "SQL: column '{}.{}' already has an index (rename it there or drop it first)",
                 table, column
             ));
+            #[cfg(feature = "cms")]
+            let _ = (table, column);
         }
 
         // Backfill: one WAL batch of index entries over the existing rows.
@@ -3813,6 +4152,7 @@ impl SqlEngine {
         table: &str,
         column: &str,
         col_type: ColumnType,
+        col_default: Option<&str>,
     ) -> Result<
         (
             Vec<String>,
@@ -3832,6 +4172,11 @@ impl SqlEngine {
             ));
         }
         schema.add_column(column.to_string(), col_type);
+        if let Some(def) = col_default {
+            schema
+                .column_defaults
+                .insert(column.to_string(), def.to_string());
+        }
         let start = std::time::Instant::now();
         self.persist_schema(&schema)?;
         let us = start.elapsed().as_micros() as u64;
@@ -3850,6 +4195,46 @@ impl SqlEngine {
                 "column '{}' added to '{}' without blocking reads or writes",
                 column, table
             )),
+        ))
+    }
+
+    /// CMS edition / generic: `ALTER TABLE t DROP COLUMN c` — metadata-only
+    /// drop (schema row rewritten; stored payloads keep the old field but it
+    /// is no longer visible in queries).
+    fn exec_drop_column(
+        &self,
+        table: &str,
+        column: &str,
+    ) -> Result<
+        (
+            Vec<String>,
+            Vec<BTreeMap<String, Value>>,
+            String,
+            Option<String>,
+        ),
+        String,
+    > {
+        let mut schema = self
+            .get_schema(table)
+            .ok_or_else(|| format!("SQL: relation '{}' does not exist", table))?;
+        if !schema.columns.contains_key(column) {
+            return Err(format!(
+                "SQL: can't DROP COLUMN '{}'; check that it exists in table '{}'",
+                column, table
+            ));
+        }
+        schema.columns.remove(column);
+        schema.column_defaults.remove(column);
+        schema.secondary_indexes.retain(|idx| idx.column != column);
+        if schema.auto_increment_column.as_deref() == Some(column) {
+            schema.auto_increment_column = None;
+        }
+        self.persist_schema(&schema)?;
+        Ok((
+            vec!["status".into()],
+            vec![mk_row(&[("status", Value::Text("DROPPED".into()))])],
+            format!("AlterTable({} DROP COLUMN {})", table, column),
+            Some(format!("column '{}' dropped from '{}'", column, table)),
         ))
     }
 
@@ -4008,6 +4393,10 @@ impl SqlEngine {
             .delete(format!("__schema:{}", table).as_bytes())
             .map_err(|e| e.to_string())?;
         self.schemas.write().remove(table);
+        // CMS edition: drop the AUTO_INCREMENT counter with the table —
+        // a recreated table must start from 1 again (MySQL parity).
+        #[cfg(feature = "cms")]
+        self.cms_sequences.reset(table);
         Ok((
             vec!["status".into()],
             vec![mk_row(&[("status", Value::Text("DROPPED".into()))])],
@@ -4110,6 +4499,29 @@ impl SqlEngine {
                 }
                 map
             };
+            // CMS edition: DEFAULT fill — omitted columns get their effective
+            // default (explicit DEFAULT or NOT NULL zero-value), matching
+            // MySQL non-strict INSERT behavior (CMS_EDITION_RU.md §4.11).
+            #[cfg(feature = "cms")]
+            let map = {
+                let mut map = map;
+                for (col, def) in &schema.column_defaults {
+                    if map.contains_key(col) {
+                        continue;
+                    }
+                    let v = if def.eq_ignore_ascii_case("NULL") {
+                        Value::Null
+                    } else if let Ok(i) = def.parse::<i64>() {
+                        Value::Int(i)
+                    } else if let Ok(f) = def.parse::<f64>() {
+                        Value::Float(f)
+                    } else {
+                        Value::Text(def.clone())
+                    };
+                    map.insert(col.clone(), v);
+                }
+                map
+            };
             let pk = Self::pk_of(&schema, &map)?;
             let key = Self::row_key(table, &pk);
             if !seen_keys.insert(key.clone()) {
@@ -4192,6 +4604,7 @@ impl SqlEngine {
             // UNIQUE index enforcement — also covers duplicates between rows
             // of this same statement (via stmt_unique) and against rows that
             // already exist in the engine (via index scan).
+            let mut handled_by_unique_upsert = false;
             for idx in schema.secondary_indexes.iter().filter(|i| i.unique) {
                 let Some(v) = map.get(&idx.column) else {
                     continue;
@@ -4215,12 +4628,75 @@ impl SqlEngine {
                     .scan_prefix(&prefix)
                     .map_err(|e| e.to_string())?;
                 if !entries.is_empty() {
+                    // CMS edition: `ON DUPLICATE KEY UPDATE` fires on ANY
+                    // unique-key conflict (not only the PK). Resolve the
+                    // conflicting row through the index entry (the entry
+                    // value holds the row key) and apply DO UPDATE.
+                    #[cfg(feature = "cms")]
+                    if let Some(OnConflict::DoUpdate { assignments }) = &on_conflict {
+                        let row_key_bytes = entries[0].1.clone();
+                        let raw = self
+                            .engine
+                            .get(&row_key_bytes)
+                            .map_err(|e| e.to_string())?
+                            .ok_or_else(|| {
+                                "UNIQUE index entry points to a missing row".to_string()
+                            })?;
+                        let mut existing: BTreeMap<String, Value> = RowCodec::decode(&raw)
+                            .map_err(|e| format!("row unreadable via unique index: {}", e))?
+                            .into_iter()
+                            .collect();
+                        for (col, val) in assignments {
+                            let nv = match val {
+                                UpsertValue::Literal(l) => l.clone(),
+                                UpsertValue::Excluded(source) => map
+                                    .get(source)
+                                    .cloned()
+                                    .ok_or_else(|| {
+                                        format!(
+                                            "SQL: VALUES({}) not present in the inserted row",
+                                            source
+                                        )
+                                    })?,
+                            };
+                            existing.insert(col.clone(), nv);
+                        }
+                        let new_pk = Self::pk_of(&schema, &existing)?;
+                        let new_key = Self::row_key(table, &new_pk);
+                        if new_key.as_bytes() != row_key_bytes.as_slice() {
+                            return Err(
+                                "SQL: ON DUPLICATE KEY UPDATE cannot change the primary key".into(),
+                            );
+                        }
+                        let payload = RowCodec::encode(
+                            &existing
+                                .iter()
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect::<Vec<_>>(),
+                        );
+                        batch.extend(Self::index_delta_batch(
+                            &schema,
+                            None,
+                            Some((table, &existing)),
+                        ));
+                        batch.push((
+                            crate::wal::WalOp::Put,
+                            row_key_bytes.clone(),
+                            Some(payload),
+                        ));
+                        upserted += 1;
+                        handled_by_unique_upsert = true;
+                        break;
+                    }
                     return Err(format!(
                         "UNIQUE constraint failed: {}.{} = {} (index '{}')",
                         table, idx.column, v, idx.name
                     ));
                 }
                 stmt_unique.insert((idx.column.clone(), enc), key.clone());
+            }
+            if handled_by_unique_upsert {
+                continue;
             }
             let payload = RowCodec::encode(
                 &map.iter()
@@ -4461,7 +4937,16 @@ impl SqlEngine {
             }
         }
 
-        let updated = changes.len();
+        let mut updated = changes.len();
+        // CMS edition (MySQL parity): UPDATE's affected count is the number
+        // of rows whose values actually CHANGED — wpdb branches on it.
+        #[cfg(feature = "cms")]
+        {
+            updated = changes
+                .iter()
+                .filter(|(_, old, _, new)| !row_maps_equal(old, new))
+                .count();
+        }
         let scan_op = match &pk_lits {
             Some(lits) if lits.len() == 1 => format!("PointGet({} = {})", table, lits[0]),
             Some(lits) => format!(
@@ -4657,6 +5142,7 @@ impl SqlEngine {
         &self,
         projection: &[SelectItem],
         from: &str,
+        from_alias: Option<&str>,
         joins: &[JoinSpec],
         where_clause: Option<Expr>,
         group_by: &[String],
@@ -4673,6 +5159,47 @@ impl SqlEngine {
         ),
         String,
     > {
+        // CMS edition: expand `t.*` projections against the alias → table
+        // map (MySQL semantics: the table's declared column order).
+        let alias_tables: Vec<(String, String)> = {
+            let mut m = Vec::new();
+            if !from.is_empty() {
+                let qual = from_alias
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| from.to_string());
+                m.push((qual, from.to_string()));
+            }
+            for j in joins {
+                let qual = j.alias.clone().unwrap_or_else(|| j.table.clone());
+                m.push((qual, j.table.clone()));
+            }
+            m
+        };
+        let mut expanded: Vec<SelectItem> = Vec::with_capacity(projection.len());
+        for item in projection {
+            match item {
+                SelectItem::AliasStar(qual) => {
+                    let table = alias_tables
+                        .iter()
+                        .find(|(a, _)| a.eq_ignore_ascii_case(qual))
+                        .map(|(_, t)| t.clone())
+                        .ok_or_else(|| {
+                            format!("SQL: unknown table or alias '{}' in projection", qual)
+                        })?;
+                    let schema = self.get_schema(&table).ok_or_else(|| {
+                        format!("SQL: relation '{}' does not exist", table)
+                    })?;
+                    for col in schema.columns.keys() {
+                        expanded.push(SelectItem::Column {
+                            source: col.clone(),
+                            alias: None,
+                        });
+                    }
+                }
+                other => expanded.push(other.clone()),
+            }
+        }
+        let projection: &[SelectItem] = &expanded;
         // v4.0: unknown FROM/JOIN tables are a hard error (SQL semantics:
         // PostgreSQL answers 42P01 undefined_table). CTE tables count as
         // existing while their WITH statement runs. FROM-less SELECTs
@@ -4915,7 +5442,7 @@ impl SqlEngine {
                             computed.push((rendered.clone(), expr.clone()));
                         }
                         SelectItem::Agg { rendered, .. } => specs.push(rendered.clone()),
-                        SelectItem::Star => {}
+                        SelectItem::AliasStar(_) | SelectItem::Star => {}
                     }
                 }
                 // A computed expression may only reference real columns of
@@ -4990,7 +5517,7 @@ impl SqlEngine {
                                 keep.push(rendered.clone());
                             }
                         }
-                        SelectItem::Star => {}
+                        SelectItem::AliasStar(_) | SelectItem::Star => {}
                     }
                 }
                 for row in current.iter_mut() {
@@ -5019,11 +5546,43 @@ impl SqlEngine {
             current.truncate(n);
         }
 
-        // Column list for tabular consumers.
-        let columns: Vec<String> = current
-            .first()
-            .map(|r| r.keys().cloned().collect())
-            .unwrap_or_default();
+        // Column list for tabular consumers. Derived from the projection so
+        // zero-row results still carry a RowDescription (PDO / psql need
+        // it); `SELECT *` falls back to the FROM schema, then the first row.
+        let columns: Vec<String> = {
+            let mut cols: Vec<String> = Vec::new();
+            for item in projection {
+                match item {
+                    SelectItem::Column { source, alias } => {
+                        // No dedup: MySQL reports duplicated output columns
+                        // (t.*, tt.* share term_id) one per projection item.
+                        cols.push(alias.clone().unwrap_or_else(|| source.clone()));
+                    }
+                    SelectItem::Agg { rendered, .. }
+                    | SelectItem::Window { rendered, .. }
+                    | SelectItem::ScalarSub { rendered, .. }
+                    | SelectItem::Computed { rendered, .. } => {
+                        if !cols.contains(rendered) {
+                            cols.push(rendered.clone());
+                        }
+                    }
+                    SelectItem::Star | SelectItem::AliasStar(_) => {}
+                }
+            }
+            if cols.is_empty() {
+                // `SELECT *` (and zero rows): the FROM table's schema order.
+                if let Some(schema) = self.get_schema(from) {
+                    cols.extend(schema.columns.keys().cloned());
+                }
+                if cols.is_empty() {
+                    cols = current
+                        .first()
+                        .map(|r| r.keys().cloned().collect())
+                        .unwrap_or_default();
+                }
+            }
+            cols
+        };
         Ok((columns, current, plan, None))
     }
 
@@ -5159,6 +5718,11 @@ impl SqlEngine {
     fn materialize_subqueries(&self, expr: Option<Expr>) -> Result<Option<Expr>, String> {
         fn walk(sql: &SqlEngine, e: &Expr) -> Result<Expr, String> {
             match e {
+                Expr::Like { operand, pattern, negated } => Ok(Expr::Like {
+                    operand: Box::new(walk(sql, operand)?),
+                    pattern: pattern.clone(),
+                    negated: *negated,
+                }),
                 Expr::InSubquery { column, query } => {
                     // Correlated? Render and re-parse the subquery, then ask
                     // for outer references. Correlated nodes resolve per row.
@@ -5695,15 +6259,39 @@ fn mk_row(fields: &[(&str, Value)]) -> BTreeMap<String, Value> {
 /// Literal typing rule shared by INSERT values and WHERE operands:
 /// non-empty pure-ACGT strings become `Value::Dna` (uppercased), everything
 /// else stays `Value::Text`.
-fn typed_string_literal(s: &str) -> Value {
-    if !s.is_empty()
-        && s.chars()
-            .all(|c| matches!(c, 'A' | 'C' | 'G' | 'T' | 'a' | 'c' | 'g' | 't'))
-    {
-        Value::Dna(s.to_uppercase())
-    } else {
-        Value::Text(s.to_string())
+fn row_maps_equal(
+    a: &BTreeMap<String, Value>,
+    b: &BTreeMap<String, Value>,
+) -> bool {
+    if a.len() != b.len() {
+        return false;
     }
+    a.iter().all(|(k, v)| {
+        b.get(k)
+            .map(|w| v.compare(w) == std::cmp::Ordering::Equal)
+            .unwrap_or(false)
+    })
+}
+
+fn typed_string_literal(s: &str) -> Value {
+    let pure_acgt = !s.is_empty()
+        && s.chars()
+            .all(|c| matches!(c, 'A' | 'C' | 'G' | 'T' | 'a' | 'c' | 'g' | 't'));
+    if !pure_acgt {
+        return Value::Text(s.to_string());
+    }
+    // CMS edition (branch cms-edition): only literals that are ALREADY
+    // uppercase ACGT keep DNA typing. WordPress content is full of
+    // lowercase pure-ACGT words ('cat', 'tag', 'gattaca') that the
+    // uppercase-normalising sniff would corrupt into pseudo-DNA.
+    #[cfg(feature = "cms")]
+    if s.chars().all(|c| c.is_ascii_uppercase()) {
+        return Value::Dna(s.to_string());
+    }
+    #[cfg(feature = "cms")]
+    return Value::Text(s.to_string());
+    #[cfg(not(feature = "cms"))]
+    return Value::Dna(s.to_uppercase());
 }
 
 /// Canonical output name of an aggregate call: `COUNT(*)`, `SUM(balance)`.
@@ -5739,6 +6327,12 @@ fn expr_to_sql(e: &Expr) -> String {
         format!("{} {} {}", side(left), op.as_str(), side(right))
     }
     match e {
+        Expr::Like { operand, pattern, negated } => format!(
+            "{} {}LIKE '{}'",
+            expr_to_sql(operand),
+            if *negated { "NOT " } else { "" },
+            pattern
+        ),
         Expr::Literal(Value::Text(s)) | Expr::Literal(Value::Dna(s)) => quote(s),
         Expr::Literal(v) => v.to_string(),
         Expr::Column(c) => c.clone(),
@@ -5783,6 +6377,7 @@ fn render_select_sql(stmt: &Stmt) -> String {
     let Stmt::Select {
         projection,
         from,
+        from_alias: _,
         joins,
         where_clause,
         group_by,
@@ -5802,6 +6397,7 @@ fn render_select_sql(stmt: &Stmt) -> String {
             .iter()
             .map(|item| match item {
                 SelectItem::Star => "*".to_string(),
+                SelectItem::AliasStar(qual) => format!("{}.*", qual),
                 SelectItem::Column { source, alias } => match alias {
                     Some(a) if a != source => format!("{} AS {}", source, a),
                     _ => source.clone(),
@@ -6039,6 +6635,7 @@ fn expr_has_subquery(e: &Expr) -> bool {
         Expr::Cmp { left, right, .. } | Expr::Arith { left, right, .. } => {
             expr_has_subquery(left) || expr_has_subquery(right)
         }
+        Expr::Like { operand, .. } => expr_has_subquery(operand),
         Expr::Literal(_) | Expr::Column(_) | Expr::InList { .. } => false,
     }
 }
@@ -7282,6 +7879,7 @@ mod acl_parse_tests {
 #[cfg(test)]
 mod security_regression_tests {
     use super::*;
+
 
     #[test]
     fn parser_rejects_pathologically_nested_expressions() {

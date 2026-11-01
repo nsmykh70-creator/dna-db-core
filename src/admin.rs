@@ -65,6 +65,10 @@ pub struct AdminPanel {
     /// token -> session
     tokens: Mutex<HashMap<String, Session>>,
     active: Arc<AtomicUsize>,
+    /// CMS edition (branch cms-edition): MySQL-dialect gate for the SQL
+    /// console and /api/query kind=sql (sessions, shims, errno mapping).
+    #[cfg(feature = "cms")]
+    pub cms: crate::CmsGateOpt,
 }
 
 const MAX_ADMIN_CONNECTIONS: usize = 64;
@@ -82,6 +86,7 @@ pub fn spawn(
     security: Arc<SecurityManager>,
     tls: Option<Arc<rustls::ServerConfig>>,
     proxy: Option<ProxyAuthConfig>,
+    cms: crate::CmsGateOpt,
 ) {
     let listener = match TcpListener::bind((bind, port)) {
         Ok(l) => l,
@@ -100,6 +105,8 @@ pub fn spawn(
         proxy,
         tokens: Mutex::new(HashMap::new()),
         active: Arc::new(AtomicUsize::new(0)),
+        #[cfg(feature = "cms")]
+        cms,
     });
     eprintln!(
         "[ADMIN] web panel ready on {}://{bind}:{port}/ (multi-user Argon2id auth{})",
@@ -951,6 +958,31 @@ dnadb_stat_{key} {n}
                 }
             }
             _ => {
+                // CMS edition: the SQL console speaks the MySQL dialect
+                // through the compat gate when one is attached (ephemeral
+                // session per request — the HTTP transport is stateless).
+                #[cfg(feature = "cms")]
+                {
+                    if let Some(gate) = &self.cms {
+                        let sid = gate.open_session();
+                        let outcome = crate::server::catch_request_panic("panel:cms-sql", || {
+                            gate.execute(sid, &query)
+                        });
+                        gate.close_session(sid);
+                        return match outcome {
+                            Ok(Ok(res)) => Response::json(200, &cms_result_json(&res)),
+                            Ok(Err(e)) => Response::json(
+                                400,
+                                &json!({
+                                    "error": e.message,
+                                    "errno": e.errno,
+                                    "sqlstate": e.sqlstate(),
+                                }),
+                            ),
+                            Err(e) => Response::json(500, &json!({"error": e})),
+                        };
+                    }
+                }
                 match crate::server::catch_request_panic("panel:sql", || self.sql.execute(&query)) {
                     Ok(Ok(res)) => Response::json(200, &sql_result_json(&res)),
                     Ok(Err(e)) => Response::json(400, &json!({"error": e})),
@@ -1221,6 +1253,40 @@ fn dnaql_rows_json(rows: &[DnaQlRow]) -> Vec<J> {
         .collect()
 }
 
+/// CMS edition: JSON shape of a gate result (superset of sql_result_json —
+/// affected_rows / last_insert_id let wpdb-style clients skip extra queries).
+#[cfg(feature = "cms")]
+fn cms_result_json(res: &crate::cms::compat::CmsQueryResult) -> J {
+    let rows: Vec<J> = res
+        .rows
+        .iter()
+        .map(|row| {
+            let mut obj = serde_json::Map::new();
+            for col in &res.columns {
+                let v = match row.get(col) {
+                    None | Some(crate::relational::Value::Null) => serde_json::Value::Null,
+                    Some(crate::relational::Value::Int(i)) => json!(i),
+                    Some(crate::relational::Value::Float(f)) => json!(f),
+                    Some(crate::relational::Value::Text(s))
+                    | Some(crate::relational::Value::Dna(s)) => json!(s),
+                };
+                obj.insert(col.clone(), v);
+            }
+            serde_json::Value::Object(obj)
+        })
+        .collect();
+    json!({
+        "kind": "sql",
+        "columns": res.columns,
+        "rows": rows,
+        "message": res.message,
+        "plan": res.plan,
+        "affected_rows": res.affected_rows,
+        "last_insert_id": res.last_insert_id,
+        "found_rows": res.found_rows,
+    })
+}
+
 fn sql_result_json(res: &QueryResult) -> J {
     json!({
         "kind": "sql",
@@ -1352,6 +1418,8 @@ mod tests {
             proxy: None,
             tokens: Mutex::new(HashMap::new()),
             active: Arc::new(AtomicUsize::new(0)),
+            #[cfg(feature = "cms")]
+            cms: None,
         });
         std::thread::spawn(move || {
             for stream in listener.incoming() {

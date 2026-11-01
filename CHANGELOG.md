@@ -2,6 +2,43 @@
 
 ## Unreleased (CMS Edition — branch `cms-edition`)
 
+### Gate wiring + differential testing vs MySQL (2026-11-02)
+
+- **The compat gate is reachable from real clients now**: `CmsSqlGate` is
+  wired into BOTH network surfaces — pgwire (one MySQL-style session per
+  connection: LAST_INSERT_ID, named locks, sql_mode, BEGIN..COMMIT buffer;
+  errors carry MySQL errnos + SQLSTATE; PostgreSQL-style command tags) and
+  the admin panel `/api/query kind=sql` (`src/main.rs` builds one shared
+  gate; `CmsGateOpt` cfg-alias keeps call sites cfg-free). Plain builds
+  keep the raw-engine path unchanged.
+- **MySQL dialect gaps closed in the engine** (cms-gated unless noted):
+  backslash string escapes (MySQL manual; `\%`/`\_` survive for LIKE),
+  `LIMIT offset,count` pagination form, `FOR UPDATE/FOR SHARE` parsed,
+  `ON DUPLICATE KEY UPDATE col=VALUES(col)` (fires on ANY unique-key
+  conflict, resolved through the unique-index entry), `LIKE 'pat'` /
+  `NOT LIKE` / parenthesized `LIKE ('pat')` in the shared expression
+  grammar (case-insensitive, `%`/`_`/`\`), qualified `t.col` projections /
+  GROUP BY, `t.*` / `wp_posts.*` alias-star expansion (declared-order via
+  the alias→table map), `AS t` table aliases (were silently swallowed),
+  parenthesized `ON (a.id = b.id)` join conditions, effective DEFAULT fill
+  for omitted INSERT columns (explicit DEFAULT or NOT NULL zero-value),
+  `ALTER TABLE ADD COLUMN … NOT NULL DEFAULT '…'` and `DROP COLUMN`,
+  multiple indexes per column (dbDelta churn), zero-row SELECTs now carry
+  a RowDescription, UPDATE affected = CHANGED rows (wpdb semantics),
+  LAST_INSERT_ID = FIRST generated id, DROP TABLE resets the sequence,
+  string literals never upper-cased to pseudo-DNA (lowercase `cat`/`tag`
+  stay text; uppercase ACGT keeps DNA typing), gate preprocessing strips
+  backticks, maps DESCRIBE→SHOW FULL COLUMNS and rewrites `NOW()` in DML.
+- **Differential harness** — `cms/harness/run_comparison.py` +
+  `examples/dump_wp_schema.rs` (fixtures from the Rust WP preset): the
+  SAME corpus/DDL/seed runs against MariaDB 10.11 and DNA-DB (pgwire).
+  Result on docs/cms/wp_queries_corpus.txt (63 statements): 54 MATCH +
+  2 identical errors (errno parity 1062/1091) = 56/63 (89 %); documented
+  remaining gaps: `CAST(x AS SIGNED)`, arithmetic in UPDATE SET,
+  `COUNT(DISTINCT …)`, ci column names (collation), DECIMAL text format,
+  `t.*, tt.*` column ORDER, version string. Report:
+  `download/DNA-DB_CMS_vs_MySQL_сравнительный_отчёт.md`.
+
 - **CMS compatibility track scaffolded** (feature-gated, `--features cms`):
   the CMS edition targets WordPress 6.x / WooCommerce / Joomla 5.x and is
   developed on the `cms-edition` branch (docs/CMS_EDITION_RU.md holds the

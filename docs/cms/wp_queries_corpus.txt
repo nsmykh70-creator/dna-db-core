@@ -118,6 +118,7 @@
 [DDL]    ALTER TABLE wp_options DROP COLUMN old_col
 [DDL]    CREATE INDEX option_name_idx ON wp_options (option_name)   -- dbDelta не делает DROP INDEX сам
 [DDL]    SHOW FULL COLUMNS FROM wp_postmeta  -- longtext/meta_value без длины: префиксный индекс 191
+[DDL]    DROP INDEX option_name_idx ON wp_options    -- откат после проверки CREATE INDEX
 
 # ---------------------------------------------------------------------
 # WOOCOMMERCE. Фаза 2: транзакции, FOR UPDATE, decimal, deadlock-retry
@@ -128,7 +129,7 @@
 [P2] COMMIT
 [P2] ROLLBACK                              -- при deadlock (errno 1213) WooCommerce повторяет
 [P2] SELECT TOTAL_SALES FROM wp_wc_product_meta_lookup WHERE product_id = 42   -- decimal (в нас: Float64)
-[P2] SELECT order_id FROM wp_wc_orders WHERE status = 'processing' ORDER BY date_created_gmt DESC LIMIT 25
+[P2] SELECT id FROM wp_wc_orders WHERE status = 'processing' ORDER BY date_created_gmt DESC LIMIT 25
 [P2] SELECT COUNT(DISTINCT customer_id) FROM wp_wc_orders WHERE status IN ('wc-completed','wc-processing')
 
 # ---------------------------------------------------------------------

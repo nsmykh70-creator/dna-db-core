@@ -75,3 +75,11 @@ pub use wal::SyncMode;
 
 #[cfg(feature = "cms")]
 pub use cms::{CmsSession, LockRegistry};
+
+/// Optional CMS compat gate handle: `Option<Arc<CmsSqlGate>>` with the cms
+/// feature, `()` without it — shared call sites (pgwire / admin panel)
+/// stay cfg-free.
+#[cfg(feature = "cms")]
+pub type CmsGateOpt = Option<std::sync::Arc<crate::cms::compat::CmsSqlGate>>;
+#[cfg(not(feature = "cms"))]
+pub type CmsGateOpt = ();

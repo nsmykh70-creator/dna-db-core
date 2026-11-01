@@ -222,6 +222,15 @@ pub struct ChromosomeTable {
     /// feature simply carry `None`.
     #[serde(default)]
     pub auto_increment_column: Option<String>,
+    /// CMS edition (branch cms-edition): effective column defaults for
+    /// MySQL-dialect tables — the explicit `DEFAULT '…'` literal plus the
+    /// implicit zero-values of NOT NULL columns ('' / 0 / zero-date), i.e.
+    /// exactly what MySQL fills in when a column is omitted from INSERT.
+    /// Populated only by the cms CREATE TABLE grammar; exec_insert_tx fills
+    /// omitted columns from this map (`--features cms`). Serde default keeps
+    /// older persisted schemas decodable.
+    #[serde(default)]
+    pub column_defaults: BTreeMap<String, String>,
 }
 
 impl ChromosomeTable {
@@ -233,6 +242,7 @@ impl ChromosomeTable {
             primary_locus_column: pk_col.into(),
             secondary_indexes: Vec::new(),
             auto_increment_column: None,
+            column_defaults: BTreeMap::new(),
         }
     }
 

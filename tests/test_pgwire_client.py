@@ -108,8 +108,10 @@ def main(port):
     print("[1] handshake OK:", params["server_version"])
 
     cols, rows, tag = query(s, "SELECT VERSION()")
-    assert cols[0][0] == "version", cols
-    assert "DNA-DB v4.0.0" in rows[0][0], rows
+    # cms builds route through the MySQL-dialect gate (column VERSION(),
+    # MySQL-compat version string); plain builds answer as "version".
+    assert cols[0][0] in ("version", "VERSION()"), cols
+    assert "DNA-DB" in rows[0][0] or rows[0][0].startswith("8.0."), rows
     print("[2] VERSION() ->", rows[0][0])
 
     cols, rows, tag = query(s, "CREATE TABLE chr_pg (id INT, label TEXT, PRIMARY KEY (id))")

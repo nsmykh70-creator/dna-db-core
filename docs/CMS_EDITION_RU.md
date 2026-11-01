@@ -53,24 +53,30 @@ COM_STMT_*. После него работают mysqli, PDO_mysql, phpMyAdmin, 
 
 ## 4. Пробелы движка (чек-лист из аудита)
 
-Состояние после фазы-1 каркаса (ветка `cms-edition`):
+Состояние после фазы-1 каркаса и интеграции гейта (ветка `cms-edition`):
 
 1. **AUTO_INCREMENT + `LAST_INSERT_ID()`** — ✅ готово: реестр
    последовательностей (`cms::sequence`, seed от MAX(pk), bump по явным id),
    поле `auto_increment_column` в схеме, назначение в `exec_insert_tx`,
    шим `SELECT LAST_INSERT_ID()` в гейте.
-2. **`SELECT … FOR UPDATE` / deadlock-детект** с кодами 1213/1205 из
-   `cms::errno` — фаза 2 (база: `tx.rs`).
+2. **`SELECT … FOR UPDATE` / deadlock-детект** — частично: синтаксис
+   `FOR UPDATE/FOR SHARE` принимается (cms-грамматика), транзакции
+   `BEGIN/COMMIT/ROLLBACK` живут в сессии гейта (буфер v3.6, ошибочный
+   оператор не роняет транзакцию — паритет MySQL); построчные блокировки
+   и коды 1213/1205 — фаза 2 (база: `tx.rs`).
 3. **Коллации** `utf8mb4_unicode_ci`: сравнение без регистра, PAD SPACE,
    составные и префиксные индексы (meta_value 191) — префиксы сохраняются
    в оверлее, сравнение — фаза 2.
 4. **`FOUND_ROWS()` / `SQL_CALC_FOUND_ROWS`** — ✅ готово в гейте
    (приближение: счёт по странице, не по запросу без LIMIT).
-5. **Каталог**: `SHOW TABLES LIKE`, `SHOW FULL COLUMNS`, `SHOW INDEX` —
-   ✅ готово через оверлей (`cms::ddl_meta`: MySQL-точный `Type`, чтобы
-   dbDelta не видел расхождений) + fallback из схемы движка;
-   `information_schema` — фаза 2.
-6. **ALTER TABLE**: ADD/DROP COLUMN/INDEX, изменение типа (онлайн) — фаза 2.
+5. **Каталог**: `SHOW TABLES LIKE`, `SHOW FULL COLUMNS`, `SHOW INDEX`
+   (14 колонок, в форме MariaDB), `DESCRIBE`, `SHOW VARIABLES` — ✅ готово
+   через оверлей (`cms::ddl_meta`: MySQL-точный `Type`, чтобы dbDelta не
+   видел расхождений; CREATE TABLE через гейт регистрирует оверлей
+   автоматически) + fallback из схемы движка; `information_schema` — фаза 2.
+6. **ALTER TABLE**: ADD COLUMN (с NOT NULL/DEFAULT → эффективный дефолт),
+   DROP COLUMN, CREATE/DROP INDEX — ✅ готово; изменение типа (онлайн) —
+   фаза 2.
 7. **Именованные блокировки** — ✅ готово: реестр `cms::locks` + SQL-шимы
    `GET_LOCK/RELEASE_LOCK/IS_FREE_LOCK/IS_USED_LOCK` в гейте.
 8. **Типы**: BIGINT UNSIGNED/DECIMAL/DATETIME/ENUM — частично: имена
@@ -80,10 +86,28 @@ COM_STMT_*. После него работают mysqli, PDO_mysql, phpMyAdmin, 
    `SET sql_mode` — ✅ готово в гейте; `CmsSession` хранит состояние.
 10. **Unix domain socket** для хостингов, persistent connections PHP-FPM —
     фаза 4 (wire-протокол).
-11. **DEFAULT-fill при INSERT** (новое, из тестов фазы 1): колонки,
-    не указанные в INSERT, хранятся разреженно; движку нужна подстановка
-    дефолтов из оверлея — фаза 2 (ядро WP даты шлёт явно, поэтому
-    установку это не блокирует).
+11. **DEFAULT-fill при INSERT** — ✅ готово: `ChromosomeTable.column_defaults`
+    (serde-default) хранит эффективные дефолты MySQL-диалекта (явный
+    DEFAULT либо нулевое значение NOT NULL); `exec_insert_tx` заполняет
+    пропущенные колонки.
+
+### Диалект-слой: дополнительные закрытые пробелы (дифф-тесты против MariaDB)
+
+Backslash-escape в строках (`\'`, `\\`, `\%`/`\_` для LIKE), backticks,
+`LIMIT offset,count`, `LIKE/'NOT LIKE'` в общем грамматике выражений
+(ci, `%`/`_`/`\`), `ON DUPLICATE KEY UPDATE … VALUES(col)` (по любому
+уникальному ключу), `t.*`/`wp_posts.*` (alias-star по карте алиасов),
+`AS t`-алиасы, `ON (a.id = b.id)` в JOIN, квалифицированные `t.col` в
+SELECT/GROUP BY, `NOW()` в DML (гейт), zero-row RowDescription, UPDATE
+affected = изменённые строки, `LAST_INSERT_ID()` = первый id, сброс
+последовательности при DROP TABLE, строковые литералы не превращаются в
+псевдо-DNA (lowercase `'cat'` остаётся текстом).
+
+**Остаточные расхождения** (63 запроса корпуса: 56 совпадений/паритетов
+ошибок): `CAST(x AS SIGNED)`, арифметика в `UPDATE SET` (`stock-1`),
+`COUNT(DISTINCT …)`, регистронезависимые имена колонок (коллация), текст
+DECIMAL (`15.0000`), порядок колонок `t.*, tt.*`, строка `VERSION()`.
+См. `cms/harness/run_comparison.py` и отчёт сравнения.
 
 ## 5. Фазы
 

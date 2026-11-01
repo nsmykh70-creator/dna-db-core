@@ -76,13 +76,30 @@ fn value_to_text(v: &Value) -> Option<String> {
 
 pub struct PgWireServer {
     stats: Arc<PgWireStats>,
+    /// CMS edition (branch cms-edition): when present, every query goes
+    /// through the MySQL-dialect compat gate (per-connection sessions,
+    /// function shims, errno mapping) instead of the raw engine.
+    #[cfg(feature = "cms")]
+    cms_gate: crate::CmsGateOpt,
 }
 
 impl PgWireServer {
     pub fn new() -> Self {
         Self {
             stats: Arc::new(PgWireStats::new()),
+            #[cfg(feature = "cms")]
+            cms_gate: None,
         }
+    }
+
+    /// CMS edition: route pgwire queries through the MySQL-dialect gate.
+    #[cfg(feature = "cms")]
+    pub fn with_cms_gate(
+        mut self,
+        gate: std::sync::Arc<crate::cms::compat::CmsSqlGate>,
+    ) -> Self {
+        self.cms_gate = Some(gate);
+        self
     }
 
     pub fn stats(&self) -> Arc<PgWireStats> {
@@ -102,17 +119,22 @@ impl PgWireServer {
             "[PGWIRE] PostgreSQL wire protocol v3 listening on {bind}:{port} (psql / DBeaver / psycopg2 ready)"
         );
         let stats = self.stats.clone();
+        #[cfg(feature = "cms")]
+        let gate: crate::CmsGateOpt = self.cms_gate.clone();
+        #[cfg(not(feature = "cms"))]
+        let gate: crate::CmsGateOpt = ();
         for stream in listener.incoming() {
             match stream {
                 Ok(s) => {
                     let sql = sql.clone();
                     let stats = stats.clone();
+                    let gate = gate.clone();
                     let _ = std::thread::Builder::new()
                         .name("pgwire-conn".into())
                         .spawn(move || {
                             stats.active.fetch_add(1, Ordering::Relaxed);
                             stats.total_sessions.fetch_add(1, Ordering::Relaxed);
-                            let _ = handle_connection(s, &sql, &stats);
+                            let _ = handle_connection(s, &sql, &stats, gate);
                             stats.active.fetch_sub(1, Ordering::Relaxed);
                         });
                 }
@@ -127,6 +149,7 @@ fn handle_connection(
     mut stream: TcpStream,
     sql: &Arc<SqlEngine>,
     stats: &PgWireStats,
+    gate: crate::CmsGateOpt,
 ) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(300)))?;
     stream.set_nodelay(true).ok();
@@ -189,6 +212,10 @@ fn handle_connection(
 
     // --- Query loop (extended bytes: type + len + payload) ---
     let mut tx: Option<crate::sql_engine::SqlTxBuffer> = None;
+    // CMS edition: one MySQL-dialect session per connection (LAST_INSERT_ID,
+    // named locks and sql_mode live and die with the socket).
+    #[cfg(feature = "cms")]
+    let cms_session: Option<u64> = gate.as_ref().map(|g| g.open_session());
     loop {
         let mut tag = [0u8; 1];
         if stream.read_exact(&mut tag).is_err() {
@@ -214,13 +241,47 @@ fn handle_connection(
                 if trimmed.is_empty() {
                     message(&mut out, b'I', b""); // EmptyQueryResponse
                 } else {
+                    #[cfg(feature = "cms")]
+                    {
+                        if let Some(g) = gate.as_ref() {
+                            let sid = cms_session.unwrap_or(0);
+                            match g.execute(sid, trimmed) {
+                                Ok(res) => encode_cms_result(&mut out, &res, trimmed),
+                                Err(ce) => {
+                                    let text = if ce.errno == 0 {
+                                        ce.message.clone()
+                                    } else {
+                                        format!("[MySQL errno {}] {}", ce.errno, ce.message)
+                                    };
+                                    error_response(&mut out, ce.sqlstate(), &text);
+                                }
+                            }
+                            message(&mut out, b'Z', b"I");
+                            stream.write_all(&out)?;
+                            stream.flush()?;
+                            continue;
+                        }
+                    }
                     match sql.execute_in_tx(trimmed, &mut tx) {
                         Ok(res) => {
                             encode_result(&mut out, &res, trimmed);
                         }
                         Err(e) => {
                             tx = None; // failed statement aborts the tx buffer
-                            error_response(&mut out, "42601", &e);
+                            // CMS edition: surface the closest MySQL sqlstate
+                            // instead of a generic syntax-error code.
+                            #[cfg(feature = "cms")]
+                            let code: String = {
+                                let errno = crate::cms::compat::classify_error(&e);
+                                if errno == 0 {
+                                    "42601".to_string()
+                                } else {
+                                    crate::cms::errno::sqlstate(errno).to_string()
+                                }
+                            };
+                            #[cfg(not(feature = "cms"))]
+                            let code: String = "42601".to_string();
+                            error_response(&mut out, &code, &e);
                         }
                     }
                 }
@@ -255,8 +316,68 @@ fn handle_connection(
             _ => break, // unknown message type: drop the session
         }
     }
+    // CMS edition: connection gone — release named locks + session state.
+    #[cfg(feature = "cms")]
+    if let (Some(g), Some(s)) = (gate.as_ref(), cms_session) {
+        g.close_session(s);
+    }
     eprintln!("[PGWIRE] session closed for user '{user}'");
     Ok(())
+}
+
+/// CMS edition: encode a gate result. Rowsets (SELECT/SHOW/DESCRIBE shims)
+/// follow the same RowDescription/DataRow shape as engine SELECTs; DML
+/// reports PostgreSQL-style command tags derived from the statement head.
+#[cfg(feature = "cms")]
+fn encode_cms_result(out: &mut Vec<u8>, res: &crate::cms::compat::CmsQueryResult, sql_text: &str) {
+    if res.is_select && !res.columns.is_empty() {
+        let qr = QueryResult {
+            columns: res.columns.clone(),
+            rows: res.rows.clone(),
+            execution_plan: res.plan.clone(),
+            execution_time_us: 0,
+            message: res.message.clone(),
+        };
+        row_description(out, &res.columns, &qr);
+        for row in &res.rows {
+            let mut body = Vec::new();
+            body.extend_from_slice(&(res.columns.len() as i16).to_be_bytes());
+            for col in &res.columns {
+                match row.get(col).and_then(value_to_text) {
+                    Some(s) => {
+                        body.extend_from_slice(&(s.len() as i32).to_be_bytes());
+                        body.extend_from_slice(s.as_bytes());
+                    }
+                    None => body.extend_from_slice(&(-1i32).to_be_bytes()),
+                }
+            }
+            message(out, b'D', &body);
+        }
+        message(out, b'C', format!("SELECT {}", res.rows.len()).as_bytes());
+        return;
+    }
+    let upper = sql_text.trim_start().to_ascii_uppercase();
+    let n = res.affected_rows;
+    let tag = if upper.starts_with("INSERT") {
+        format!("INSERT 0 {n}")
+    } else if upper.starts_with("UPDATE") {
+        format!("UPDATE {n}")
+    } else if upper.starts_with("DELETE") {
+        format!("DELETE {n}")
+    } else if upper.starts_with("BEGIN") || upper.starts_with("START") {
+        "BEGIN".to_string()
+    } else if upper.starts_with("COMMIT") {
+        "COMMIT".to_string()
+    } else if upper.starts_with("ROLLBACK") {
+        "ROLLBACK".to_string()
+    } else if upper.starts_with("CREATE") {
+        "CREATE TABLE".to_string()
+    } else if upper.starts_with("DROP") {
+        "DROP TABLE".to_string()
+    } else {
+        format!("COMMAND affected={n}")
+    };
+    message(out, b'C', tag.as_bytes());
 }
 
 /// Encode a successful statement result as RowDescription + DataRows +

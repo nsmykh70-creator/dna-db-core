@@ -1020,6 +1020,17 @@ fn run_server(
     let sql = Arc::new(SqlEngine::new(engine.clone()));
     let dnaql = Arc::new(DnaQlEngine::new(engine.clone(), sql.clone()));
 
+    // CMS edition (branch cms-edition): one shared MySQL-dialect gate for
+    // pgwire and the panel SQL console (sessions + named locks are global).
+    #[cfg(feature = "cms")]
+    let cms_gate: dna_db_core::CmsGateOpt = {
+        let gate = std::sync::Arc::new(dna_db_core::cms::compat::CmsSqlGate::new(sql.clone()));
+        eprintln!("[CMS] MySQL-dialect compat gate active (WordPress/Joomla track)");
+        Some(gate)
+    };
+    #[cfg(not(feature = "cms"))]
+    let cms_gate: dna_db_core::CmsGateOpt = ();
+
     // Embedded web admin panel (phpMyAdmin-style). Non-fatal bind errors.
     if admin_port != 0 {
         dna_db_core::admin::spawn(
@@ -1031,6 +1042,7 @@ fn run_server(
             security.clone(),
             tls.clone(),
             proxy_auth.clone(),
+            cms_gate.clone(),
         );
         let scheme = if tls.is_some() { "https" } else { "http" };
         eprintln!("[ADMIN] open {scheme}://{bind_address}:{admin_port}/ (log in with the bootstrap admin; the one-time password is in the [SECURITY] line above)");
@@ -1040,6 +1052,11 @@ fn run_server(
     // JDBC / Prisma / Drizzle) on the same engine — same SQL, same ACLs.
     if pgwire_port != 0 {
         let pg = dna_db_core::pgwire::PgWireServer::new();
+        #[cfg(feature = "cms")]
+        let pg = match cms_gate.clone() {
+            Some(g) => pg.with_cms_gate(g),
+            None => pg,
+        };
         let pg_sql = sql.clone();
         let pg_bind = bind_address.to_string();
         std::thread::Builder::new()

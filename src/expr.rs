@@ -56,6 +56,15 @@ pub enum Expr {
         stmt: Box<crate::sql_engine::Stmt>,
         negated: bool,
     },
+    /// `expr [NOT] LIKE 'pattern'` — MySQL wildcard match (% = any run,
+    /// _ = one char, \ escapes the next char), case-insensitive (ci
+    /// collations). WordPress uses LIKE everywhere (transients, slugs,
+    /// meta searches).
+    Like {
+        operand: Box<Expr>,
+        pattern: String,
+        negated: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +160,18 @@ impl Expr {
             Expr::InSubquery { .. }
             | Expr::ScalarSubquery { .. }
             | Expr::Exists { .. } => Some(Value::Null),
+            Expr::Like { operand, pattern, negated } => {
+                let v = operand.eval(row)?;
+                if v.is_null() {
+                    return Some(Value::Null);
+                }
+                let hay = match v {
+                    Value::Text(s) | Value::Dna(s) => s,
+                    other => other.to_string(),
+                };
+                let hit = like_match(pattern, &hay);
+                Some(Value::Int((hit != *negated) as i64))
+            }
             Expr::Cmp { op, left, right } => {
                 let l = left.eval(row)?;
                 let r = right.eval(row)?;
@@ -213,6 +234,12 @@ impl Expr {
             Expr::Cmp { op, left, right } => {
                 format!("{} {} {}", left.describe(), op.as_str(), right.describe())
             }
+            Expr::Like { operand, pattern, negated } => format!(
+                "{} {}LIKE '{}'",
+                operand.describe(),
+                if *negated { "NOT " } else { "" },
+                pattern
+            ),
         }
     }
 
@@ -246,7 +273,33 @@ impl Expr {
                 left.collect_columns(out);
                 right.collect_columns(out);
             }
+            Expr::Like { operand, .. } => operand.collect_columns(out),
         }
+    }
+}
+
+/// MySQL LIKE with % (any run) and _ (one char), case-insensitive (ci
+/// collations). A backslash escapes the next wildcard character, so
+/// '\_transient\_%' anchors on a literal underscore.
+pub fn like_match(pattern: &str, text: &str) -> bool {
+    let p = pattern.to_ascii_lowercase();
+    let t = text.to_ascii_lowercase();
+    like_rec(p.as_bytes(), t.as_bytes())
+}
+
+fn like_rec(p: &[u8], t: &[u8]) -> bool {
+    match (p.first(), t.first()) {
+        (None, None) => true,
+        (Some(b'%'), _) => like_rec(&p[1..], t) || (!t.is_empty() && like_rec(p, &t[1..])),
+        // A backslash in the pattern is authoritative: it always escapes the
+        // NEXT pattern char (no fall-through), so '\_' matches a literal
+        // underscore and never the two characters '\','_'.
+        (Some(b'\\'), _) if p.len() >= 2 => {
+            !t.is_empty() && p[1] == t[0] && like_rec(&p[2..], &t[1..])
+        }
+        (Some(b'_'), Some(_)) => like_rec(&p[1..], &t[1..]),
+        (Some(&c), Some(&d)) => c == d && like_rec(&p[1..], &t[1..]),
+        _ => false,
     }
 }
 
