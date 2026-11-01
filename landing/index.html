@@ -162,6 +162,7 @@ footer .f1{margin-bottom:6px}
     <div class="links">
       <a href="#features"><span class="ru">Возможности</span><span class="en">Features</span></a>
       <a href="#bench"><span class="ru">Бенчмарки</span><span class="en">Benchmarks</span></a>
+      <a href="#resources"><span class="ru">Ресурсы</span><span class="en">Resources</span></a>
       <a href="#charts"><span class="ru">Графики</span><span class="en">Charts</span></a>
       <a href="#tests"><span class="ru">Тесты</span><span class="en">Testing</span></a>
       <a href="#shots"><span class="ru">Скриншоты</span><span class="en">Screenshots</span></a>
@@ -260,6 +261,36 @@ footer .f1{margin-bottom:6px}
     <span class="en">The v4.0.0 run dated 2026-10-31 used a different machine (8 threads), so it is not directly comparable to the v3.5.0 table: same <code>scripts/bench_compare.py</code> methodology, MySQL/PostgreSQL did not take part. Raw data: <a href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/docs/bench_compare_results_v400_linux.json">bench_compare_results_v400_linux.json</a>.</span></p>
 
     <p style="margin-top:18px"><a class="btn ghost" href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/docs/reports/DB_COMPARISON_REPORT_v3.5.0_RU.pdf">📄 <span class="ru">Полный отчёт о сравнении (PDF, 13 стр., RU)</span><span class="en">Full comparison report (PDF, 13 pages, RU)</span></a></p>
+  </div>
+</section>
+
+<section id="resources">
+  <div class="wrap">
+    <div class="kicker">Resources</div>
+    <h2><span class="ru">Потребление ресурсов: память и диск</span><span class="en">Resource usage: RAM &amp; disk</span></h2>
+    <p class="lead"><span class="ru">Один и тот же детерминированный датасет во всех трёх СУБД — 100 000 строк (ключ + значение 160 байт, seed 42, как в основном бенчмарке), настройки по умолчанию у всех. Память — суммарный PSS всех процессов СУБД: разделяемая память делится пропорционально, поэтому PostgreSQL со своими shared_buffers учитывается честно. Диск — прирост каталога данных после корректной остановки, включая WAL и binlog.</span>
+    <span class="en">The same deterministic dataset in all three DBMS — 100,000 rows (key + 160-byte value, seed 42, as in the main benchmark), default settings everywhere. Memory is the summed PSS of all DBMS processes: shared memory is split proportionally, so PostgreSQL with its shared_buffers is counted fairly. Disk is the data directory growth after a clean shutdown, including WAL and binlog.</span></p>
+
+    <div class="v400">
+      <div class="cell"><div class="n"><span class="ru">5,9×</span><span class="en">5.9×</span></div><div class="t ru">меньше RAM в пике, чем у MySQL (69,6 против 410,1 MiB); в покое — в 16,9 раза</div><div class="t en">less peak RAM than MySQL (69.6 vs 410.1 MiB); 16.9× less when idle</div></div>
+      <div class="cell"><div class="n"><span class="ru">42,2 <small>MiB</small></span><span class="en">42.2 <small>MiB</small></span></div><div class="t ru">место на диске за 100 000 строк — минимум из трёх: −29 % к MySQL, −25 % к PostgreSQL</div><div class="t en">disk footprint per 100,000 rows — the lowest of the three: −29% vs MySQL, −25% vs PostgreSQL</div></div>
+      <div class="cell"><div class="n"><span class="ru">×2,6</span><span class="en">2.6×</span></div><div class="t ru">к полезным данным (16,4 MiB) — накладные расходы RS(4+2) + WAL + индексы; у MySQL ×3,6, у PostgreSQL ×3,4</div><div class="t en">the raw payload (16.4 MiB) — RS(4+2) + WAL + index overhead; MySQL ×3.6, PostgreSQL ×3.4</div></div>
+    </div>
+
+    <table class="data">
+      <tr><th><span class="ru">Метрика</span><span class="en">Metric</span></th><th>DNA-DB 4.0.0</th><th>MySQL 8.0.46</th><th>PostgreSQL 16.15</th></tr>
+      <tr><td><span class="ru">RAM в покое (сумма PSS процессов)</span><span class="en">Idle RAM (sum of process PSS)</span></td><td><span class="ru">22,3</span><span class="en">22.3</span></td><td><span class="ru">376,7</span><span class="en">376.7</span></td><td class="best"><span class="ru">21,8</span><span class="en">21.8</span></td></tr>
+      <tr><td><span class="ru">RAM в пике — загрузка + точечные чтения</span><span class="en">Peak RAM — load + point reads</span></td><td><span class="ru">69,6</span><span class="en">69.6</span></td><td><span class="ru">410,1</span><span class="en">410.1</span></td><td class="best"><span class="ru">54,7</span><span class="en">54.7</span></td></tr>
+      <tr><td><span class="ru">Место на диске — прирост, MiB</span><span class="en">Disk growth, MiB</span></td><td class="best"><span class="ru">42,2</span><span class="en">42.2</span></td><td><span class="ru">59,1</span><span class="en">59.1</span></td><td><span class="ru">56,1</span><span class="en">56.1</span></td></tr>
+    </table>
+
+    <div class="chart-grid">
+      <figure><img src="assets/charts/ram_resources.png" alt="RAM usage"><figcaption><span class="ru">Память: сумма PSS процессов СУБД — в покое и в пике</span><span class="en">RAM: sum of DBMS process PSS — idle vs peak</span></figcaption></figure>
+      <figure><img src="assets/charts/disk_footprint.png" alt="Disk footprint"><figcaption><span class="ru">Диск: прирост каталога данных после чистой остановки</span><span class="en">Disk: data directory growth after a clean shutdown</span></figcaption></figure>
+    </div>
+
+    <p class="note"><span class="ru">Всё в MiB, меньше — лучше. Методика: пик — максимум суммы PSS при опросе каждые 50 мс во время загрузки 100 000 строк (одиночные вставки, ack на каждую) и 4 000 чтений; диск — от пустого сервера к загруженному после корректной остановки: у MySQL в каталоге лежат binlog и undo, у PostgreSQL — WAL, у DNA-DB — WAL и сегменты RS(4+2). Прогон GitHub Actions, ubuntu-24.04: MySQL 8.0.46 и PostgreSQL 16.15 из apt, DNA-DB 4.0.0 (<code>--sync strict</code>). Сырые данные: <a href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/docs/resources_compare_linux.json">resources_compare_linux.json</a>; воспроизведение: Actions → «Resources (RAM &amp; disk)», скрипт <code>scripts/measure_resources.py</code>.</span>
+    <span class="en">All values in MiB, lower is better. Methodology: peak = max of the PSS sum sampled every 50 ms during the 100,000-row load (single inserts, ack per row) plus 4,000 reads; disk = from an empty server to the loaded one after a clean shutdown — MySQL keeps binlog and undo files in the directory, PostgreSQL keeps WAL, DNA-DB keeps WAL and RS(4+2) segments. GitHub Actions run, ubuntu-24.04: MySQL 8.0.46 and PostgreSQL 16.15 from apt, DNA-DB 4.0.0 (<code>--sync strict</code>). Raw data: <a href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/docs/resources_compare_linux.json">resources_compare_linux.json</a>; reproduce via Actions → “Resources (RAM &amp; disk)”, script <code>scripts/measure_resources.py</code>.</span></p>
   </div>
 </section>
 
