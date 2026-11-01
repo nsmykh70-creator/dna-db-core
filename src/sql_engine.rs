@@ -6867,6 +6867,99 @@ mod tests {
             .unwrap();
         assert_eq!(res.rows.len(), 1);
     }
+
+    // ---------- v4.1: SHOW STORAGE ----------
+
+    #[test]
+    fn show_storage_maps_row_to_locus_and_decodes_values() {
+        let (_e, sql) = setup();
+        sql.execute(
+            "CREATE TABLE chr_samples (sample_id INT, label TEXT, seq DNA, \
+             PRIMARY KEY (sample_id))",
+        )
+        .unwrap();
+        sql.execute(
+            "INSERT INTO chr_samples (sample_id = 7, label = 'demo', seq = 'CGCGCGATCGATCGCGC')",
+        )
+        .unwrap();
+
+        // Point mode: one row per column, values decoded, chains included.
+        let res = sql
+            .execute("SHOW STORAGE FOR chr_samples WHERE sample_id = 7")
+            .unwrap();
+        assert_eq!(
+            res.columns,
+            vec![
+                "chromosome".to_string(),
+                "locus".to_string(),
+                "storage_key".to_string(),
+                "column".to_string(),
+                "sql_type".to_string(),
+                "value".to_string(),
+                "stored_as".to_string(),
+            ]
+        );
+        let by_col = |name: &str| {
+            res.rows
+                .iter()
+                .find(|r| r.get("column") == Some(&Value::Text(name.into())))
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(by_col("chromosome").get("storage_key"),
+                   Some(&Value::Text("chr_samples:7".into())));
+        assert_eq!(by_col("sample_id").get("sql_type"),
+                   Some(&Value::Text("INT".into())));
+        assert_eq!(by_col("sample_id").get("value"),
+                   Some(&Value::Text("7".into())));
+        assert_eq!(by_col("label").get("value"),
+                   Some(&Value::Text("demo".into())));
+        assert_eq!(by_col("seq").get("sql_type"),
+                   Some(&Value::Text("DNA".into())));
+        // The chain is shown decoded AND its physical form is described.
+        assert_eq!(by_col("seq").get("value"),
+                   Some(&Value::Text("CGCGCGATCGATCGCGC".into())));
+        assert!(matches!(
+            by_col("seq").get("stored_as"),
+            Some(Value::Text(s)) if s.contains("tag 4") && s.contains("18 nt")
+        ));
+
+        // Scan mode: one summary row per stored locus.
+        let res2 = sql.execute("SHOW STORAGE FOR chr_samples").unwrap();
+        assert_eq!(res2.rows.len(), 1);
+        assert_eq!(res2.rows[0].get("storage_key"),
+                   Some(&Value::Text("chr_samples:7".into())));
+        assert_eq!(res2.rows[0].get("dna_columns"),
+                   Some(&Value::Int(1)));
+        assert!(matches!(
+            res2.rows[0].get("payload_bytes"),
+            Some(Value::Int(n)) if *n > 0
+        ));
+
+        // Filtering by a non-PK column is rejected, unknown locus errors.
+        assert!(sql
+            .execute("SHOW STORAGE FOR chr_samples WHERE label = 'demo'")
+            .is_err());
+        assert!(sql
+            .execute("SHOW STORAGE FOR chr_samples WHERE sample_id = 999")
+            .is_err());
+        assert!(sql.execute("SHOW STORAGE FOR no_such_table").is_err());
+    }
+
+    #[test]
+    fn explain_storage_maps_insert_before_execution() {
+        let (_e, sql) = setup();
+        let map = sql
+            .explain_storage(
+                "INSERT INTO chr_users (user_id, username, balance) VALUES (5, 'ada', 100.0)",
+            )
+            .unwrap();
+        assert!(map.contains("chromosome 'chr_users'"), "{}", map);
+        assert!(map.contains("locus 5"), "{}", map);
+        assert!(map.contains("chr_users:5"), "{}", map);
+        assert!(map.contains("balance [FLOAT] = 100"), "{}", map);
+        assert!(map.contains("RowCodec tag 2"), "{}", map);
+    }
 }
 #[cfg(test)]
 mod acl_parse_tests {
@@ -7020,95 +7113,5 @@ mod security_regression_tests {
         // (both kept with NULLs on the right side).
         let left_joined = hash_join_left(&left, &right, "id", "id");
         assert_eq!(left_joined.len(), 4);
-    }
-
-    // ---------- v4.1: SHOW STORAGE ----------
-
-    #[test]
-    fn show_storage_maps_row_to_locus_and_decodes_values() {
-        let (_e, sql) = setup();
-        sql.execute(
-            "CREATE TABLE chr_samples (sample_id INT, label TEXT, seq DNA, \
-             PRIMARY KEY (sample_id))",
-        )
-        .unwrap();
-        sql.execute(
-            "INSERT INTO chr_samples (sample_id = 7, label = 'demo', seq = 'CGCGCGATCGATCGCGC')",
-        )
-        .unwrap();
-
-        // Point mode: one row per column, values decoded, chains included.
-        let res = sql
-            .execute("SHOW STORAGE FOR chr_samples WHERE sample_id = 7")
-            .unwrap();
-        assert_eq!(
-            res.columns,
-            vec![
-                "chromosome".to_string(),
-                "locus".to_string(),
-                "storage_key".to_string(),
-                "column".to_string(),
-                "sql_type".to_string(),
-                "value".to_string(),
-                "stored_as".to_string(),
-            ]
-        );
-        let by_col = |name: &str| {
-            res.rows
-                .iter()
-                .find(|r| r.get("column") == Some(&Value::Text(name.into())))
-                .unwrap()
-                .clone()
-        };
-        assert_eq!(by_col("chromosome").get("storage_key"),
-                   Some(&Value::Text("chr_samples:7".into())));
-        assert_eq!(by_col("sample_id").get("sql_type"),
-                   Some(&Value::Text("INT".into())));
-        assert_eq!(by_col("sample_id").get("value"),
-                   Some(&Value::Text("7".into())));
-        assert_eq!(by_col("label").get("value"),
-                   Some(&Value::Text("demo".into())));
-        assert_eq!(by_col("seq").get("sql_type"),
-                   Some(&Value::Text("DNA".into())));
-        // The chain is shown decoded AND its physical form is described.
-        assert_eq!(by_col("seq").get("value"),
-                   Some(&Value::Text("CGCGCGATCGATCGCGC".into())));
-        assert!(matches!(
-            by_col("seq").get("stored_as"),
-            Some(Value::Text(s)) if s.contains("tag 4") && s.contains("18 nt")
-        ));
-
-        // Scan mode: one summary row per stored locus.
-        let res2 = sql.execute("SHOW STORAGE FOR chr_samples").unwrap();
-        assert_eq!(res2.rows.len(), 1);
-        assert_eq!(res2.rows[0].get("storage_key"),
-                   Some(&Value::Text("chr_samples:7".into())));
-        assert_eq!(res2.rows[0].get("dna_columns"),
-                   Some(&Value::Int(1)));
-        assert_eq!(res2.rows[0].get("payload_bytes").map(|v| matches!(v, Value::Int(n) if *n > 0)), Some(true));
-
-        // Filtering by a non-PK column is rejected, unknown locus errors.
-        assert!(sql
-            .execute("SHOW STORAGE FOR chr_samples WHERE label = 'demo'")
-            .is_err());
-        assert!(sql
-            .execute("SHOW STORAGE FOR chr_samples WHERE sample_id = 999")
-            .is_err());
-        assert!(sql.execute("SHOW STORAGE FOR no_such_table").is_err());
-    }
-
-    #[test]
-    fn explain_storage_maps_insert_before_execution() {
-        let (_e, sql) = setup();
-        let map = sql
-            .explain_storage(
-                "INSERT INTO chr_users (user_id, username, balance) VALUES (5, 'ada', 100.0)",
-            )
-            .unwrap();
-        assert!(map.contains("chromosome 'chr_users'"), "{}", map);
-        assert!(map.contains("locus 5"), "{}", map);
-        assert!(map.contains("chr_users:5"), "{}", map);
-        assert!(map.contains("balance [FLOAT] = 100"), "{}", map);
-        assert!(map.contains("RowCodec tag 2"), "{}", map);
     }
 }
