@@ -216,7 +216,8 @@ impl AdminPanel {
             ("GET", "/api/browse") => self.api_browse(req, &session),
             ("POST", "/api/query") => self.api_query(&session, req),
             ("POST", "/api/explain") => self.api_explain(&session, req),
-            ("POST", "/api/compact") => self.api_compact(&session),
+            ("POST", "/api/compact") => self.api_compact(&session, req),
+            ("GET", "/api/compactions") => self.api_compactions(&session),
             ("GET", "/api/me") => Response::json(
                 200,
                 &json!({
@@ -545,6 +546,65 @@ dnadb_memtable_bytes ");
 dnadb_segments_count ");
         body.push_str(&self.engine.segment_count().to_string());
         body.push_str("\n");
+        // v4.1: compaction results — lifetime counter, the last completed run
+        // (duration / bytes before-after / savings / completion timestamp) and
+        // the on-disk footprint of the whole data directory.
+        let stats = &self.engine.stats;
+        let push_gauge = |body: &mut String, name: &str, help: &str, value: String| {
+            body.push_str(&format!(
+                "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {value}\n"
+            ));
+        };
+        body.push_str("# HELP dnadb_compactions_total Completed segment compactions since engine open.
+# TYPE dnadb_compactions_total counter
+dnadb_compactions_total ");
+        body.push_str(&stats.compaction_count.load(Ordering::Relaxed).to_string());
+        body.push_str("\n");
+        push_gauge(
+            &mut body,
+            "dnadb_compaction_last_duration_seconds",
+            "Wall-clock duration of the last completed compaction.",
+            format!(
+                "{:.3}",
+                stats.compaction_last_duration_ms.load(Ordering::Relaxed) as f64 / 1000.0
+            ),
+        );
+        push_gauge(
+            &mut body,
+            "dnadb_compaction_bytes_before",
+            "Data-directory size on disk immediately before the last compaction.",
+            stats
+                .compaction_last_bytes_before
+                .load(Ordering::Relaxed)
+                .to_string(),
+        );
+        push_gauge(
+            &mut body,
+            "dnadb_compaction_bytes_after",
+            "Data-directory size on disk immediately after the last compaction.",
+            stats
+                .compaction_last_bytes_after
+                .load(Ordering::Relaxed)
+                .to_string(),
+        );
+        push_gauge(
+            &mut body,
+            "dnadb_compaction_bytes_saved",
+            "Bytes reclaimed by the last compaction (before - after).",
+            stats.compaction_saved_bytes().to_string(),
+        );
+        push_gauge(
+            &mut body,
+            "dnadb_compaction_last_success_timestamp_seconds",
+            "Unix time of the last completed compaction (0 = never).",
+            stats.compaction_last_unix.load(Ordering::Relaxed).to_string(),
+        );
+        push_gauge(
+            &mut body,
+            "dnadb_data_dir_bytes",
+            "Total size of the data directory on disk (recursive).",
+            self.engine.dir_size_bytes().to_string(),
+        );
         // Flat engine stats (puts/gets/deletes/wal_bytes/...) as gauges.
         for pair in self.engine.stats.summary().split_whitespace() {
             if let Some((k, v)) = pair.split_once('=') {
@@ -588,7 +648,7 @@ dnadb_stat_{key} {n}
                 "memtable_bytes": self.engine.memtable_size(),
                 "wal_bytes": self.engine.wal_size_bytes(),
                 "data_dir": self.engine.data_dir().display().to_string(),
-                "data_dir_bytes": dir_size(self.engine.data_dir()),
+                "data_dir_bytes": self.engine.dir_size_bytes(),
             }),
         )
     }
@@ -662,33 +722,71 @@ dnadb_stat_{key} {n}
 
     /// v4.1: online full compaction (admin only). Safe under concurrency —
     /// readers use snapshots and the segment swap is atomic. Reports the data
-    /// directory size before/after so the panel can show the real win.
-    fn api_compact(&self, session: &Session) -> Response {
+    /// directory size before/after so the panel can show the real win. The
+    /// completed run is tagged with the panel user, appended to
+    /// `compaction_history.jsonl` and exported through `dnadb_compaction_*`.
+    fn api_compact(&self, session: &Session, req: &Request) -> Response {
         if let Some(response) = self.require_admin(session) {
             return response;
         }
-        let before = dir_size(self.engine.data_dir());
+        // An optional JSON body is accepted (and ignored) so the UI can POST
+        // an empty object; nothing in it can change the compaction semantics.
+        let _ = req.json_body();
+        let trigger = format!("panel:{}", session.user);
         let started = Instant::now();
-        match self.engine.compact() {
-            Ok(removed) => {
-                let after = dir_size(self.engine.data_dir());
-                Response::json(
-                    200,
-                    &json!({
-                        "ok": true,
-                        "before_bytes": before,
-                        "after_bytes": after,
-                        "freed_bytes": before.saturating_sub(after),
-                        "removed_files": removed,
-                        "time_us": started.elapsed().as_micros() as u64,
-                    }),
-                )
-            }
+        match self.engine.compact_with_trigger(&trigger) {
+            Ok(Some(record)) => Response::json(
+                200,
+                &json!({
+                    "ok": true,
+                    "ran": true,
+                    "before_bytes": record.bytes_before,
+                    "after_bytes": record.bytes_after,
+                    "freed_bytes": record.saved_bytes,
+                    "removed_files": record.deleted_files,
+                    "time_us": started.elapsed().as_micros() as u64,
+                    "record": record,
+                }),
+            ),
+            Ok(None) => Response::json(
+                200,
+                &json!({
+                    "ok": true,
+                    "ran": false,
+                    "message": "компакция не требуется: на диске один (или ноль) сегментов",
+                    "before_bytes": self.engine.dir_size_bytes(),
+                    "after_bytes": self.engine.dir_size_bytes(),
+                    "freed_bytes": 0,
+                    "removed_files": 0,
+                    "time_us": started.elapsed().as_micros() as u64,
+                }),
+            ),
             Err(e) => Response::json(
                 500,
                 &json!({"error": format!("compaction failed: {e}")}),
             ),
         }
+    }
+
+    /// v4.1: completed compactions, newest first (on-disk history file).
+    fn api_compactions(&self, session: &Session) -> Response {
+        if let Some(response) = self.require_admin(session) {
+            return response;
+        }
+        let history = self.engine.compaction_history();
+        Response::json(
+            200,
+            &json!({
+                "compactions": history,
+                "count": history.len(),
+                "history_file": self
+                    .engine
+                    .data_dir()
+                    .join(crate::engine::COMPACTION_HISTORY_FILE)
+                    .display()
+                    .to_string(),
+            }),
+        )
     }
 
     fn api_tables(&self, session: &Session) -> Response {
@@ -1138,24 +1236,6 @@ fn is_safe_ident(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// Recursive size of a directory in bytes (files only). Used by /api/health
-/// ("data on disk" card) and /api/compact (before/after).
-fn dir_size(path: &std::path::Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return 0;
-    };
-    let mut total = 0u64;
-    for entry in entries.flatten() {
-        let Ok(meta) = entry.metadata() else { continue };
-        if meta.is_dir() {
-            total += dir_size(&entry.path());
-        } else {
-            total += meta.len();
-        }
-    }
-    total
-}
-
 /// CSP hashes for inline `<script>` blocks. Hash-based allowlisting keeps
 /// `script-src` free of `'unsafe-inline'` even though the SPA ships as one
 /// embedded HTML document.
@@ -1485,7 +1565,8 @@ mod tests {
         );
         assert_eq!(status, 400);
 
-        // Compaction endpoint: admin may run it, response carries sizes.
+        // Compaction endpoint: admin may run it, response carries sizes and
+        // (when a merge actually happened) the full history record.
         sql.execute("INSERT INTO chr_t (id = 4, name = 'delta')").unwrap();
         sql.execute("UPDATE chr_t SET name = 'beta2' WHERE id = 2").unwrap();
         sql.execute("DELETE FROM chr_t WHERE id = 1").unwrap();
@@ -1496,6 +1577,60 @@ mod tests {
         assert!(v["before_bytes"].as_u64().unwrap() > 0);
         assert!(v["after_bytes"].as_u64().unwrap() > 0);
         assert!(v["removed_files"].as_u64().unwrap() <= 1);
+        let ran = v["ran"].as_bool().unwrap_or(false);
+        if ran {
+            let rec = &v["record"];
+            assert_eq!(rec["trigger"], json!("panel:admin"));
+            assert!(rec["ts_unix"].as_u64().unwrap() > 0);
+        }
+
+        // Prometheus: compaction gauges are exported after the run.
+        let (status, body) = http(port, "GET", "/metrics", Some(&token), "");
+        assert_eq!(status, 200);
+        for name in [
+            "dnadb_compactions_total",
+            "dnadb_compaction_bytes_before",
+            "dnadb_compaction_bytes_after",
+            "dnadb_compaction_bytes_saved",
+            "dnadb_compaction_last_duration_seconds",
+            "dnadb_compaction_last_success_timestamp_seconds",
+            "dnadb_data_dir_bytes",
+        ] {
+            assert!(body.contains(name), "metrics must expose {name}");
+        }
+        if ran {
+            let ts_line = body
+                .lines()
+                .find(|l| {
+                    l.starts_with("dnadb_compaction_last_success_timestamp_seconds ")
+                })
+                .expect("timestamp metric line");
+            let ts: u64 = ts_line
+                .split_whitespace()
+                .last()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            assert!(ts > 0, "compaction timestamp must be set after a run");
+        }
+
+        // History endpoint: on-disk compaction journal, admin only.
+        let (status, body) = http(port, "GET", "/api/compactions", Some(&token), "");
+        assert_eq!(status, 200);
+        let v: J = serde_json::from_str(&body).unwrap();
+        let list = v["compactions"].as_array().unwrap();
+        assert_eq!(list.len(), v["count"].as_u64().unwrap() as usize);
+        assert!(v["history_file"]
+            .as_str()
+            .unwrap()
+            .ends_with("compaction_history.jsonl"));
+        if ran {
+            assert!(
+                !list.is_empty(),
+                "a completed compaction must appear in the history"
+            );
+            assert_eq!(list[0]["trigger"], json!("panel:admin"));
+            assert!(list[0]["bytes_before"].as_u64().unwrap() > 0);
+        }
 
         // A viewer must be rejected from compaction.
         security
@@ -1513,6 +1648,9 @@ mod tests {
         let vtoken: J = serde_json::from_str(&body).unwrap();
         let vtoken = vtoken["token"].as_str().unwrap().to_string();
         let (status, _) = http(port, "POST", "/api/compact", Some(&vtoken), "");
+        assert_eq!(status, 403);
+        // …and from reading the compaction history.
+        let (status, _) = http(port, "GET", "/api/compactions", Some(&vtoken), "");
         assert_eq!(status, 403);
 
         // …and from explaining statements on tables outside its ACL.

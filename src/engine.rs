@@ -29,6 +29,33 @@ use crate::segment_block::{BlockSegmentReader, BlockSegmentWriter};
 use crate::stats::EngineStats;
 use crate::wal::{SyncMode, WalEntry, WalOp, WalParity, WalReader, WalWriter};
 
+/// One completed compaction, persisted as a JSON line in
+/// `<data_dir>/compaction_history.jsonl` and exposed through the admin panel
+/// (`GET /api/compactions`) and Prometheus (`dnadb_compaction_*`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CompactionRecord {
+    /// Unix time of completion (seconds).
+    pub ts_unix: u64,
+    /// Who ran it: "manual" (API/engine), "panel:<user>", "cli", "auto".
+    pub trigger: String,
+    pub segments_before: usize,
+    pub segments_after: usize,
+    /// Superseded segment + bloom files removed.
+    pub deleted_files: usize,
+    /// Data-directory size on disk before the compaction (bytes).
+    pub bytes_before: u64,
+    /// Data-directory size on disk after the compaction (bytes).
+    pub bytes_after: u64,
+    /// Convenience copy of `bytes_before - bytes_after` (0 if it grew).
+    pub saved_bytes: u64,
+    /// Wall-clock duration in milliseconds.
+    pub duration_ms: u64,
+}
+
+pub const COMPACTION_HISTORY_FILE: &str = "compaction_history.jsonl";
+/// The history file is capped: appending beyond this rewrites the newest half.
+const COMPACTION_HISTORY_CAP: usize = 500;
+
 pub struct EngineConfig {
     pub dir_path: PathBuf,
     pub memtable_capacity: usize,
@@ -1120,7 +1147,25 @@ impl Engine {
     /// Full compaction: merge all segments into one, drop shadowed versions
     /// and consumed tombstones, delete old files. Safe under concurrency:
     /// readers use snapshots; the swap is atomic.
+    ///
+    /// Returns the number of superseded files removed (0 when there is
+    /// nothing to merge). The completed run is appended to the on-disk
+    /// compaction history and exported through `dnadb_compaction_*` metrics.
     pub fn compact(&self) -> Result<usize, std::io::Error> {
+        Ok(self
+            .compact_with_trigger("manual")?
+            .map(|record| record.deleted_files)
+            .unwrap_or(0))
+    }
+
+    /// Like [`Engine::compact`], but tags the history record with `trigger`
+    /// and returns the full result. `Ok(None)` means "nothing to compact"
+    /// (one or zero segments) — no history entry is written for a no-op.
+    pub fn compact_with_trigger(
+        &self,
+        trigger: &str,
+    ) -> Result<Option<CompactionRecord>, std::io::Error> {
+        let started = std::time::Instant::now();
         let _mutation_gate = self.mutation_gate.write();
         let _guard = self.flush_lock.lock();
         let old_segments: Vec<Arc<SegmentFile>> = {
@@ -1128,8 +1173,11 @@ impl Engine {
             g.clone()
         };
         if old_segments.len() <= 1 {
-            return Ok(0);
+            return Ok(None);
         }
+        // Honest "before" footprint of the whole data directory, taken before
+        // any merge/deletion work happens.
+        let bytes_before = self.dir_size_bytes();
 
         // Merge oldest -> newest so newer versions win
         let mut merged: std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>> =
@@ -1218,7 +1266,130 @@ impl Engine {
         let _ = File::open(&self.config.dir_path).and_then(|f| f.sync_all());
 
         self.stats.compaction_count.fetch_add(1, Ordering::Relaxed);
-        Ok(deleted)
+
+        let record = CompactionRecord {
+            ts_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            trigger: trigger.to_string(),
+            segments_before: old_segments.len(),
+            segments_after: 1,
+            deleted_files: deleted,
+            bytes_before,
+            bytes_after: bytes_before, // corrected by record_compaction
+            saved_bytes: 0,
+            duration_ms: started.elapsed().as_millis() as u64,
+        };
+        let corrected = self.record_compaction(record);
+        Ok(Some(corrected))
+    }
+
+    /// Append a completed compaction to the on-disk history, refresh the
+    /// last-compaction Prometheus gauges and log one line. Recomputes
+    /// `bytes_after` from disk so the record reflects the real post-compaction
+    /// footprint (old files are already unlinked) and returns the corrected
+    /// record for the caller's response.
+    fn record_compaction(&self, mut record: CompactionRecord) -> CompactionRecord {
+        let after = self.dir_size_bytes();
+        record.bytes_after = after;
+        record.saved_bytes = record.bytes_before.saturating_sub(after);
+        record.duration_ms = record.duration_ms.max(1);
+        let s = &self.stats;
+        s.compaction_last_bytes_before
+            .store(record.bytes_before, Ordering::Relaxed);
+        s.compaction_last_bytes_after
+            .store(record.bytes_after, Ordering::Relaxed);
+        s.compaction_last_duration_ms
+            .store(record.duration_ms, Ordering::Relaxed);
+        s.compaction_last_unix.store(record.ts_unix, Ordering::Relaxed);
+        eprintln!(
+            "[COMPACT] done trigger='{}' segments {}→{} files removed {} bytes {}→{} (saved {}) in {} ms",
+            record.trigger,
+            record.segments_before,
+            record.segments_after,
+            record.deleted_files,
+            record.bytes_before,
+            record.bytes_after,
+            record.saved_bytes,
+            record.duration_ms,
+        );
+        let path = self.config.dir_path.join(COMPACTION_HISTORY_FILE);
+        let mut entries = self.compaction_history();
+        entries.push(record.clone());
+        // Cap the file: keep the newest COMPACTION_HISTORY_CAP records.
+        if entries.len() > COMPACTION_HISTORY_CAP {
+            let keep = entries[entries.len() - COMPACTION_HISTORY_CAP..].to_vec();
+            entries = keep;
+        }
+        let rewrite = entries.len() >= COMPACTION_HISTORY_CAP
+            || !path.exists()
+            || std::fs::metadata(&path).map(|m| m.len() == 0).unwrap_or(false);
+        let payload = entries
+            .iter()
+            .filter_map(|r| serde_json::to_string(r).ok())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let payload = payload + "\n";
+        let result = if rewrite {
+            std::fs::write(&path, payload)
+        } else {
+            use std::io::Write as _;
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .and_then(|mut f| f.write_all(payload.as_bytes()))
+        };
+        if let Err(e) = result {
+            eprintln!(
+                "[COMPACT] could not update {}: {}",
+                path.file_name().unwrap_or_default().to_string_lossy(),
+                e
+            );
+        }
+        record
+    }
+
+    /// Completed compactions, newest first (on-disk history file).
+    pub fn compaction_history(&self) -> Vec<CompactionRecord> {
+        let path = self.config.dir_path.join(COMPACTION_HISTORY_FILE);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return Vec::new();
+        };
+        let mut out: Vec<CompactionRecord> = text
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        out.sort_by_key(|r| std::cmp::Reverse(r.ts_unix));
+        out
+    }
+
+    /// Total size of the data directory on disk (recursive walk). Includes
+    /// segments, WAL files, journals and the TLS/crypto material — the honest
+    /// footprint shown in the panel and exported as `dnadb_data_dir_bytes`.
+    pub fn dir_size_bytes(&self) -> u64 {
+        fn walk(dir: &Path, total: &mut u64) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                match entry.file_type() {
+                    Ok(t) if t.is_dir() => walk(&path, total),
+                    Ok(t) if t.is_file() => {
+                        if let Ok(meta) = entry.metadata() {
+                            *total += meta.len();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut total = 0u64;
+        walk(&self.config.dir_path, &mut total);
+        total
     }
 
     /// Rebuild Strand B from the current verified primary files and switch it

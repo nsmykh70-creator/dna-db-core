@@ -47,6 +47,15 @@ pub struct EngineStats {
     pub scrub_lesions: AtomicU64,
     /// Unix time of the last completed scrub pass (0 = never).
     pub scrub_last_unix: AtomicU64,
+    // --- Last compaction result (v4.1, exported to Prometheus) ---
+    /// Directory size before the last compaction (bytes).
+    pub compaction_last_bytes_before: AtomicU64,
+    /// Directory size after the last compaction (bytes).
+    pub compaction_last_bytes_after: AtomicU64,
+    /// Wall-clock duration of the last compaction (milliseconds).
+    pub compaction_last_duration_ms: AtomicU64,
+    /// Unix time of the last completed compaction (0 = never).
+    pub compaction_last_unix: AtomicU64,
     started_at: std::sync::Mutex<Option<Instant>>,
 }
 
@@ -107,6 +116,13 @@ impl EngineStats {
         }
         let scanned = self.scrub_blocks_scanned.load(Ordering::Relaxed).min(total);
         scanned as f64 / total as f64
+    }
+
+    /// Bytes saved by the last compaction (0 if none / grew).
+    pub fn compaction_saved_bytes(&self) -> u64 {
+        let before = self.compaction_last_bytes_before.load(Ordering::Relaxed);
+        let after = self.compaction_last_bytes_after.load(Ordering::Relaxed);
+        before.saturating_sub(after)
     }
 
     /// Snapshot as a display string (used by server STATUS / shell).

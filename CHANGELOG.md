@@ -32,10 +32,29 @@
   - `POST /api/compact` (admin only) — online full compaction safe under
     concurrent readers; the new "Обслуживание" dashboard panel reports the
     data-dir size before/after, freed bytes and removed-file count.
+  - **Compaction history** — every completed run (panel `panel:<user>`, CLI,
+    manual, auto) is appended to `<data_dir>/compaction_history.jsonl`
+    (capped at 500 records) and served to the panel via the new
+    `GET /api/compactions` (admin only): timestamp, trigger, segment count,
+    bytes before → after, saved bytes, duration. The "Обслуживание" panel
+    renders the journal as a table, newest first.
+  - **Prometheus export of compaction results** — `/metrics` now carries
+    `dnadb_compactions_total`, `dnadb_compaction_bytes_before` /
+    `dnadb_compaction_bytes_after` / `dnadb_compaction_bytes_saved`,
+    `dnadb_compaction_last_duration_seconds`,
+    `dnadb_compaction_last_success_timestamp_seconds` and
+    `dnadb_data_dir_bytes` (whole-directory footprint).
+  - **STORAGE_MAP hand-off** — the 🔬 storage-map modal of the table browser
+    gained a "STORAGE_MAP в DnaQL-консоли" button: it prefills
+    `ANALYZE LOCUS <table>:<pk> |> STORAGE_MAP();` in the DnaQL console and
+    runs it — the same physical map in DnaQL terms (STORAGE_MAP mode of the
+    console). STORAGE_MAP examples in the DnaQL cheatsheet.
   - `GET /api/health` now reports `data_dir_bytes`; the dashboard shows a
-    "Данные на диске" card (GiB-aware formatter, path in the tooltip).
+    "Данные на диске" card (GiB-aware formatter, path in the tooltip) and a
+    compaction counter card.
   - Tests: `admin::tests::panel_explain_compact_and_disk_size` (real
-    HTTP round-trips: ACL 403s for viewers, JOIN rejection, TX transpile).
+    HTTP round-trips: ACL 403s for viewers, JOIN rejection, TX transpile,
+    `/api/compactions`, `/metrics` compaction gauges).
 
 ## v4.0.0-GA (2026-10-31) — Enterprise production release
 

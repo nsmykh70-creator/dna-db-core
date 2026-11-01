@@ -166,6 +166,8 @@
           <span style="color:var(--muted);font-size:12px">Слияние сегментов в один: убирает затёртые версии строк и освобождает место на диске. Безопасно при активных клиентах (снимки чтения, атомарная подмена).</span>
         </div>
         <div id="compact-out"></div>
+        <div class="result-meta" style="margin-top:10px">История компакций (новые сверху; файл <span class="mono" id="history-file">compaction_history.jsonl</span> в каталоге данных; каждый запуск также экспортируется в <span class="mono">/metrics</span> как <span class="mono">dnadb_compaction_*</span>)</div>
+        <div class="grid-wrap" style="max-height:260px"><table class="grid" id="compactions-table"></table></div>
       </div>
     </section>
 
@@ -221,7 +223,7 @@
     <!-- ---------- DnaQL console ---------- -->
     <section class="view" id="view-dnaql">
       <div class="panel">
-        <h2>DnaQL-консоль <span class="badge">ANALYZE SEQUENCE / LOCUS · COMPARE · SEARCH · FILTER · PIPELINES</span></h2>
+        <h2>DnaQL-консоль <span class="badge">ANALYZE SEQUENCE / LOCUS · COMPARE · SEARCH · FILTER · PIPELINES · STORAGE_MAP</span></h2>
         <textarea id="ql-input" spellcheck="false" placeholder="ANALYZE SEQUENCE 'ATGGCCTAA' |> GC_CONTENT() |> MELTING_TEMP()"></textarea>
         <div class="console-bar">
           <button class="act" id="ql-run">Выполнить <kbd style="opacity:.6">Ctrl+Enter</kbd></button>
@@ -297,6 +299,11 @@
       <button class="act ghost" id="sm-close" title="Закрыть (Esc)">✕</button>
     </div>
     <div id="sm-out" style="padding:14px 18px;max-height:60vh;overflow:auto"></div>
+    <div class="modal-foot">
+      <button class="act" id="sm-to-dnaql" title="Та же карта значения в терминах DnaQL: STORAGE_MAP <хромосома>:<локус>">🧬 STORAGE_MAP в DnaQL-консоли</button>
+      <span style="flex:1"></span>
+      <button class="act ghost" id="sm-foot-close">Закрыть</button>
+    </div>
   </div>
 </div>
 
@@ -433,6 +440,7 @@ async function loadHealth() {
     ["Memtable", fmtBytes(h.memtable_bytes)],
     ["WAL", fmtBytes(h.wal_bytes)],
     ["Данные на диске", fmtBytes(h.data_dir_bytes), "Каталог: " + (h.data_dir || "—")],
+    ["Компакций", fmtNum(st.compactions), "Полных слияний сегментов; детали — в разделе «Обслуживание»"],
     ["Операций (puts)", fmtNum(st.puts)],
     ["Лезий найдено", fmtNum(st.lesions_found)],
     ["Лезий исправлено", fmtNum(st.lesions_repaired)],
@@ -445,6 +453,7 @@ async function loadHealth() {
   const flat = {};
   for (const [k, v] of Object.entries(hj)) flat[k] = v;
   kvTable($("#health-table"), flat);
+  loadCompactions();
 }
 function fmtBytes(n) {
   n = Number(n || 0);
@@ -600,9 +609,14 @@ $("#tbl-grid").addEventListener("click", e => {
 });
 
 /* ---------------- storage modal (SHOW STORAGE per row) ---------------- */
+let ST_PK = null;            // PK последней открытой карты — для hand-off в DnaQL
+function pkLiteral(v) {
+  return typeof v === "number" ? String(v) : "'" + String(v).replace(/'/g, "''") + "'";
+}
 function openStorageModal() { $("#store-modal").classList.remove("hidden"); }
 function closeStorageModal() { $("#store-modal").classList.add("hidden"); }
 $("#sm-close").addEventListener("click", closeStorageModal);
+$("#sm-foot-close").addEventListener("click", closeStorageModal);
 $("#store-modal").addEventListener("click", e => { if (e.target.id === "store-modal") closeStorageModal(); });
 document.addEventListener("keydown", e => { if (e.key === "Escape" && !$("#store-modal").classList.contains("hidden")) closeStorageModal(); });
 
@@ -615,8 +629,10 @@ async function openStorage(row) {
   try {
     const pkv = row[s.pk];
     if (pkv === null || pkv === undefined) throw new Error("строка без значения PK — SHOW STORAGE недоступен");
+    ST_PK = pkv;
     q = "SHOW STORAGE FOR " + CURRENT + " WHERE " + s.pk + " = " + sqlLiteral(s.pk, pkv, false, s.columns);
   } catch (err) {
+    ST_PK = null;
     $("#sm-out").innerHTML = '<div class="errbox">' + esc(err.message) + "</div>";
     return;
   }
@@ -631,6 +647,16 @@ async function openStorage(row) {
   out.innerHTML = h;
   renderGrid(out.querySelector(".out-grid"), b.columns || [], b.rows || []);
 }
+
+/* v4.1: hand-off — та же строка в терминах DnaQL (STORAGE_MAP-режим консоли) */
+$("#sm-to-dnaql").addEventListener("click", () => {
+  if (ST_PK === null) return;
+  $("#ql-input").value = "ANALYZE LOCUS " + CURRENT + ":" + pkLiteral(ST_PK) + " |> STORAGE_MAP();";
+  closeStorageModal();
+  const nav = document.querySelector('#nav button[data-view="dnaql"]');
+  if (nav) nav.click();
+  runQl();
+});
 $("#rm-save").addEventListener("click", async () => {
   let sql;
   try {
@@ -736,7 +762,7 @@ async function showTranspile() {
 }
 $("#sql-tx").addEventListener("click", showTranspile);
 
-/* ---------------- обслуживание: онлайн-компакция (только admin) ---------------- */
+/* ---------------- обслуживание: онлайн-компакция + история (только admin) ---------------- */
 async function runCompact() {
   if (ROLE !== "admin") return;
   if (!confirm("Запустить полную компакцию? Сегменты будут слиты; панель покажет размер данных до и после.")) return;
@@ -751,12 +777,45 @@ async function runCompact() {
   }
   const b = r.body;
   $("#maint-badge").className = "badge ok"; $("#maint-badge").textContent = "OK";
-  out.innerHTML = '<div class="result-meta">🧬 было ' + fmtBytes(b.before_bytes) + " → стало " + fmtBytes(b.after_bytes) +
-    " · освобождено <b>" + fmtBytes(b.freed_bytes) + "</b> · удалено файлов: " + fmtNum(b.removed_files) +
-    " · ⏱ " + (b.time_us / 1000).toFixed(0) + " мс</div>";
+  if (b.ran === false) {
+    out.innerHTML = '<div class="result-meta">✅ ' + esc(b.message || "компакция не требуется") + "</div>";
+  } else {
+    out.innerHTML = '<div class="result-meta">🧬 было ' + fmtBytes(b.before_bytes) + " → стало " + fmtBytes(b.after_bytes) +
+      " · освобождено <b>" + fmtBytes(b.freed_bytes) + "</b> · удалено файлов: " + fmtNum(b.removed_files) +
+      " · ⏱ " + (b.time_us / 1000).toFixed(0) + " мс · запись в журнал: " + esc((b.record && b.record.trigger) || "panel") + "</div>";
+  }
   loadHealth();
 }
 $("#compact-run").addEventListener("click", runCompact);
+
+/* v4.1: журнал компакций (GET /api/compactions, только admin) */
+async function loadCompactions() {
+  const el = $("#compactions-table");
+  if (!el) return;
+  if (ROLE !== "admin") {
+    el.innerHTML = '<tbody><tr><td style="color:var(--muted)">история компакций доступна роли admin</td></tr></tbody>';
+    return;
+  }
+  const r = await api("/api/compactions");
+  if (!r.ok) {
+    el.innerHTML = '<tbody><tr><td class="errbox">' + esc((r.body && r.body.error) || "нет доступа") + "</td></tr></tbody>";
+    return;
+  }
+  if (r.body && r.body.history_file) $("#history-file").textContent = r.body.history_file;
+  const list = (r.body && r.body.compactions) || [];
+  let h = "<thead><tr><th>Время</th><th>Триггер</th><th>Сегменты</th><th>Байт до → после</th><th>Освобождено</th><th>Длительность</th><th>Файлов удалено</th></tr></thead><tbody>";
+  for (const c of list) {
+    h += "<tr><td>" + esc(new Date((c.ts_unix || 0) * 1000).toLocaleString("ru-RU")) + "</td>" +
+      "<td class='mono'>" + esc(c.trigger || "?") + "</td>" +
+      "<td>" + esc(c.segments_before + " → " + c.segments_after) + "</td>" +
+      "<td class='mono'>" + esc(fmtBytes(c.bytes_before) + " → " + fmtBytes(c.bytes_after)) + "</td>" +
+      "<td style='color:var(--ok)'>" + esc(fmtBytes(c.saved_bytes)) + "</td>" +
+      "<td>" + esc(fmtNum(c.duration_ms) + " мс") + "</td>" +
+      "<td>" + esc(String(c.deleted_files)) + "</td></tr>";
+  }
+  if (!list.length) h += '<tr><td colspan="7" style="color:var(--muted)">компакций ещё не было</td></tr>';
+  el.innerHTML = h + "</tbody>";
+}
 
 function saveRecent(key, q) {
   try {
@@ -783,6 +842,7 @@ const QL_EXAMPLES = [
   ["Стандартный поиск + LINK по FK", "FIND PATTERN 'GATCGATC' IN chr_variants WHERE LEVENSHTEIN_DISTANCE <= 1 LINK chr_patients VIA COMPLEMENT(patient_id) EMIT locus, mismatches, variant_name, name"],
   ["Пайплайн FROM |> WHERE |> EMIT", "FROM chr_variants |> WHERE variant_id >= 2 |> EMIT variant_id, variant_name, sequence"],
   ["Физическая карта значения (ACGT)", "ANALYZE LOCUS chr_orders:1042 |> STORAGE_MAP()"],
+  ["Физическая карта строки из SQL-браузера", "ANALYZE LOCUS chr_users:1001 |> STORAGE_MAP()"],
   ["Проверка целостности хромосомы", "VERIFY CHROMOSOME chr_variants"],
 ];
 function mountExamples(sel, items, target) {
