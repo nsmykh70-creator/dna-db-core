@@ -2,6 +2,43 @@
 
 ## Unreleased (CMS Edition — branch `cms-edition`)
 
+### Differential run #3 vs MariaDB 10.11.11 — 66/66 (2026-11-02)
+
+The last two corpus divergences are closed; the corpus itself grew
+63 → 66 statements (multi-row INSERT, two numeric-sort checks), so the
+run exercises the new paths with real data. Corpus result: **64 MATCH +
+2 identical-error parities (1062/1091) = 66/66 (100 %)**.
+
+- **Arithmetic ORDER BY keys** (`ORDER BY meta_value+0 DESC` — the
+  WordPress/WooCommerce numeric-meta sort of WP_Query): the parser now
+  accepts an expression order key (rewind + full expression parse,
+  `src/sql_engine.rs`), the key is materialised per row before the sort
+  (`SelectItem::OrderKeyOnly`) and emits NO output column — MySQL
+  returns only the listed projection. The corpus query previously died
+  with errno 1064 ("unexpected trailing tokens starting at Plus").
+- **MySQL string-to-number arithmetic coercion** (`src/expr.rs`,
+  `--features cms`): `'250.00' + 0` → 250, `'abc' + 0` → 0, NULL stays
+  NULL (leading numeric prefix, same rule as CAST). Plain builds keep
+  the strict NULL semantics.
+- **`SELECT *` / `t.*` report columns in DECLARATION order** (was
+  alphabetical BTreeMap order): `ChromosomeTable` now records
+  `column_order` (CREATE TABLE list, ALTER TABLE ADD appends, DROP
+  COLUMN removes; serde default keeps older persisted schemas
+  decodable), `declared_columns()` drives star expansion, the wire
+  column list and the `t.*, tt.*` multi-star projection — WordPress
+  builds assoc rows from these labels, and `wp_users`/`wp_posts`
+  SELECT-\* now come out byte-compatible with MySQL.
+- **Corpus additions** (`docs/cms/wp_queries_corpus.txt`): multi-row
+  INSERT (wp-upgrader path), `ORDER BY meta_value+0 DESC` over mixed
+  data ('250.00' / '110.50' / 'abc'), `+0 ASC, post_id ASC LIMIT 2`.
+- **New unit tests** (cms module: 13 → 15): numeric-sort/no-extra-column
+  and declaration-order star projections incl. ALTER ADD append.
+
+Full report: `docs/cms/COMPARISON_MYSQL_REPORT.md` (run #3). Remaining
+cosmetic notes: MySQL names system-variable columns by the full
+expression (`@@SESSION.sql_mode`, `GET_LOCK('…')`) — values match;
+byte-exact aliasing is on the фаза-2 collation track.
+
 ### Differential run #2 vs MariaDB 10.11.11 — 61/63 (2026-11-02)
 
 Reproduced the differential stand end-to-end (MariaDB 10.11.11 bintar,

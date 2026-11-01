@@ -6,14 +6,12 @@
 (ветка `cms-edition`, `--features cms`, MySQL-dialect gate через pgwire, порт 15432).
 Сравниваются: успех/ошибка, errno, колонки и значения строк (без ORDER BY — с сортировкой).
 
-## Сводка (63 запросов)
+## Сводка (66 запросов)
 
 | Вердикт | Запросов |
 |---|---|
-| MATCH | 59 |
+| MATCH | 64 |
 | BOTH-ERR | 2 |
-| ERR-DNA | 1 |
-| DIFF-VALUE | 1 |
 
 ## Детали по запросам
 
@@ -53,35 +51,38 @@
 | 32 | P1 | `SELECT meta_value FROM wp_postmeta WHERE meta_key = '_wp_attach…` | MATCH (1 rows) |
 | 33 | P1 | `INSERT INTO wp_postmeta (post_id, meta_key, meta_value) VALUES …` | MATCH (affected=1) |
 | 34 | P1 | `UPDATE wp_postmeta SET meta_value = 'v2' WHERE meta_key = '_edi…` | MATCH (affected=2) |
-| 35 | P1 | `SELECT wp_posts.* FROM wp_posts INNER JOIN wp_postmeta AS mt1 O…` | MATCH (0 rows) (column names differ: ['ID', 'post_author', 'post_date', 'post_date_gmt'] vs ['ID', 'comment_count', 'comment_status', 'guid']) |
-| 36 | P1 | `SELECT SQL_CALC_FOUND_ROWS wp_posts.ID FROM wp_posts INNER JOIN…` | ERR-DNA |
-| 37 | P1 | `SELECT t.*, tt.* FROM wp_terms AS t INNER JOIN wp_term_taxonomy…` | DIFF-VALUE (column names differ: ['term_id', 'name', 'slug', 'term_group'] vs ['name', 'slug', 'term_group', 'term_id']) |
-| 38 | P1 | `SELECT tr.object_id FROM wp_term_relationships AS tr INNER JOIN…` | MATCH (1 rows) |
-| 39 | P1 | `SELECT term_id FROM wp_terms WHERE slug = 'news' OR name = 'New…` | MATCH (1 rows) |
-| 40 | P1 | `INSERT INTO wp_terms (name, slug, term_group) VALUES ('News', '…` | MATCH (affected=1) |
-| 41 | P1 | `INSERT INTO wp_term_relationships (object_id, term_taxonomy_id,…` | MATCH (affected=0) |
-| 42 | P1 | `SELECT * FROM wp_users WHERE user_login = 'admin'` | MATCH (1 rows) (column names differ: ['ID', 'user_login', 'user_pass', 'user_nicename'] vs ['ID', 'display_name', 'user_activation_key', 'user_email']) |
-| 43 | P1 | `SELECT user_id FROM wp_usermeta WHERE meta_key = 'wp_capabiliti…` | MATCH (1 rows) |
-| 44 | P1 | `INSERT INTO wp_usermeta (user_id, meta_key, meta_value) VALUES …` | MATCH (affected=1) |
-| 45 | P1 | `SELECT COUNT(*) FROM wp_users` | MATCH (1 rows) |
-| 46 | P1 | `SELECT * FROM wp_comments WHERE comment_post_ID = 42 AND commen…` | MATCH (1 rows, ordered) (column names differ: ['comment_ID', 'comment_post_ID', 'comment_author', 'comment_author_email'] vs ['comment_ID', 'comment_agent', 'comment_approved', 'comment_author']) |
-| 47 | P1 | `SELECT COUNT(*) FROM wp_comments WHERE comment_post_ID = 42 AND…` | MATCH (1 rows) |
-| 48 | P1 | `UPDATE wp_comments SET comment_approved = '1' WHERE comment_ID …` | MATCH (affected=0) |
-| 49 | DDL | `CREATE TABLE wp_options ( option_id bigint(20) unsigned NOT NUL…` | MATCH (ctl) |
-| 50 | DDL | `SHOW FULL COLUMNS FROM wp_options` | MATCH (4 rows) |
-| 51 | DDL | `ALTER TABLE wp_options ADD COLUMN new_col varchar(64) NOT NULL …` | MATCH (ctl) |
-| 52 | DDL | `ALTER TABLE wp_options DROP COLUMN old_col` | BOTH-ERR (same errno 1091) |
-| 53 | DDL | `CREATE INDEX option_name_idx ON wp_options (option_name)` | MATCH (ctl) |
-| 54 | DDL | `SHOW FULL COLUMNS FROM wp_postmeta` | MATCH (4 rows) |
-| 55 | DDL | `DROP INDEX option_name_idx ON wp_options` | MATCH (ctl) |
-| 56 | P2 | `START TRANSACTION` | MATCH (ctl) |
-| 57 | P2 | `SELECT stock_quantity FROM wp_wc_product_meta_lookup WHERE prod…` | MATCH (1 rows) |
-| 58 | P2 | `UPDATE wp_wc_product_meta_lookup SET stock_quantity = stock_qua…` | MATCH (affected=1) |
-| 59 | P2 | `COMMIT` | MATCH (ctl) |
-| 60 | P2 | `ROLLBACK` | MATCH (ctl) |
-| 61 | P2 | `SELECT TOTAL_SALES FROM wp_wc_product_meta_lookup WHERE product…` | MATCH (1 rows) |
-| 62 | P2 | `SELECT id FROM wp_wc_orders WHERE status = 'processing' ORDER B…` | MATCH (1 rows, ordered) |
-| 63 | P2 | `SELECT COUNT(DISTINCT customer_id) FROM wp_wc_orders WHERE stat…` | MATCH (1 rows) |
+| 35 | P1 | `INSERT INTO wp_postmeta (post_id, meta_key, meta_value) VALUES …` | MATCH (affected=3) |
+| 36 | P1 | `SELECT post_id, meta_value FROM wp_postmeta WHERE meta_key = 'p…` | MATCH (4 rows, ordered) |
+| 37 | P1 | `SELECT post_id FROM wp_postmeta WHERE meta_key = 'price' ORDER …` | MATCH (2 rows, ordered) |
+| 38 | P1 | `SELECT wp_posts.* FROM wp_posts INNER JOIN wp_postmeta AS mt1 O…` | MATCH (0 rows) |
+| 39 | P1 | `SELECT SQL_CALC_FOUND_ROWS wp_posts.ID FROM wp_posts INNER JOIN…` | MATCH (1 rows, ordered) |
+| 40 | P1 | `SELECT t.*, tt.* FROM wp_terms AS t INNER JOIN wp_term_taxonomy…` | MATCH (1 rows, ordered) |
+| 41 | P1 | `SELECT tr.object_id FROM wp_term_relationships AS tr INNER JOIN…` | MATCH (1 rows) |
+| 42 | P1 | `SELECT term_id FROM wp_terms WHERE slug = 'news' OR name = 'New…` | MATCH (1 rows) |
+| 43 | P1 | `INSERT INTO wp_terms (name, slug, term_group) VALUES ('News', '…` | MATCH (affected=1) |
+| 44 | P1 | `INSERT INTO wp_term_relationships (object_id, term_taxonomy_id,…` | MATCH (affected=0) |
+| 45 | P1 | `SELECT * FROM wp_users WHERE user_login = 'admin'` | MATCH (1 rows) |
+| 46 | P1 | `SELECT user_id FROM wp_usermeta WHERE meta_key = 'wp_capabiliti…` | MATCH (1 rows) |
+| 47 | P1 | `INSERT INTO wp_usermeta (user_id, meta_key, meta_value) VALUES …` | MATCH (affected=1) |
+| 48 | P1 | `SELECT COUNT(*) FROM wp_users` | MATCH (1 rows) |
+| 49 | P1 | `SELECT * FROM wp_comments WHERE comment_post_ID = 42 AND commen…` | MATCH (1 rows, ordered) |
+| 50 | P1 | `SELECT COUNT(*) FROM wp_comments WHERE comment_post_ID = 42 AND…` | MATCH (1 rows) |
+| 51 | P1 | `UPDATE wp_comments SET comment_approved = '1' WHERE comment_ID …` | MATCH (affected=0) |
+| 52 | DDL | `CREATE TABLE wp_options ( option_id bigint(20) unsigned NOT NUL…` | MATCH (ctl) |
+| 53 | DDL | `SHOW FULL COLUMNS FROM wp_options` | MATCH (4 rows) |
+| 54 | DDL | `ALTER TABLE wp_options ADD COLUMN new_col varchar(64) NOT NULL …` | MATCH (ctl) |
+| 55 | DDL | `ALTER TABLE wp_options DROP COLUMN old_col` | BOTH-ERR (same errno 1091) |
+| 56 | DDL | `CREATE INDEX option_name_idx ON wp_options (option_name)` | MATCH (ctl) |
+| 57 | DDL | `SHOW FULL COLUMNS FROM wp_postmeta` | MATCH (4 rows) |
+| 58 | DDL | `DROP INDEX option_name_idx ON wp_options` | MATCH (ctl) |
+| 59 | P2 | `START TRANSACTION` | MATCH (ctl) |
+| 60 | P2 | `SELECT stock_quantity FROM wp_wc_product_meta_lookup WHERE prod…` | MATCH (1 rows) |
+| 61 | P2 | `UPDATE wp_wc_product_meta_lookup SET stock_quantity = stock_qua…` | MATCH (affected=1) |
+| 62 | P2 | `COMMIT` | MATCH (ctl) |
+| 63 | P2 | `ROLLBACK` | MATCH (ctl) |
+| 64 | P2 | `SELECT TOTAL_SALES FROM wp_wc_product_meta_lookup WHERE product…` | MATCH (1 rows) |
+| 65 | P2 | `SELECT id FROM wp_wc_orders WHERE status = 'processing' ORDER B…` | MATCH (1 rows, ordered) |
+| 66 | P2 | `SELECT COUNT(DISTINCT customer_id) FROM wp_wc_orders WHERE stat…` | MATCH (1 rows) |
 
 ## Расхождения и ошибки
 
@@ -93,22 +94,7 @@ INSERT INTO wp_options (option_name, option_value, autoload) VALUES ('foo','bar'
 - MySQL error: [1062] Duplicate entry 'foo' for key 'option_name'
 - DNA error: [1062/23000] [MySQL errno 1062] UNIQUE constraint failed: wp_options.option_name = foo (index 'option_name')
 
-### #36 P1 — ERR-DNA
-
-```sql
-SELECT SQL_CALC_FOUND_ROWS wp_posts.ID FROM wp_posts INNER JOIN wp_postmeta ON (wp_posts.ID = wp_postmeta.post_id) WHERE (wp_postmeta.meta_key = 'price' AND CAST(wp_postmeta.meta_value AS SIGNED) > 100) ORDER BY wp_postmeta.meta_value+0 DESC LIMIT 0,20
-```
-- mysql ok; dna errno 1064 (42000): [MySQL errno 1064] SQL: unexpected trailing tokens starting at Plus (unsupported syntax?)
-- DNA error: [1064/42000] [MySQL errno 1064] SQL: unexpected trailing tokens starting at Plus (unsupported syntax?)
-
-### #37 P1 — DIFF-VALUE (column names differ: ['term_id', 'name', 'slug', 'term_group'] vs ['name', 'slug', 'term_group', 'term_id'])
-
-```sql
-SELECT t.*, tt.* FROM wp_terms AS t INNER JOIN wp_term_taxonomy AS tt ON t.term_id = tt.term_id WHERE tt.taxonomy IN ('category') AND t.slug IN ('news') ORDER BY t.name ASC
-```
-- row 0 col term_id: mysql='4' dna='News'
-
-### #52 DDL — BOTH-ERR (same errno 1091)
+### #55 DDL — BOTH-ERR (same errno 1091)
 
 ```sql
 ALTER TABLE wp_options DROP COLUMN old_col

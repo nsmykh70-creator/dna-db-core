@@ -210,6 +210,14 @@ pub struct ChromosomeTable {
     pub name: String,
     /// Column order preserved via BTreeMap for deterministic codec output
     pub columns: BTreeMap<String, ColumnType>,
+    /// CMS edition (branch cms-edition): column DECLARATION order as
+    /// MySQL reports it (`SELECT *`, `t.*`, SHOW COLUMNS). The BTreeMap
+    /// above sorts alphabetically; this Vec records the order in which
+    /// columns were added (CREATE TABLE list, then ALTER TABLE ADD).
+    /// Older persisted schemas decode with an empty Vec — consumers fall
+    /// back to the BTreeMap order.
+    #[serde(default)]
+    pub column_order: Vec<String>,
     pub foreign_keys: Vec<ForeignKeyConstraint>,
     pub primary_locus_column: String,
     /// Secondary indexes on non-PK columns (CREATE INDEX).
@@ -238,6 +246,7 @@ impl ChromosomeTable {
         Self {
             name: name.into(),
             columns: BTreeMap::new(),
+            column_order: Vec::new(),
             foreign_keys: Vec::new(),
             primary_locus_column: pk_col.into(),
             secondary_indexes: Vec::new(),
@@ -251,7 +260,29 @@ impl ChromosomeTable {
     }
 
     pub fn add_column(&mut self, name: impl Into<String>, col_type: ColumnType) {
-        self.columns.insert(name.into(), col_type);
+        let name = name.into();
+        // CMS edition: record declaration order (first insertion wins —
+        // ALTER TABLE ADD appends, DROP leaves no ghost entries).
+        if !self.column_order.contains(&name) {
+            self.column_order.push(name.clone());
+        }
+        self.columns.insert(name, col_type);
+    }
+
+    /// CMS edition: declared column order when recorded, else the
+    /// alphabetical BTreeMap order (older persisted schemas).
+    pub fn declared_columns(&self) -> Vec<String> {
+        if self.column_order.is_empty() {
+            self.columns.keys().cloned().collect()
+        } else {
+            // Keep only columns that still exist (DROP COLUMN syncs the
+            // order list, but stay defensive against old snapshots).
+            self.column_order
+                .iter()
+                .filter(|c| self.columns.contains_key(c.as_str()))
+                .cloned()
+                .collect()
+        }
     }
 
     pub fn add_foreign_key(&mut self, fk: ForeignKeyConstraint) {

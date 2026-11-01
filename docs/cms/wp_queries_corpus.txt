@@ -67,6 +67,9 @@
 [P1] SELECT meta_value FROM wp_postmeta WHERE meta_key = '_wp_attached_file' AND post_id = 7
 [P1] INSERT INTO wp_postmeta (post_id, meta_key, meta_value) VALUES (42, '_edit_lock', '1762000000:1')
 [P1] UPDATE wp_postmeta SET meta_value = 'v2' WHERE meta_key = '_edit_lock' AND post_id = 42
+[P1] INSERT INTO wp_postmeta (post_id, meta_key, meta_value) VALUES (42,'price','250.00'), (43,'price','110.50'), (44,'price','abc')   -- мульти-row INSERT (path wp-upgrader)
+[P1] SELECT post_id, meta_value FROM wp_postmeta WHERE meta_key = 'price' ORDER BY meta_value+0 DESC   -- числовая сортировка varchar-меты (+0)
+[P1] SELECT post_id FROM wp_postmeta WHERE meta_key = 'price' ORDER BY meta_value+0 ASC, post_id ASC LIMIT 2   -- +0 ASC + multi-key + LIMIT
 [P1] SELECT wp_posts.* FROM wp_posts
      INNER JOIN wp_postmeta AS mt1 ON (wp_posts.ID = mt1.post_id)
      INNER JOIN wp_postmeta AS mt2 ON (wp_posts.ID = mt2.post_id)

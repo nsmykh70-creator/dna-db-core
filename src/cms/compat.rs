@@ -1420,4 +1420,92 @@ mod tests {
             .unwrap();
         assert_eq!(r.rows.len(), 2, "\\_ must anchor the pattern to the literal underscore");
     }
+
+    #[test]
+    fn order_by_arithmetic_numeric_sort_no_extra_column() {
+        // WordPress/WooCommerce numeric-sort idiom: `ORDER BY meta_value+0`
+        // over a varchar column (differential corpus #37, run #2 errno 1064).
+        // MySQL reads the leading numeric prefix: '250.00'+0 -> 250,
+        // 'abc'+0 -> 0; and the sort key emits NO output column.
+        let g = gate("order_arith");
+        let s = g.open_session();
+        g.execute(
+            s,
+            "CREATE TABLE t_items (id bigint(20) unsigned NOT NULL auto_increment, label varchar(50) NOT NULL default '', weight varchar(20) NOT NULL default '', PRIMARY KEY (id))",
+        )
+        .unwrap();
+        g.execute(
+            s,
+            "INSERT INTO t_items (label, weight) VALUES ('a','250.00'), ('b','110.50'), ('c','abc')",
+        )
+        .unwrap();
+        let r = g
+            .execute(s, "SELECT id, label FROM t_items ORDER BY weight+0 DESC")
+            .unwrap();
+        assert_eq!(r.columns, vec!["id", "label"], "sort key must not add an output column");
+        let got: Vec<String> = r.rows.iter().map(|row| v(row, "label")).collect();
+        assert_eq!(got, vec!["a", "b", "c"], "250 > 110.5 > 0('abc')");
+        // ASC with a secondary key and LIMIT (MySQL multi-key sort).
+        let r = g
+            .execute(
+                s,
+                "SELECT id FROM t_items ORDER BY weight+0 ASC, id ASC LIMIT 2",
+            )
+            .unwrap();
+        let got: Vec<String> = r.rows.iter().map(|row| v(row, "id")).collect();
+        assert_eq!(got, vec!["3", "2"], "'abc'(0) first, then 110.50");
+    }
+
+    #[test]
+    fn star_projections_use_declaration_order() {
+        // MySQL reports `SELECT *` / `t.*` columns in DECLARATION order
+        // (differential corpus #36/#37, run #2 label/value desync).
+        let g = gate("decl_order");
+        let s = g.open_session();
+        g.execute(
+            s,
+            "CREATE TABLE wp_terms (term_id bigint(20) unsigned NOT NULL auto_increment, name varchar(200) NOT NULL default '', slug varchar(200) NOT NULL default '', term_group bigint(20) NOT NULL default 0, PRIMARY KEY (term_id))",
+        )
+        .unwrap();
+        g.execute(s, "INSERT INTO wp_terms (name, slug) VALUES ('News','news')").unwrap();
+        let r = g.execute(s, "SELECT * FROM wp_terms").unwrap();
+        assert_eq!(r.columns, vec!["term_id", "name", "slug", "term_group"]);
+        // `t.*, tt.*`: labels follow each table's declaration order, MySQL
+        // keeps the duplicated label (term_id) one per projection item.
+        g.execute(
+            s,
+            "CREATE TABLE wp_term_taxonomy (term_taxonomy_id bigint(20) unsigned NOT NULL auto_increment, term_id bigint(20) unsigned NOT NULL default 0, taxonomy varchar(32) NOT NULL default '', PRIMARY KEY (term_taxonomy_id))",
+        )
+        .unwrap();
+        g.execute(
+            s,
+            "INSERT INTO wp_term_taxonomy (term_id, taxonomy) VALUES (1,'category')",
+        )
+        .unwrap();
+        let r = g
+            .execute(
+                s,
+                "SELECT t.*, tt.* FROM wp_terms AS t INNER JOIN wp_term_taxonomy AS tt ON t.term_id = tt.term_id",
+            )
+            .unwrap();
+        assert_eq!(
+            r.columns,
+            vec![
+                "term_id", "name", "slug", "term_group", "term_taxonomy_id", "term_id", "taxonomy"
+            ]
+        );
+        assert_eq!(v(&r.rows[0], "name"), "News");
+        assert_eq!(v(&r.rows[0], "taxonomy"), "category");
+        // ALTER TABLE ADD appends to the declaration order (MySQL).
+        g.execute(
+            s,
+            "ALTER TABLE wp_terms ADD COLUMN new_col varchar(64) NOT NULL default ''",
+        )
+        .unwrap();
+        let r = g.execute(s, "SELECT * FROM wp_terms").unwrap();
+        assert_eq!(
+            r.columns,
+            vec!["term_id", "name", "slug", "term_group", "new_col"]
+        );
+    }
 }

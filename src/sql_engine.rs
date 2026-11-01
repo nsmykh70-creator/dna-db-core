@@ -459,6 +459,15 @@ pub(crate) enum SelectItem {
         /// Output column name: alias if given, else the rendered expression.
         rendered: String,
     },
+    /// CMS edition: an arithmetic ORDER BY key (`ORDER BY meta_value+0`,
+    /// the WordPress numeric-sort idiom). The expression is materialised
+    /// per row before sorting but emits NO output column — MySQL returns
+    /// only the listed projection for such queries.
+    OrderKeyOnly {
+        expr: Expr,
+        /// Canonical rendering used as the internal row key.
+        rendered: String,
+    },
     /// v3.6: scalar subquery in the projection, e.g.
     /// `(SELECT MAX(total) FROM chr_orders WHERE user_id = id) AS max_order`.
     /// Correlated references are resolved against the current outer row.
@@ -1035,6 +1044,7 @@ impl SParser {
             let mut keys = Vec::new();
             loop {
                 // order key: a column, or an aggregate call (COUNT(*) ...)
+                let start = self.pos;
                 let mut key = self.ident()?;
                 // qualified reference `t.col` — the qualifier is stripped
                 // (single-namespace row model), as in projections.
@@ -1057,6 +1067,28 @@ impl SParser {
                     };
                     self.expect(STok::RParen)?;
                     key = render_agg_distinct(&key, arg.as_deref(), distinct);
+                }
+                // CMS edition: an arithmetic order key — `ORDER BY
+                // meta_value+0 DESC` is the canonical WordPress/WooCommerce
+                // numeric-sort idiom for varchar meta. Rewind and parse the
+                // whole key as an expression; exec_select materialises it
+                // per row before sorting and it emits no output column.
+                // (Plain builds keep the original strict grammar: the key
+                // ends here and the operator surfaces as trailing tokens.)
+                else if cfg!(feature = "cms")
+                    && matches!(
+                        self.peek(),
+                        STok::Plus | STok::Minus | STok::Star | STok::Slash
+                    )
+                {
+                    self.pos = start;
+                    let expr = self.parse_expr()?;
+                    let rendered = expr.describe();
+                    projection.push(SelectItem::OrderKeyOnly {
+                        expr,
+                        rendered: rendered.clone(),
+                    });
+                    key = rendered;
                 }
                 let asc = if self.kw("DESC") {
                     false
@@ -2492,7 +2524,11 @@ fn collect_stmt_columns(stmt: &Stmt, out: &mut Vec<String>) -> Result<(), String
                             }
                         }
                     }
-                    SelectItem::AliasStar(_) | SelectItem::Star => {}
+                    // CMS edition: ORDER BY sort keys are internal — they
+                    // create no outer references of their own.
+                    SelectItem::OrderKeyOnly { .. }
+                    | SelectItem::AliasStar(_)
+                    | SelectItem::Star => {}
                 }
             }
             if let Some(e) = where_clause {
@@ -4299,6 +4335,8 @@ impl SqlEngine {
         }
         schema.columns.remove(column);
         schema.column_defaults.remove(column);
+        // CMS edition: keep the declaration-order list in sync.
+        schema.column_order.retain(|c| c != column);
         schema.secondary_indexes.retain(|idx| idx.column != column);
         if schema.auto_increment_column.as_deref() == Some(column) {
             schema.auto_increment_column = None;
@@ -5266,7 +5304,10 @@ impl SqlEngine {
                     let schema = self.get_schema(&table).ok_or_else(|| {
                         format!("SQL: relation '{}' does not exist", table)
                     })?;
-                    for col in schema.columns.keys() {
+                    // MySQL semantics: declaration order (CREATE TABLE list,
+                    // then ALTER TABLE ADD), not the alphabetical BTreeMap
+                    // order — WordPress builds assoc rows from these labels.
+                    for col in schema.declared_columns() {
                         expanded.push(SelectItem::Column {
                             source: col.clone(),
                             alias: None,
@@ -5448,6 +5489,21 @@ impl SqlEngine {
             }
         }
 
+        // CMS edition: arithmetic ORDER BY keys (`OrderKeyOnly`) are
+        // materialised into the rows under their rendered name so the sort
+        // below sees real values. They emit no output column (MySQL
+        // returns only the listed projection).
+        for item in projection {
+            if let SelectItem::OrderKeyOnly { expr, rendered } = item {
+                for row in current.iter_mut() {
+                    if !row.contains_key(rendered) {
+                        let v = expr.eval(row).unwrap_or(Value::Null);
+                        row.insert(rendered.clone(), v);
+                    }
+                }
+            }
+        }
+
         // ORDER BY (post-aggregation, pre-projection: sorting may reference
         // columns the projection would otherwise drop).
         if !order_by.is_empty() {
@@ -5559,7 +5615,10 @@ impl SqlEngine {
                             computed.push((rendered.clone(), expr.clone()));
                         }
                         SelectItem::Agg { rendered, .. } => specs.push(rendered.clone()),
-                        SelectItem::AliasStar(_) | SelectItem::Star => {}
+                        // CMS edition: sort keys emit no output column.
+                        SelectItem::OrderKeyOnly { .. }
+                        | SelectItem::AliasStar(_)
+                        | SelectItem::Star => {}
                     }
                 }
                 // A computed expression may only reference real columns of
@@ -5634,7 +5693,10 @@ impl SqlEngine {
                                 keep.push(rendered.clone());
                             }
                         }
-                        SelectItem::AliasStar(_) | SelectItem::Star => {}
+                        // CMS edition: sort keys emit no output column.
+                        SelectItem::OrderKeyOnly { .. }
+                        | SelectItem::AliasStar(_)
+                        | SelectItem::Star => {}
                     }
                 }
                 for row in current.iter_mut() {
@@ -5683,13 +5745,18 @@ impl SqlEngine {
                             cols.push(rendered.clone());
                         }
                     }
-                    SelectItem::Star | SelectItem::AliasStar(_) => {}
+                    // CMS edition: sort keys emit no output column.
+                    SelectItem::OrderKeyOnly { .. }
+                    | SelectItem::Star
+                    | SelectItem::AliasStar(_) => {}
                 }
             }
             if cols.is_empty() {
                 // `SELECT *` (and zero rows): the FROM table's schema order.
                 if let Some(schema) = self.get_schema(from) {
-                    cols.extend(schema.columns.keys().cloned());
+                    // CMS edition: declaration order (MySQL `SELECT *`
+                    // reports columns as declared, not alphabetically).
+                    cols.extend(schema.declared_columns());
                 }
                 if cols.is_empty() {
                     cols = current
@@ -6549,24 +6616,26 @@ fn render_select_sql(stmt: &Stmt) -> String {
     } else {
         projection
             .iter()
-            .map(|item| match item {
-                SelectItem::Star => "*".to_string(),
-                SelectItem::AliasStar(qual) => format!("{}.*", qual),
+            .filter_map(|item| match item {
+                SelectItem::Star => Some("*".to_string()),
+                SelectItem::AliasStar(qual) => Some(format!("{}.*", qual)),
                 SelectItem::Column { source, alias } => match alias {
-                    Some(a) if a != source => format!("{} AS {}", source, a),
-                    _ => source.clone(),
+                    Some(a) if a != source => Some(format!("{} AS {}", source, a)),
+                    _ => Some(source.clone()),
                 },
                 SelectItem::Computed { expr, rendered } => {
                     let base = expr_to_sql(expr);
                     if *rendered == expr.describe() {
-                        base
+                        Some(base)
                     } else {
-                        format!("{} AS {}", base, rendered)
+                        Some(format!("{} AS {}", base, rendered))
                     }
                 }
-                SelectItem::Agg { canonical, .. } => canonical.clone(),
-                SelectItem::ScalarSub { canonical, .. } => canonical.clone(),
-                SelectItem::Window { canonical, .. } => canonical.clone(),
+                SelectItem::Agg { canonical, .. } => Some(canonical.clone()),
+                SelectItem::ScalarSub { canonical, .. } => Some(canonical.clone()),
+                SelectItem::Window { canonical, .. } => Some(canonical.clone()),
+                // CMS edition: sort keys are not part of the SQL text.
+                SelectItem::OrderKeyOnly { .. } => None,
             })
             .collect::<Vec<_>>()
             .join(", ")

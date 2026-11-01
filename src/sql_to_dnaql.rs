@@ -306,6 +306,14 @@ fn emit_columns(
                     qual
                 ));
             }
+            // CMS edition: ORDER BY sort keys are engine-internal — they
+            // have no DnaQL EMIT counterpart.
+            SelectItem::OrderKeyOnly { rendered, .. } => {
+                return Err(format!(
+                    "SQL→DnaQL: ORDER BY expression '{}' is not expressible in DnaQL EMIT",
+                    rendered
+                ));
+            }
             SelectItem::Column { source, alias } => {
                 if let Some(a) = alias {
                     if a != source {

@@ -432,6 +432,14 @@ fn arith(op: ArithOp, l: &Value, r: &Value) -> Option<Value> {
         match v {
             Value::Int(i) => Some((*i as f64, true)),
             Value::Float(f) => Some((*f, false)),
+            // CMS edition (branch cms-edition): MySQL string-to-number
+            // coercion reads the leading numeric prefix — '250.00' + 0
+            // -> 250, 'abc' + 0 -> 0, NULL stays NULL. The WordPress/
+            // WooCommerce `ORDER BY meta_value+0` numeric-sort idiom
+            // depends on it. Plain builds keep the strict NULL semantics
+            // for text arithmetic.
+            #[cfg(feature = "cms")]
+            Value::Text(_) | Value::Dna(_) => Some((numeric_prefix(v).unwrap_or(0.0), false)),
             _ => None,
         }
     }
