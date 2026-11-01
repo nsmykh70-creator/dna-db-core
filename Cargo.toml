@@ -8,6 +8,13 @@ description = "High-performance LSM storage engine with 2-bit DNA packing, dual-
 # ядро, SQL/DnaQL, сервер, тесты, скрипты и документация — AGPL-3.0-only. См. LICENSE.
 license = "AGPL-3.0-only AND Apache-2.0"
 
+[features]
+# CMS Edition (branch `cms-edition`): WordPress/Joomla compatibility track.
+# Enables src/cms/ — MySQL errno mapping, per-connection session state
+# (LAST_INSERT_ID/FOUND_ROWS/SET NAMES/sql_mode) and the named advisory
+# lock registry (GET_LOCK/RELEASE_LOCK). Plain `cargo build` is unchanged.
+cms = []
+
 [dependencies]
 crc32fast = "1.4"
 fastbloom = "0.8"

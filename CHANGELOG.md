@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased (CMS Edition — branch `cms-edition`)
+
+- **CMS compatibility track scaffolded** (feature-gated, `--features cms`):
+  the CMS edition targets WordPress 6.x / WooCommerce / Joomla 5.x and is
+  developed on the `cms-edition` branch (docs/CMS_EDITION_RU.md holds the
+  phased roadmap and the integration-route analysis).
+  - `src/cms/errno` — MySQL server error codes + SQLSTATE classes CMS code
+    branches on (1062 dup entry, 1146 no such table, 1213 deadlock,
+    1205 lock wait timeout, …).
+  - `src/cms/session` — per-connection MySQL-dialect session state:
+    `LAST_INSERT_ID()`, `FOUND_ROWS()`/`ROW_COUNT()`, `SET NAMES` charset,
+    `SET sql_mode` (strict/zero-date semantics), autocommit.
+  - `src/cms/locks` — named advisory lock registry with GET_LOCK /
+    RELEASE_LOCK / IS_FREE_LOCK / IS_USED_LOCK semantics: one exclusive
+    holder per name, re-entrant per session, timeouts, release-all on
+    connection close, `held_since()` diagnostics.
+  - 11 new unit tests (200 total with the feature); plain main build and
+    its tests unchanged.
+
 ## Unreleased (v4.1)
 
 - **Transparent storage for SQL operators** — the operator writes plain SQL

@@ -25,6 +25,12 @@ pub mod access;
 pub mod auth;
 pub mod bio_plugins;
 pub mod bloom;
+// CMS Edition (branch cms-edition): WordPress/Joomla compatibility
+// primitives — MySQL errno mapping, per-connection session state, named
+// advisory locks. Compiled only with `--features cms`.
+#[cfg(feature = "cms")]
+pub mod cms;
+
 pub mod complement_index;
 pub mod crypto;
 pub mod dna;
@@ -66,3 +72,6 @@ pub use sql_engine::{QueryResult, SqlEngine};
 pub use tiered_storage::{StorageTier, TieredStorageManager};
 pub use tx::{Mutation, TransactionCoordinator, TransactionSession, TxIsolationLevel};
 pub use wal::SyncMode;
+
+#[cfg(feature = "cms")]
+pub use cms::{CmsSession, LockRegistry};
