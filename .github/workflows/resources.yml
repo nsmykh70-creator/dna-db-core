@@ -20,7 +20,7 @@ permissions:
 
 jobs:
   resources:
-    name: RAM & disk: DNA-DB vs MySQL vs PostgreSQL
+    name: RAM & disk — DNA-DB vs MySQL vs PostgreSQL
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
