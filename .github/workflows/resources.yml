@@ -97,4 +97,7 @@ jobs:
           git add docs/resources_compare_linux.json docs/resources_compare_linux_1m.json \
                   docs/charts landing/assets/charts || true
           git diff --cached --quiet || git commit -m "resources: замер RAM и диска DNA-DB vs MySQL vs PostgreSQL (100k + 1M) [skip ci]"
+          # Другие job'ы (bench-бот) могут уйти вперёд, пока шёл замер:
+          # перебазируемся, чтобы push не отклонился гонкой.
+          git pull --rebase origin main || true
           git push
