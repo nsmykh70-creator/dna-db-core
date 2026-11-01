@@ -1,6 +1,6 @@
 {
   "meta": {
-    "date": "2026-11-01 03:59:24",
+    "date": "2026-11-01 09:57:54",
     "machine": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39",
     "rows": 100000,
     "value_bytes": 160,
@@ -15,17 +15,17 @@
   "systems": {
     "dnadb": {
       "version": "dna-db-core 4.0.0 (legacy, strict fsync)",
-      "idle_pss_mib": 22.3,
-      "peak_pss_mib": 69.6,
-      "idle_rss_mib": 24.0,
+      "idle_pss_mib": 22.5,
+      "peak_pss_mib": 69.5,
+      "idle_rss_mib": 24.2,
       "peak_rss_mib": 71.3,
       "disk_baseline_mib": 0.0,
       "disk_after_mib": 42.2,
       "disk_delta_mib": 42.2,
       "setup_secs": 0.02,
-      "load_secs": 27.994,
-      "load_ops_s": 3572,
-      "read_ops_s": 16304
+      "load_secs": 30.357,
+      "load_ops_s": 3294,
+      "read_ops_s": 15882
     },
     "mysql": {
       "version": "MySQL 8.0.46-0ubuntu0.24.04.4",
@@ -36,24 +36,24 @@
       "disk_baseline_mib": 191.7,
       "disk_after_mib": 250.8,
       "disk_delta_mib": 59.1,
-      "setup_secs": 0.02,
-      "load_secs": 72.453,
-      "load_ops_s": 1380,
-      "read_ops_s": 4764
+      "setup_secs": 0.03,
+      "load_secs": 74.567,
+      "load_ops_s": 1341,
+      "read_ops_s": 5001
     },
     "postgres": {
       "version": "PostgreSQL 16.15 (Ubuntu 16.15-1.pgdg24.04+2) on x86_64-pc-linux-gnu",
-      "idle_pss_mib": 21.8,
-      "peak_pss_mib": 54.7,
-      "idle_rss_mib": 70.0,
-      "peak_rss_mib": 141.7,
+      "idle_pss_mib": 22.1,
+      "peak_pss_mib": 54.8,
+      "idle_rss_mib": 70.3,
+      "peak_rss_mib": 120.3,
       "disk_baseline_mib": 45.6,
       "disk_after_mib": 101.7,
       "disk_delta_mib": 56.1,
-      "setup_secs": 0.12,
-      "load_secs": 24.604,
-      "load_ops_s": 4064,
-      "read_ops_s": 6971
+      "setup_secs": 0.05,
+      "load_secs": 25.916,
+      "load_ops_s": 3859,
+      "read_ops_s": 6148
     }
   }
 }
