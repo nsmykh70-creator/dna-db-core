@@ -1,37 +1,37 @@
 
 === DNA-DB v4.0.0 ===
-  load 10000 ... 3369 ops/s, avg 0.30 ms
-  load-mt 8000 rows x 8 threads ... 3617 rows/s, p50 1.85 ms, errors=0, verified=True
-  load-batch 8000 rows, batch=200 ... 154829 rows/s (40 batches), p50 1.20 ms/batch, errors=0, verified=True
-  point-read 4000 ... 18243 ops/s, p50 0.06 / p95 0.07 / p99 0.09 ms, errors=0
-  mixed 8 threads x 500 ops (80/20) ... 9854 ops/s, p50 0.39 / p99 1.86 ms
-  sql load 3000 rows ... 3088 ops/s, avg 0.32 ms
-  sql SELECT WHERE pk x 1500 ... 10165 ops/s, p50 0.09 / p95 0.11 / p99 0.12 ms, errors=0
+  load 10000 ... 3634 ops/s, avg 0.28 ms
+  load-mt 8000 rows x 8 threads ... 3971 rows/s, p50 1.45 ms, errors=0, verified=True
+  load-batch 8000 rows, batch=200 ... 225881 rows/s (40 batches), p50 0.88 ms/batch, errors=0, verified=True
+  point-read 4000 ... 27738 ops/s, p50 0.03 / p95 0.05 / p99 0.07 ms, errors=0
+  mixed 8 threads x 500 ops (80/20) ... 7757 ops/s, p50 0.31 / p99 1.56 ms
+  sql load 3000 rows ... 1546 ops/s, avg 0.65 ms
+  sql SELECT WHERE pk x 1500 ... 19114 ops/s, p50 0.05 / p95 0.06 / p99 0.07 ms, errors=0
 
 === MySQL ===
-  load 10000 ... 1368 ops/s, avg 0.73 ms
-  load-mt 8000 rows x 8 threads ... 4916 rows/s, p50 1.36 ms, errors=0, verified=True
-  load-batch 8000 rows, batch=200 ... 64245 rows/s (40 batches), p50 2.91 ms/batch, errors=0, verified=True
-  point-read 4000 ... 5266 ops/s, p50 0.18 / p95 0.23 / p99 0.24 ms, errors=0
-  mixed 8 threads x 500 ops (80/20) ... 7330 ops/s, p50 0.76 / p99 2.41 ms
-  sql load 3000 rows ... 1354 ops/s, avg 0.74 ms
-  sql SELECT WHERE pk x 1500 ... 5017 ops/s, p50 0.19 / p95 0.24 / p99 0.26 ms, errors=0
+  load 10000 ... 1365 ops/s, avg 0.73 ms
+  load-mt 8000 rows x 8 threads ... 5237 rows/s, p50 0.92 ms, errors=0, verified=True
+  load-batch 8000 rows, batch=200 ... 22448 rows/s (40 batches), p50 1.79 ms/batch, errors=0, verified=True
+  point-read 4000 ... 8636 ops/s, p50 0.10 / p95 0.16 / p99 0.17 ms, errors=0
+  mixed 8 threads x 500 ops (80/20) ... 10506 ops/s, p50 0.52 / p99 1.69 ms
+  sql load 3000 rows ... 1675 ops/s, avg 0.60 ms
+  sql SELECT WHERE pk x 1500 ... 7368 ops/s, p50 0.13 / p95 0.17 / p99 0.18 ms, errors=0
 
 === PostgreSQL ===
-  load 10000 ... 3901 ops/s, avg 0.26 ms
-  load-mt 8000 rows x 8 threads ... 13774 rows/s, p50 0.51 ms, errors=0, verified=True
-  load-batch 8000 rows, batch=200 ... 123134 rows/s (40 batches), p50 1.59 ms/batch, errors=0, verified=True
-  point-read 4000 ... 6572 ops/s, p50 0.15 / p95 0.19 / p99 0.20 ms, errors=0
-  mixed 8 threads x 500 ops (80/20) ... 14144 ops/s, p50 0.39 / p99 1.68 ms
-  sql load 3000 rows ... 3850 ops/s, avg 0.26 ms
-  sql SELECT WHERE pk x 1500 ... 6916 ops/s, p50 0.13 / p95 0.18 / p99 0.20 ms, errors=0
+  load 10000 ... 4001 ops/s, avg 0.25 ms
+  load-mt 8000 rows x 8 threads ... 10367 rows/s, p50 0.36 ms, errors=0, verified=True
+  load-batch 8000 rows, batch=200 ... 31490 rows/s (40 batches), p50 0.88 ms/batch, errors=0, verified=True
+  point-read 4000 ... 12387 ops/s, p50 0.07 / p95 0.10 / p99 0.29 ms, errors=0
+  mixed 8 threads x 500 ops (80/20) ... 9998 ops/s, p50 0.29 / p99 1.95 ms
+  sql load 3000 rows ... 3157 ops/s, avg 0.32 ms
+  sql SELECT WHERE pk x 1500 ... 9330 ops/s, p50 0.11 / p95 0.13 / p99 0.14 ms, errors=0
 
 JSON report: docs/bench_compare_results_linux.json
 
 ================================================================================================
 system / metric      load1/s   loadMT/s   batch/s    read/s   mixed/s  sqlsel/s
 ------------------------------------------------------------------------------------------------
-DNA-DB                  3369       3617    154829     18243      9854     10165
-MySQL                   1368       4916     64245      5266      7330      5017
-PostgreSQL              3901      13774    123134      6572     14144      6916
+DNA-DB                  3634       3971    225881     27738      7757     19114
+MySQL                   1365       5237     22448      8636     10506      7368
+PostgreSQL              4001      10367     31490     12387      9998      9330
 ================================================================================================
