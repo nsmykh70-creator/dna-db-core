@@ -1,0 +1,59 @@
+{
+  "meta": {
+    "date": "2026-11-01 03:59:24",
+    "machine": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39",
+    "rows": 100000,
+    "value_bytes": 160,
+    "reads": 4000,
+    "method": "defaults everywhere; idle = sum of process PSS after setup; peak = max sum of PSS sampled every 50 ms during load+reads; disk = data directory growth (clean shutdown) incl. WAL/binlog; same deterministic dataset as bench_compare.py (seed 42)",
+    "order": [
+      "dnadb",
+      "mysql",
+      "postgres"
+    ]
+  },
+  "systems": {
+    "dnadb": {
+      "version": "dna-db-core 4.0.0 (legacy, strict fsync)",
+      "idle_pss_mib": 22.3,
+      "peak_pss_mib": 69.6,
+      "idle_rss_mib": 24.0,
+      "peak_rss_mib": 71.3,
+      "disk_baseline_mib": 0.0,
+      "disk_after_mib": 42.2,
+      "disk_delta_mib": 42.2,
+      "setup_secs": 0.02,
+      "load_secs": 27.994,
+      "load_ops_s": 3572,
+      "read_ops_s": 16304
+    },
+    "mysql": {
+      "version": "MySQL 8.0.46-0ubuntu0.24.04.4",
+      "idle_pss_mib": 376.7,
+      "peak_pss_mib": 410.1,
+      "idle_rss_mib": 385.7,
+      "peak_rss_mib": 419.2,
+      "disk_baseline_mib": 191.7,
+      "disk_after_mib": 250.8,
+      "disk_delta_mib": 59.1,
+      "setup_secs": 0.02,
+      "load_secs": 72.453,
+      "load_ops_s": 1380,
+      "read_ops_s": 4764
+    },
+    "postgres": {
+      "version": "PostgreSQL 16.15 (Ubuntu 16.15-1.pgdg24.04+2) on x86_64-pc-linux-gnu",
+      "idle_pss_mib": 21.8,
+      "peak_pss_mib": 54.7,
+      "idle_rss_mib": 70.0,
+      "peak_rss_mib": 141.7,
+      "disk_baseline_mib": 45.6,
+      "disk_after_mib": 101.7,
+      "disk_delta_mib": 56.1,
+      "setup_secs": 0.12,
+      "load_secs": 24.604,
+      "load_ops_s": 4064,
+      "read_ops_s": 6971
+    }
+  }
+}
