@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="ru">
+<html lang="ru" data-theme="light">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -7,10 +7,28 @@
 <meta name="description" content="DNA-DB Enterprise v4.0.0-GA — LSM-движок на Rust: DnaQL, SQL 32/32 (JOIN/UNION/CTE/оконные/UPSERT/транзакции), pgwire (PostgreSQL protocol), Raft-кластер, S3-тиринг, PITR, TLS 1.3/Argon2id, RS(4+2) самовосстановление, Prometheus, Kubernetes. Бенчмарки против MySQL 8.4 и PostgreSQL 17.">
 <style>
 :root{
+  /* light theme (default) */
+  color-scheme:light;
+  --bg:#f4f8fb; --bg2:#eaf1f7; --panel:#ffffff; --panel2:#edf3f9;
+  --line:#d3dfe9; --text:#223742; --muted:#51677a; --dim:#7d94a6;
+  --accent:#1f6c92; --accent2:#188a52; --gold:#b45309; --red:#b42323;
+  --code:#eef4f9; --code-text:#163a4f; --code-inline:#155e83; --code-key:#0e6b93;
+  --nav-bg:rgba(244,248,251,.9);
+  --hero-g1:rgba(31,108,146,.10); --hero-g2:rgba(24,138,82,.07);
+  --ok-bg:rgba(24,138,82,.10); --ok-border:rgba(24,138,82,.42); --ok-text:#15803d;
+  --img-bg:#ffffff; --lb-bg:rgba(15,23,32,.93);
+}
+html[data-theme="dark"]{
+  /* dark theme */
+  color-scheme:dark;
   --bg:#070b16; --bg2:#0a1020; --panel:#0d1428; --panel2:#111a33;
   --line:#1c2a4a; --text:#dbe4ff; --muted:#8fa0c9; --dim:#5f6f99;
   --accent:#39d0ff; --accent2:#22c55e; --gold:#f59e0b; --red:#f87171;
-  --code:#0a0f1e;
+  --code:#0a0f1e; --code-text:#c9e4ff; --code-inline:#9fd8ff; --code-key:#7dd3fc;
+  --nav-bg:rgba(7,11,22,.86);
+  --hero-g1:rgba(57,208,255,.14); --hero-g2:rgba(34,197,94,.10);
+  --ok-bg:rgba(34,197,94,.12); --ok-border:rgba(34,197,94,.4); --ok-text:#4ade80;
+  --img-bg:#ffffff; --lb-bg:rgba(4,7,14,.92);
 }
 *{margin:0;padding:0;box-sizing:border-box}
 html{scroll-behavior:smooth}
@@ -24,35 +42,35 @@ h3{font-size:19px;margin:22px 0 10px;color:var(--text)}
 .lead{color:var(--muted);font-size:16.5px;max-width:820px;margin-bottom:14px}
 .note{color:var(--dim);font-size:13.5px;margin:10px 0 4px}
 section{padding:64px 0 30px}
-code{background:var(--code);border:1px solid var(--line);border-radius:5px;padding:1px 6px;font-size:.92em;color:#9fd8ff}
-pre{background:var(--code);border:1px solid var(--line);border-radius:12px;padding:16px 18px;overflow-x:auto;font-size:13.5px;line-height:1.55;margin:12px 0 8px;color:#c9e4ff}
+code{background:var(--code);border:1px solid var(--line);border-radius:5px;padding:1px 6px;font-size:.92em;color:var(--code-inline)}
+pre{background:var(--code);border:1px solid var(--line);border-radius:12px;padding:16px 18px;overflow-x:auto;font-size:13.5px;line-height:1.55;margin:12px 0 8px;color:var(--code-text)}
 pre .c{color:var(--dim)}
-pre .k{color:#7dd3fc}
+pre .k{color:var(--code-key)}
 
 /* language visibility */
 html[lang="ru"] .en{display:none}
 html[lang="en"] .ru{display:none}
 
 /* nav */
-nav{position:sticky;top:0;z-index:50;background:rgba(7,11,22,.86);backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
-.nav-in{display:flex;align-items:center;gap:18px;height:58px}
-.logo{display:flex;align-items:center;gap:10px;font-weight:700;font-size:17px;white-space:nowrap;color:var(--text)}
+nav{position:sticky;top:0;z-index:50;background:var(--nav-bg);backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
+.nav-in{display:flex;align-items:center;gap:12px;height:58px}
+.logo{display:flex;align-items:center;gap:9px;font-weight:700;font-size:16px;white-space:nowrap;color:var(--text)}
 .logo .dna{font-size:20px}
 .logo b{color:var(--accent)}
-nav .links{display:flex;gap:15px;margin-left:auto;flex-wrap:wrap}
-nav .links a{color:var(--muted);font-size:13.5px;white-space:nowrap}
+nav .links{display:flex;gap:11px;margin-left:auto;flex-wrap:wrap}
+nav .links a{color:var(--muted);font-size:13px;white-space:nowrap}
 nav .links a:hover{color:var(--accent);text-decoration:none}
 .lang-btn{background:var(--panel2);border:1px solid var(--line);color:var(--text);border-radius:8px;padding:4px 12px;font-size:13px;cursor:pointer;margin-left:6px}
 .lang-btn:hover{border-color:var(--accent)}
 
 /* hero */
 header{padding:80px 0 60px;background:
-  radial-gradient(800px 380px at 15% -10%, rgba(57,208,255,.14), transparent 60%),
-  radial-gradient(700px 340px at 90% 0%, rgba(34,197,94,.10), transparent 60%),
+  radial-gradient(800px 380px at 15% -10%, var(--hero-g1), transparent 60%),
+  radial-gradient(700px 340px at 90% 0%, var(--hero-g2), transparent 60%),
   var(--bg)}
 h1{font-size:42px;line-height:1.15;letter-spacing:-.5px}
 h1 .accent{color:var(--accent)}
-.ver{display:inline-block;background:rgba(34,197,94,.12);border:1px solid rgba(34,197,94,.4);color:#4ade80;font-size:13px;border-radius:999px;padding:3px 12px;margin-bottom:18px;letter-spacing:.4px}
+.ver{display:inline-block;background:var(--ok-bg);border:1px solid var(--ok-border);color:var(--ok-text);font-size:13px;border-radius:999px;padding:3px 12px;margin-bottom:18px;letter-spacing:.4px}
 .sub{color:var(--muted);font-size:17.5px;max-width:800px;margin:18px 0 22px}
 .badges{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:28px}
 .badge{font-size:12.5px;color:var(--muted);border:1px solid var(--line);background:var(--panel);border-radius:8px;padding:4px 10px}
@@ -78,12 +96,12 @@ h1 .accent{color:var(--accent)}
 .feat h3{margin:8px 0 6px;font-size:16.5px}
 .feat p{color:var(--muted);font-size:14px}
 .feat code{font-size:.88em}
-.feat .new{display:inline-block;background:rgba(34,197,94,.14);border:1px solid rgba(34,197,94,.45);color:#4ade80;border-radius:6px;font-size:10.5px;padding:1px 7px;letter-spacing:.5px;vertical-align:2px;margin-left:6px}
+.feat .new{display:inline-block;background:var(--ok-bg);border:1px solid var(--ok-border);color:var(--ok-text);border-radius:6px;font-size:10.5px;padding:1px 7px;letter-spacing:.5px;vertical-align:2px;margin-left:6px}
 
 /* data table */
 table.data{width:100%;border-collapse:collapse;font-size:14px;margin:16px 0 8px}
 table.data th{color:var(--dim);font-weight:600;text-align:left;border-bottom:1px solid var(--line);padding:8px 10px}
-table.data td{border-bottom:1px solid rgba(28,42,74,.55);padding:8px 10px;color:var(--muted)}
+table.data td{border-bottom:1px solid var(--line);padding:8px 10px;color:var(--muted)}
 table.data td.best{color:var(--accent2);font-weight:700}
 table.data td b{color:var(--text)}
 
@@ -97,7 +115,7 @@ table.data td b{color:var(--text)}
 /* charts / screenshots */
 .shots,.chart-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px;margin-top:10px}
 .shot,.chart-grid figure{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:10px;cursor:zoom-in}
-.shot img,.chart-grid img{width:100%;display:block;border-radius:8px;background:#fff}
+.shot img,.chart-grid img{width:100%;display:block;border-radius:8px;background:var(--img-bg)}
 figcaption{color:var(--muted);font-size:13px;padding:8px 4px 2px;text-align:center}
 
 /* tests */
@@ -125,7 +143,7 @@ footer{border-top:1px solid var(--line);margin-top:50px;padding:30px 0 40px;colo
 footer .f1{margin-bottom:6px}
 
 /* lightbox */
-#lb{position:fixed;inset:0;background:rgba(4,7,14,.92);display:none;align-items:center;justify-content:center;z-index:100;cursor:zoom-out;padding:24px}
+#lb{position:fixed;inset:0;background:var(--lb-bg);display:none;align-items:center;justify-content:center;z-index:100;cursor:zoom-out;padding:24px}
 #lb.open{display:flex}
 #lb img{max-width:96vw;max-height:92vh;border-radius:10px;box-shadow:0 10px 60px rgba(0,0,0,.7)}
 
@@ -152,6 +170,7 @@ footer .f1{margin-bottom:6px}
       <a href="https://github.com/nsmykh70-creator/dna-db-core">GitHub ↗</a>
     </div>
     <button class="lang-btn" id="lang">EN</button>
+    <button class="lang-btn" id="theme" title="Тема / Theme" aria-label="Toggle theme">🌙</button>
   </div>
 </nav>
 
@@ -422,6 +441,18 @@ btn.addEventListener('click', function(){
   setLang(document.documentElement.lang === 'ru' ? 'en' : 'ru');
 });
 try { var saved = localStorage.getItem('dnadb_lang'); if (saved) setLang(saved); } catch(e){}
+
+// theme toggle (light by default, dark optional)
+var tbtn = document.getElementById('theme');
+function setTheme(t){
+  document.documentElement.setAttribute('data-theme', t === 'dark' ? 'dark' : 'light');
+  tbtn.textContent = (t === 'dark') ? '☀️' : '🌙';
+  try { localStorage.setItem('dnadb_theme', t); } catch(e){}
+}
+tbtn.addEventListener('click', function(){
+  setTheme(document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark');
+});
+try { var savedTheme = localStorage.getItem('dnadb_theme'); setTheme(savedTheme === 'dark' ? 'dark' : 'light'); } catch(e){ setTheme('light'); }
 
 // lightbox for screenshots and charts
 var lb = document.getElementById('lb'), lbImg = document.getElementById('lb-img');
