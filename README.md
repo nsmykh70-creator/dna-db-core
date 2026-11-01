@@ -101,7 +101,7 @@ A general-purpose, high-performance embeddable and client/server database engine
 | `LIMIT` / `OFFSET` | pagination | used by the web panel |
 | **Secondary indexes** | `CREATE INDEX idx ON t (col)` / `DROP INDEX` — stored in the schema, honoured by DML | index unit tests |
 | **IndexScan plans** | equality/`IN`/range on an indexed column → `IndexScan(...)` instead of `SeqScan` | plan unit tests |
-| **Web panel** | `serve --admin-port 8080`: overview/health + disk-usage card, tables + paginated browser with per-row `SHOW STORAGE` (🔬), indexes, SQL and DnaQL consoles, SQL → DnaQL explain block, online compaction (admin), user administration | HTTPS/API integration + security probe |
+| **Web panel** | `serve --admin-port 8080`: overview/health + disk-usage & compaction cards, tables + paginated browser with per-row `SHOW STORAGE` (🔬) and a one-click `STORAGE_MAP` hand-off to the DnaQL console, indexes, SQL and DnaQL consoles, SQL → DnaQL explain block, online compaction (admin) with the on-disk history journal, user administration | HTTPS/API integration + security probe |
 | **Row editing** | click a row → modal dialog (phpMyAdmin-style): schema-driven fields, NULL checkboxes, live SQL preview, UPDATE/DELETE with confirmation | manual e2e scenario in the browser |
 | **SQL tokenizer** | negative numbers (`-25.5`) and standard quote escaping (`'O''Brien'`) | `tokenizer_negative_numbers_and_escaped_quotes`, `update_with_negative_and_quoted_values` |
 
@@ -177,7 +177,7 @@ A high-performance embeddable and client/server database engine written in Rust,
 | Atomic transactions | batched WAL write (one fsync = one atomic interval) | `write_batch_is_atomic_on_recovery` |
 | DnaQL (Standard + Quick) | tokenizer → parser → executor over real storage | 8 unit tests + live smoke |
 | SQL subset | SELECT/JOIN(WHERE/IN-subqueries)/GROUP BY/HAVING/ORDER BY/LIMIT/OFFSET, aggregates, INSERT, UPDATE, DELETE (CASCADE), CREATE/DROP TABLE, **CREATE/DROP INDEX + IndexScan** | 40+ unit tests |
-| Web admin panel | HTTPS + SPA (no external dependencies): overview, tables, SQL/DnaQL consoles, user management, explain/compact/disk-size API | `admin::tests::panel_requires_auth_and_serves_api`, `admin::tests::panel_explain_compact_and_disk_size` + `scripts/security_probe.py` |
+| Web admin panel | HTTPS + SPA (no external dependencies): overview, tables, SQL/DnaQL consoles, user management, explain/compact/disk-size API, compaction history (`GET /api/compactions`) and Prometheus compaction gauges (`/metrics`) | `admin::tests::panel_requires_auth_and_serves_api`, `admin::tests::panel_explain_compact_and_disk_size` + `scripts/security_probe.py` |
 | Bitap/Myers fuzzy search | correct Wu-Manber, **true** distance, Levenshtein + Hamming | 8000-case fuzz vs a reference DP |
 | Bio plugins | real Smith-Waterman, PAM scanner, ORF-finder, GC windows | unit tests |
 | TCP server | thread-per-connection, TLS, 16 MiB frame cap (64 KiB pre-auth), Argon2id, persistent IP/username lockout | unit tests + `scripts/security_probe.py` |
@@ -259,6 +259,10 @@ TX {
 
 -- Bio analysis
 ANALYZE SEQUENCE 'CGCGCGATCGATCGCGC' |> GC_CONTENT() |> MELTING_TEMP() |> REV_COMP() |> TRANSLATE();
+
+-- Physical storage map of one row (v4.1): which memtable layer / DNASST02
+-- segment holds it, with on-disk bytes and RS(k+m) geometry
+ANALYZE LOCUS chr_users:14 |> STORAGE_MAP();
 ```
 
 `LINK VIA COMPLEMENT` is an O(1) direct key-seek on the primary key of the target chromosome (no hash join).
@@ -294,6 +298,10 @@ DROP INDEX idx_orders_status ON chr_orders;
 UPDATE chr_users SET balance = 950.00 WHERE user_id = 14;
 DELETE FROM chr_users WHERE user_id = 14;   -- cascades to chr_orders
 DROP TABLE chr_orders;
+
+-- Physical storage map (v4.1): where does a row live on disk?
+SHOW STORAGE FOR chr_users WHERE user_id = 14;
+SHOW STORAGE FOR chr_orders;
 ```
 INSERT supports two forms: positional `(cols) VALUES (vals)` and typed `(col = val, ...)`.
 
@@ -302,6 +310,27 @@ everything else is an honest `SeqScan` with a filter. JOIN runs as a hash join o
 The plan shows what actually happens: `SeqScan(t) -> InnerHashJoin(a.x, b.y) -> Filter(...) -> Project([...])`.
 
 Full SQL manual: [docs/SQL_MANUAL.md](docs/SQL_MANUAL.md).
+
+### 4.1. Physical storage maps & compaction (v4.1)
+
+- `SHOW STORAGE FOR <table> [WHERE <pk> = <value>]` (SQL) and
+  `ANALYZE LOCUS <table>:<pk> |> STORAGE_MAP();` (DnaQL) show exactly
+  where a row lives — the panel's 🔬 button on any row opens the SQL view
+  and hands the equivalent DnaQL command to the DnaQL console in one
+  click.
+- **Compaction** (merge all segments, drop shadowed versions + consumed
+  tombstones, delete superseded files; readers keep working):
+  - panel: Обзор → **Обслуживание** → **🧬 Компакция** (admin), with the
+    data-dir size before → after and the **compaction history** table;
+  - CLI: `dna-db-core compact --data-dir DATA` (offline; refuses a live
+    dir);
+  - every run is tagged (`panel:<user>` / `manual` / `auto`) and appended
+    to `DATA/compaction_history.jsonl` (capped at 500 records;
+    `GET /api/compactions` in the panel) and exported to Prometheus:
+    `dnadb_compactions_total`, `dnadb_compaction_bytes_before/after/saved`,
+    `dnadb_compaction_last_duration_seconds`,
+    `dnadb_compaction_last_success_timestamp_seconds`,
+    `dnadb_data_dir_bytes`.
 
 ## 5. Durability
 

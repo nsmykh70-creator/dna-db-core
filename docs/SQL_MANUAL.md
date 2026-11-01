@@ -68,15 +68,20 @@ ssh -L 8080:127.0.0.1:8080 user@db-host
 
 ![Overview](screenshots/panel-02-dashboard.png)
 
-Four blocks:
+Five blocks:
 
-- **Cards**: segments, memtable/WAL size, operation counters, "lesions"
-  found and repaired, mirror rescues, uptime.
+- **Cards**: segments, memtable/WAL size, «Данные на диске» (whole data
+  directory), compaction counter, operation counters, "lesions" found and
+  repaired, mirror rescues, uptime.
 - **Engine metrics** — all real counters from `stats.summary()`
   (puts/gets/deletes, bytes, flush/compaction, average latencies).
 - **Diagnostics** — a snapshot of `Engine::health()`: Reed–Solomon
   geometry, lesion counters, mirror status, repair policy, scrubber
   progress.
+- **Обслуживание** (maintenance) — the 🧬 **Компакция** button (admin)
+  runs an online full compaction and reports the data-dir size
+  before → after; below it the **compaction history** table renders the
+  on-disk journal (see 3.3b).
 
 ### 2.3. Tables (browser)
 
@@ -91,6 +96,11 @@ Four blocks:
 - **CREATE INDEX** — name + column → `CREATE INDEX … ON t (col)`;
 - the ✕ on an index chip → `DROP INDEX`;
 - "Open in SQL console" inserts `SELECT * FROM … LIMIT 50`;
+- **🔬 per row** — opens the physical storage map
+  (`SHOW STORAGE FOR <table> WHERE <pk> = …`) in a modal; the modal's
+  «🧬 STORAGE_MAP в DnaQL-консоли» button hands the equivalent
+  `ANALYZE LOCUS <table>:<pk> |> STORAGE_MAP();` to the DnaQL console and
+  runs it (see 3.3a);
 - **clicking a row** → the edit modal (see 2.4).
 
 ### 2.4. Row editing (modal dialog)
@@ -128,6 +138,14 @@ in ms, row/column counts and the message. Errors appear in a separate
 red block (for example an FK violation). The example buttons at the
 bottom are ready-made queries.
 
+**v4.1:** the **SQL → DnaQL** button translates the current statement into
+its DnaQL form (the same transpiler as the `sql2dnaql` CLI) and shows the
+physical storage map — chromosome, locus, storage key and RowCodec
+representation — **without executing anything** (`POST /api/explain`);
+it is also shown automatically after every mutating statement. `SHOW
+STORAGE` is SQL-only: the explain block names the DnaQL equivalent
+(`ANALYZE LOCUS <table>:<pk> |> STORAGE_MAP()`) instead of translating it.
+
 ### 2.6. DnaQL console
 
 ![DnaQL](screenshots/panel-05-dnaql.png)
@@ -137,6 +155,12 @@ bottom are ready-made queries.
 `VERIFY CHROMOSOME …` — everything described in
 [DNAQL_MANUAL.md](DNAQL_MANUAL.md).
 
+**v4.1:** the STORAGE_MAP mode — `ANALYZE LOCUS <table>:<pk> |> STORAGE_MAP();`
+shows the physical storage map of one row (see
+[DNAQL_MANUAL.md](DNAQL_MANUAL.md), "Locus storage map"). The 🔬 button of
+a table row (browser) can hand this exact command over to the DnaQL
+console in one click.
+
 ### 2.7. Panel HTTP API
 
 For scripts and integrations (every route except `/` and `/api/login`
@@ -145,10 +169,15 @@ requires `Authorization: Bearer <token>`):
 | Method | Path | Body/params | Response |
 |---|---|---|---|
 | POST | `/api/login` | `{"user","pass"}` | `{"token","user"}` |
-| GET | `/api/health` | — | `{health, stats, segments, memtable_bytes, wal_bytes, data_dir}` |
+| GET | `/api/health` | — | `{health, stats, segments, memtable_bytes, wal_bytes, data_dir, data_dir_bytes}` |
 | GET | `/api/tables` | — | `{tables: [{name, columns, pk, fks, indexes}]}` |
 | GET | `/api/browse` | `?table=&limit=&offset=` | `{columns, rows, total, plan, time_us}` |
 | POST | `/api/query` | `{"kind":"sql"\|"dnaql","query":…}` | `{columns, rows, plan, time_us, …}` |
+| POST | `/api/explain` (v4.1) | `{"query":…}` (SQL) | `{dnaql, dnaql_error, storage, storage_error}` — SQL → DnaQL + the physical map, nothing is executed |
+| POST | `/api/compact` (v4.1, admin) | `{}` | `{ran, before_bytes, after_bytes, freed_bytes, removed_files, record}` — online compaction, tagged `panel:<user>` |
+| GET | `/api/compactions` (v4.1, admin) | — | `{compactions: […], count, history_file}` — the on-disk journal, newest first |
+| GET | `/api/me` | — | `{user, role, allowed_tables, must_change}` |
+| GET | `/metrics` (no auth) | — | Prometheus text 0.0.4 — engine counters plus `dnadb_compactions_total`, `dnadb_compaction_bytes_before/after/saved`, `dnadb_compaction_last_duration_seconds`, `dnadb_compaction_last_success_timestamp_seconds`, `dnadb_data_dir_bytes` |
 
 ```bash
 TOKEN=$(curl -s -X POST http://127.0.0.1:8080/api/login \
@@ -286,6 +315,24 @@ SHOW STORAGE FOR chr_orders WHERE order_id = 1042;
 The PK-only filter addresses a single locus, exactly like DnaQL
 (`<chromosome>:<locus>`); filtering by a non-PK column is rejected.
 The DnaQL equivalent: `ANALYZE LOCUS chr_orders:1042 |> STORAGE_MAP();`.
+
+### 3.3b. Compaction — storage maintenance & history (v4.1)
+
+Compaction merges all segments into one, drops shadowed versions and
+consumed tombstones and deletes the superseded files; readers keep working
+(read snapshots, atomic segment swap) — the `shadowed` rows that
+`SHOW STORAGE` reports are exactly its food.
+
+| How | Command / control | Access |
+|---|---|---|
+| web panel | Обзор → **Обслуживание** → **🧬 Компакция** (reports bytes before → after; on a single-segment dir: «компакция не требуется») | admin role |
+| HTTP API | `POST /api/compact` (empty JSON body), `GET /api/compactions` | admin role |
+| CLI (offline) | `dna-db-core compact --data-dir DATA` | refuses a locked (live) data dir |
+| history | `DATA/compaction_history.jsonl` (capped at 500 records): `ts_unix, trigger, segments_before/after, bytes_before/after, saved_bytes, duration_ms`; panel renders it under «Обслуживание» | — |
+| Prometheus | `dnadb_compactions_total`, `dnadb_compaction_bytes_before/after/saved`, `dnadb_compaction_last_duration_seconds`, `dnadb_compaction_last_success_timestamp_seconds`, `dnadb_data_dir_bytes` | `GET /metrics` |
+
+Every completed run is tagged with its trigger — `panel:<user>`, `manual`
+(engine/CLI) or `auto` — so the history shows who compacted what and when.
 
 ### 3.4. Secondary indexes and plans
 

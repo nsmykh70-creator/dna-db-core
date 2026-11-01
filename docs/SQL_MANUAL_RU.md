@@ -66,14 +66,18 @@ ssh -L 8080:127.0.0.1:8080 user@db-host
 
 ![Обзор](screenshots/panel-02-dashboard.png)
 
-Четыре блока:
+Пять блоков:
 
-- **Карточки**: сегменты, размер memtable/WAL, счётчик операций, найденные и
+- **Карточки**: сегменты, размер memtable/WAL, «Данные на диске» (весь
+  каталог данных), счётчик компакций, счётчик операций, найденные и
   исправленные «лезии», rescue-ы зеркала, аптайм.
 - **Показатели движка** — все реальные счётчики `stats.summary()`
   (puts/gets/deletes, байты, flush/compaction, средние латентности).
 - **Диагностика** — снимок `Engine::health()`: геометрия Reed–Solomon,
   счётчики lesions, статус зеркала, политика репарации, прогресс scrubber'а.
+- **Обслуживание** — кнопка **🧬 Компакция** (только admin) запускает
+  онлайн-компакцию и показывает размер каталога до → после; под ней —
+  таблица **истории компакций** из дискового журнала (см. 3.3b).
 
 ### 2.3. Таблицы (браузер)
 
@@ -87,6 +91,11 @@ ssh -L 8080:127.0.0.1:8080 user@db-host
 - **CREATE INDEX** — имя + колонка → `CREATE INDEX … ON t (col)`;
 - крестик на чипе индекса → `DROP INDEX`;
 - «Открыть в SQL-консоли» — подставляет `SELECT * FROM … LIMIT 50`;
+- **🔬 у каждой строки** — открывает физическую карту хранения
+  (`SHOW STORAGE FOR <таблица> WHERE <pk> = …`) в модальном окне; кнопка
+  «🧬 STORAGE_MAP в DnaQL-консоли» передаёт эквивалентную команду
+  `ANALYZE LOCUS <таблица>:<pk> |> STORAGE_MAP();` в DnaQL-консоль и
+  выполняет её (см. 3.3a);
 - **клик по строке** → модальное окно редактирования (см. 2.4).
 
 ### 2.4. Редактирование строки (модальное окно)
@@ -122,6 +131,14 @@ ssh -L 8080:127.0.0.1:8080 user@db-host
 строк/колонок и сообщение. Ошибки выводятся отдельным красным блоком
 (например, нарушение FK). Кнопки-примеры внизу — готовые запросы.
 
+**v4.1:** кнопка **SQL → DnaQL** транслирует текущее выражение в
+DnaQL-форму (тот же транслятор, что у CLI `sql2dnaql`) и показывает
+физическую карту хранения — хромосому, локус, ключ и RowCodec-
+представление — **ничего не выполняя** (`POST /api/explain`); блок также
+появляется автоматически после каждой изменяющей команды. `SHOW STORAGE`
+— SQL-only: explain-блок называет DnaQL-эквивалент
+(`ANALYZE LOCUS <таблица>:<pk> |> STORAGE_MAP()`), а не транслирует его.
+
 ### 2.6. DnaQL-консоль
 
 ![DnaQL](screenshots/panel-05-dnaql.png)
@@ -131,6 +148,12 @@ ssh -L 8080:127.0.0.1:8080 user@db-host
 `VERIFY CHROMOSOME …` — всё, что описано в
 [DNAQL_MANUAL_RU.md](DNAQL_MANUAL_RU.md).
 
+**v4.1:** режим STORAGE_MAP — `ANALYZE LOCUS <таблица>:<pk> |> STORAGE_MAP();`
+показывает физическую карту хранения строки (см.
+[DNAQL_MANUAL_RU.md](DNAQL_MANUAL_RU.md), «Карта хранения локуса»).
+Кнопка 🔬 у строки таблицы передаёт эту команду в DnaQL-консоль одним
+кликом.
+
 ### 2.7. HTTP API панели
 
 Для скриптов и интеграций (все маршруты, кроме `/` и `/api/login`,
@@ -139,10 +162,15 @@ ssh -L 8080:127.0.0.1:8080 user@db-host
 | Метод | Путь | Тело/параметры | Ответ |
 |---|---|---|---|
 | POST | `/api/login` | `{"user","pass"}` | `{"token","user"}` |
-| GET | `/api/health` | — | `{health, stats, segments, memtable_bytes, wal_bytes, data_dir}` |
+| GET | `/api/health` | — | `{health, stats, segments, memtable_bytes, wal_bytes, data_dir, data_dir_bytes}` |
 | GET | `/api/tables` | — | `{tables: [{name, columns, pk, fks, indexes}]}` |
 | GET | `/api/browse` | `?table=&limit=&offset=` | `{columns, rows, total, plan, time_us}` |
 | POST | `/api/query` | `{"kind":"sql"\|"dnaql","query":…}` | `{columns, rows, plan, time_us, …}` |
+| POST | `/api/explain` (v4.1) | `{"query":…}` (SQL) | `{dnaql, dnaql_error, storage, storage_error}` — SQL → DnaQL + физическая карта, без выполнения |
+| POST | `/api/compact` (v4.1, admin) | `{}` | `{ran, before_bytes, after_bytes, freed_bytes, removed_files, record}` — онлайн-компакция, метка `panel:<user>` |
+| GET | `/api/compactions` (v4.1, admin) | — | `{compactions: […], count, history_file}` — дисковый журнал, новые сверху |
+| GET | `/api/me` | — | `{user, role, allowed_tables, must_change}` |
+| GET | `/metrics` (без авторизации) | — | Prometheus text 0.0.4 — счётчики движка плюс `dnadb_compactions_total`, `dnadb_compaction_bytes_before/after/saved`, `dnadb_compaction_last_duration_seconds`, `dnadb_compaction_last_success_timestamp_seconds`, `dnadb_data_dir_bytes` |
 
 ```bash
 TOKEN=$(curl -s -X POST http://127.0.0.1:8080/api/login \
@@ -282,6 +310,25 @@ SHOW STORAGE FOR chr_orders WHERE order_id = 1042;
 Фильтр только по PK — это адрес отдельного локуса, как в DnaQL
 (`<хромосома>:<локус>`); фильтр по обычной колонке отклоняется.
 Эквивалент в DnaQL: `ANALYZE LOCUS chr_orders:1042 |> STORAGE_MAP();`.
+
+### 3.3b. Компакция — обслуживание хранилища и история (v4.1)
+
+Компакция сливает все сегменты в один, убирает затёртые версии и
+потреблённые надгробия и удаляет устаревшие файлы; читатели продолжают
+работать (снимки чтения, атомарная подмена) — «затенённые» строки,
+которые показывает `SHOW STORAGE`, ровно её «пища».
+
+| Как | Команда / управление | Доступ |
+|---|---|---|
+| веб-панель | Обзор → **Обслуживание** → **🧬 Компакция** (показывает байты до → после; если сегмент один: «компакция не требуется») | роль admin |
+| HTTP API | `POST /api/compact` (пустое JSON-тело), `GET /api/compactions` | роль admin |
+| CLI (офлайн) | `dna-db-core compact --data-dir DATA` | отказывается от занятого (живого) каталога данных |
+| история | `DATA/compaction_history.jsonl` (не более 500 записей): `ts_unix, trigger, segments_before/after, bytes_before/after, saved_bytes, duration_ms`; панель рисует её в «Обслуживании» | — |
+| Prometheus | `dnadb_compactions_total`, `dnadb_compaction_bytes_before/after/saved`, `dnadb_compaction_last_duration_seconds`, `dnadb_compaction_last_success_timestamp_seconds`, `dnadb_data_dir_bytes` | `GET /metrics` |
+
+Каждый завершённый запуск помечен триггером — `panel:<user>`, `manual`
+(движок/CLI) или `auto`, — поэтому история показывает, кто, когда и
+зачем запускал компакцию.
 
 ### 3.4. Secondary-индексы и планы
 

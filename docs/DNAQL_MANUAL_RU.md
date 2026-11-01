@@ -123,6 +123,12 @@ ANALYZE LOCUS chr_orders:1042 |> STORAGE_MAP();
 -- STORAGE_MAP chr_orders  1042   chr_orders:1042   status   TEXT      PENDING  RowCodec tag 3: UTF-8 text, u32 length + 7 B
 ```
 
+**Веб-панель (v4.1):** кнопка 🔬 у каждой строки браузера таблиц открывает
+SQL-вид `SHOW STORAGE` этой строки; её кнопка «🧬 STORAGE_MAP в
+DnaQL-консоли» подставляет ровно эту команду `ANALYZE LOCUS <таблица>:<pk>
+|> STORAGE_MAP();` в DnaQL-консоль и выполняет её — та же физическая карта
+в терминах DnaQL, в один клик из любой консоли.
+
 ---
 
 ## Глава 4. Шпаргалка Rosetta Stone: SQL vs DnaQL

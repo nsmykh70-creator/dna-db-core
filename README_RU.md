@@ -91,7 +91,7 @@
 | `LIMIT` / `OFFSET` | пагинация | веб-панель использует |
 | **Secondary-индексы** | `CREATE INDEX idx ON t (col)` / `DROP INDEX` — хранятся в схеме, поддерживаются при DML | unit-тесты индексов |
 | **IndexScan-планы** | равенство/`IN`/диапазон по индексированной колонке → `IndexScan(...)` вместо `SeqScan` | unit-тесты планов |
-| **Веб-панель** | `serve --admin-port 8080`: обзор/здоровье, таблицы + браузер с пагинацией, индексы, SQL- и DnaQL-консоли, управление пользователями | HTTPS/API-интеграция + `scripts/security_probe.py` |
+| **Веб-панель** | `serve --admin-port 8080`: обзор/здоровье + карточки «Данные на диске» и компакций, таблицы + браузер с пагинацией, 🔬 у каждой строки (SHOW STORAGE) с передачей `STORAGE_MAP` в DnaQL-консоль одним кликом, индексы, SQL- и DnaQL-консоли, блок SQL → DnaQL, онлайн-компакция (admin) с дисковым журналом истории, управление пользователями | HTTPS/API-интеграция + `scripts/security_probe.py` |
 | **Редактирование строк** | клик по строке → модальное окно (phpMyAdmin-стиль): поля по схеме, NULL-галочки, живое SQL-превью, UPDATE/DELETE с подтверждением | ручной e2e-сценарий в браузере |
 | **Токенизатор SQL** | отрицательные числа (`-25.5`) и экранирование кавычек по стандарту (`'O''Brien'`) | `tokenizer_negative_numbers_and_escaped_quotes`, `update_with_negative_and_quoted_values` |
 
@@ -168,7 +168,7 @@ cargo build --release
 | Атомарные транзакции | batch-запись WAL (один fsync = один атомарный интервал) | `write_batch_is_atomic_on_recovery` |
 | DnaQL (Standard + Quick) | токенайзер → парсер → исполнитель над реальным хранилищем | 8 unit-тестов + живой smoke |
 | SQL-подмножество | SELECT/JOIN(WHERE/IN-подзапросы)/GROUP BY/HAVING/ORDER BY/LIMIT/OFFSET, агрегаты, INSERT, UPDATE, DELETE (CASCADE), CREATE/DROP TABLE, **CREATE/DROP INDEX + IndexScan** | 40+ unit-тестов |
-| Веб-панель администрирования | HTTP/1.1 + SPA (без внешних зависимостей): обзор, таблицы, консоли SQL/DnaQL | `admin::tests::panel_requires_auth_and_serves_api` |
+| Веб-панель администрирования | HTTP/1.1 + SPA (без внешних зависимостей): обзор, таблицы, консоли SQL/DnaQL, explain/compact/disk-size API, история компакций (`GET /api/compactions`) и Prometheus-метрики компакции (`/metrics`) | `admin::tests::panel_requires_auth_and_serves_api`, `admin::tests::panel_explain_compact_and_disk_size` |
 | Bitap/Myers нечёткий поиск | корректный Wu-Manber, **истинная** дистанция, Levenshtein + Hamming | фаззинг 8000 кейсов vs эталонный DP |
 | Bio-плагины | настоящий Smith-Waterman, PAM-сканер, ORF-finder, GC-окна | unit-тесты |
 | TCP-сервер | thread-per-connection, TLS, фреймы 16 MiB (64 KiB до auth), Argon2id, персистентный IP/username-lockout | unit-тесты + `scripts/security_probe.py` |
@@ -253,6 +253,10 @@ TX {
 
 -- Био-анализ
 ANALYZE SEQUENCE 'CGCGCGATCGATCGCGC' |> GC_CONTENT() |> MELTING_TEMP() |> REV_COMP() |> TRANSLATE();
+
+-- Физическая карта строки (v4.1): какой memtable-слой / сегмент DNASST02
+-- хранит её, с размерами на диске и геометрией RS(k+m)
+ANALYZE LOCUS chr_users:14 |> STORAGE_MAP();
 ```
 
 `LINK VIA COMPLEMENT` — это O(1) прямой key-seek по первичному ключу целевой хромосомы (никаких hash join).
@@ -288,6 +292,10 @@ DROP INDEX idx_orders_status ON chr_orders;
 UPDATE chr_users SET balance = 950.00 WHERE user_id = 14;
 DELETE FROM chr_users WHERE user_id = 14;   -- каскад по chr_orders
 DROP TABLE chr_orders;
+
+-- Физическая карта хранения (v4.1): где строка живёт на диске?
+SHOW STORAGE FOR chr_users WHERE user_id = 14;
+SHOW STORAGE FOR chr_orders;
 ```
 INSERT поддерживает две формы: позиционную `(cols) VALUES (vals)` и типизированную `(col = val, ...)`.
 Доступ по первичному ключу — point-lookup (bloom + sparse index), по secondary-индексу — `IndexScan`;
@@ -295,6 +303,28 @@ INSERT поддерживает две формы: позиционную `(cols
 В планах видно, что реально сделано: `SeqScan(t) -> InnerHashJoin(a.x, b.y) -> Filter(...) -> Project([...])`.
 
 Полный SQL-мануал: [docs/SQL_MANUAL_RU.md](docs/SQL_MANUAL_RU.md).
+
+### 4.1. Физические карты хранения и компакция (v4.1)
+
+- `SHOW STORAGE FOR <таблица> [WHERE <pk> = <значение>]` (SQL) и
+  `ANALYZE LOCUS <таблица>:<pk> |> STORAGE_MAP();` (DnaQL) показывают,
+  где именно лежит строка; кнопка 🔬 панели у любой строки открывает
+  SQL-вид и одним кликом передаёт DnaQL-эквивалент в DnaQL-консоль.
+- **Компакция** (слить все сегменты, убрать затёртые версии и
+  потреблённые надгробия, удалить устаревшие файлы; читатели не
+  блокируются):
+  - панель: Обзор → **Обслуживание** → **🧬 Компакция** (admin) с размером
+    каталога до → после и таблицей **истории компакций**;
+  - CLI: `dna-db-core compact --data-dir DATA` (офлайн; отказывается от
+    живого каталога);
+  - каждый запуск помечается триггером (`panel:<user>` / `manual` /
+    `auto`), пишется в `DATA/compaction_history.jsonl` (не более 500
+    записей; `GET /api/compactions` в панели) и экспортируется в
+    Prometheus: `dnadb_compactions_total`,
+    `dnadb_compaction_bytes_before/after/saved`,
+    `dnadb_compaction_last_duration_seconds`,
+    `dnadb_compaction_last_success_timestamp_seconds`,
+    `dnadb_data_dir_bytes`.
 
 ## 5. Долговечность (durability)
 
