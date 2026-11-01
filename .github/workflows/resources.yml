@@ -4,8 +4,11 @@ name: Resources (RAM & disk)
 # нагрузкой) и место на диске (прирост каталога данных после чистой
 # остановки) для DNA-DB, MySQL и PostgreSQL на одном и том же
 # детерминированном датасете (seed 42, как в bench_compare.py).
+# Два масштаба в одном прогоне: 100 000 строк и 1 000 000 строк.
 # У всех систем — настройки по умолчанию. Результаты коммитятся
-# в docs/resources_compare_linux.json и попадают на лендинг.
+# в docs/resources_compare_linux.json (100k) и
+# docs/resources_compare_linux_1m.json (1M), графики — в docs/charts и
+# landing/assets/charts — и попадают на лендинг.
 
 on:
   workflow_dispatch:
@@ -53,24 +56,34 @@ jobs:
           sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='bench'" | grep -q 1 || \
             sudo -u postgres psql -c "CREATE USER bench WITH PASSWORD 'bench';"
 
-      - name: Python-драйверы
-        run: python3 -m pip install --quiet pymysql psycopg2-binary
+      - name: Python-драйверы и matplotlib (для графиков)
+        run: python3 -m pip install --quiet pymysql psycopg2-binary matplotlib
 
       - name: Сборка DNA-DB (release)
         run: cargo build --release
 
-      - name: Измерение RAM и диска (100 000 строк, seed 42)
+      - name: Измерение RAM и диска (100 000 и 1 000 000 строк, seed 42)
         run: |
           SITE=$(python3 -c "import site; print(site.getusersitepackages())")
           echo "user site-packages: $SITE"
           sudo PYTHONPATH="$SITE" python3 scripts/measure_resources.py \
             --rows 100000 --reads 4000 \
             --json-out docs/resources_compare_linux.json
+          sudo PYTHONPATH="$SITE" python3 scripts/measure_resources.py \
+            --rows 1000000 --reads 20000 \
+            --json-out docs/resources_compare_linux_1m.json
+
+      - name: Графики для лендинга (100k + 1M)
+        run: |
+          python3 scripts/gen_resources_charts.py \
+            --json docs/resources_compare_linux.json \
+            --json docs/resources_compare_linux_1m.json
 
       - name: Коммит результатов в репозиторий
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add docs/resources_compare_linux.json || true
-          git diff --cached --quiet || git commit -m "resources: замер RAM и диска DNA-DB vs MySQL vs PostgreSQL [skip ci]"
+          git add docs/resources_compare_linux.json docs/resources_compare_linux_1m.json \
+                  docs/charts landing/assets/charts || true
+          git diff --cached --quiet || git commit -m "resources: замер RAM и диска DNA-DB vs MySQL vs PostgreSQL (100k + 1M) [skip ci]"
           git push

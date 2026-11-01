@@ -2,13 +2,17 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Charts for the resource benchmark: RAM & disk, DNA-DB vs MySQL vs PostgreSQL.
 
-Reads  docs/resources_compare_linux.json  (produced by scripts/measure_resources.py)
-Writes docs/charts/resources_ram.png      (idle vs peak RAM, sum PSS, MiB)
-       docs/charts/resources_disk.png     (disk growth of the data directory, MiB)
+Reads  docs/resources_compare_linux.json      (100 000 rows, produced by
+       scripts/measure_resources.py) and docs/resources_compare_linux_1m.json
+       (1 000 000 rows).
+Writes docs/charts/resources_ram.png          (idle vs peak RAM, sum PSS, MiB)
+       docs/charts/resources_disk.png         (disk growth of the data directory, MiB)
        landing/assets/charts/ram_resources.png   (copies for the landing page)
        landing/assets/charts/disk_footprint.png
+For every non-default scale <rows> the files get a suffix: resources_ram_1m.png,
+ram_resources_1m.png, ... Pass --json once per scale.
 
-Usage: python scripts/gen_resources_charts.py [--json PATH] [--out DIR] [--landing DIR]
+Usage: python scripts/gen_resources_charts.py [--json PATH]... [--out DIR] [--landing DIR]
 """
 
 import argparse
@@ -28,6 +32,15 @@ NAMES = {"dnadb": "DNA-DB", "mysql": "MySQL", "postgres": "PostgreSQL"}
 ORDER = ("dnadb", "mysql", "postgres")
 
 
+def scale_suffix(rows):
+    """File-name suffix for a dataset scale: legacy names for 100k, _1m for 1M."""
+    if rows == 100000:
+        return ""
+    if rows == 1000000:
+        return "_1m"
+    return "_%d" % rows
+
+
 def load(path):
     with open(path, encoding="utf-8") as f:
         return json.load(f)
@@ -40,7 +53,7 @@ def style(ax):
     ax.set_axisbelow(True)
 
 
-def chart_ram(systems, out_dir, rows):
+def chart_ram(systems, out_dir, rows, suffix=""):
     """Grouped bars: idle vs peak memory (sum of process PSS), MiB."""
     idle = [systems[s]["idle_pss_mib"] for s in ORDER]
     peak = [systems[s]["peak_pss_mib"] for s in ORDER]
@@ -65,14 +78,14 @@ def chart_ram(systems, out_dir, rows):
                  "{:,}".format(rows).replace(",", " "), fontsize=12)
     style(ax)
     ax.legend(loc="upper left", fontsize=9.5, framealpha=0.9)
-    path = os.path.join(out_dir, "resources_ram.png")
+    path = os.path.join(out_dir, "resources_ram%s.png" % suffix)
     fig.savefig(path, dpi=130)
     plt.close(fig)
     print("wrote", path)
     return path
 
 
-def chart_disk(systems, out_dir, rows, value_bytes=160, key_len=12):
+def chart_disk(systems, out_dir, rows, suffix="", value_bytes=160, key_len=12):
     """Bars: data-directory growth after a clean shutdown, MiB."""
     delta = [systems[s]["disk_delta_mib"] for s in ORDER]
     raw = rows * (value_bytes + key_len) / (1024 * 1024)
@@ -93,7 +106,7 @@ def chart_disk(systems, out_dir, rows, value_bytes=160, key_len=12):
     ax.set_title("Disk: data directory growth (clean shutdown), %s rows x 172 B" %
                  "{:,}".format(rows).replace(",", " "), fontsize=12)
     style(ax)
-    path = os.path.join(out_dir, "resources_disk.png")
+    path = os.path.join(out_dir, "resources_disk%s.png" % suffix)
     fig.savefig(path, dpi=130)
     plt.close(fig)
     print("wrote", path)
@@ -102,25 +115,33 @@ def chart_disk(systems, out_dir, rows, value_bytes=160, key_len=12):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--json", default=os.path.join(
-        PROJECT, "docs", "resources_compare_linux.json"))
+    ap.add_argument("--json", action="append", dest="jsons", default=None,
+                    help="resources JSON; repeat for each scale (100k, 1M)")
     ap.add_argument("--out", default=os.path.join(PROJECT, "docs", "charts"))
     ap.add_argument("--landing", default=os.path.join(
         PROJECT, "landing", "assets", "charts"))
     args = ap.parse_args()
 
-    data = load(args.json)
-    systems = data["systems"]
-    rows = data["meta"]["rows"]
+    jsons = args.jsons or [os.path.join(
+        PROJECT, "docs", "resources_compare_linux.json")]
 
-    p1 = chart_ram(systems, args.out, rows)
-    p2 = chart_disk(systems, args.out, rows)
-
+    os.makedirs(args.out, exist_ok=True)
     os.makedirs(args.landing, exist_ok=True)
-    for src, name in ((p1, "ram_resources.png"), (p2, "disk_footprint.png")):
-        dst = os.path.join(args.landing, name)
-        shutil.copyfile(src, dst)
-        print("wrote", dst)
+    for path in jsons:
+        data = load(path)
+        systems = data["systems"]
+        rows = data["meta"]["rows"]
+        # default scale keeps the legacy file names, larger scales get _1m etc.
+        suffix = scale_suffix(rows)
+
+        p1 = chart_ram(systems, args.out, rows, suffix)
+        p2 = chart_disk(systems, args.out, rows, suffix)
+
+        for src, name in ((p1, "ram_resources%s.png" % suffix),
+                          (p2, "disk_footprint%s.png" % suffix)):
+            dst = os.path.join(args.landing, name)
+            shutil.copyfile(src, dst)
+            print("wrote", dst)
 
 
 if __name__ == "__main__":
