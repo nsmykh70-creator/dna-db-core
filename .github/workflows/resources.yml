@@ -69,6 +69,17 @@ jobs:
           sudo PYTHONPATH="$SITE" python3 scripts/measure_resources.py \
             --rows 100000 --reads 4000 \
             --json-out docs/resources_compare_linux.json
+
+          # Первый замер останавливает MySQL и PostgreSQL (корректная
+          # остановка для замера диска). Возвращаем службы и готовим
+          # чистый baseline для масштаба 1M: пустые базы, усечённые журналы.
+          sudo systemctl start mysql
+          mysql -uroot -pbench -h 127.0.0.1 -e "DROP DATABASE IF EXISTS bench;" || true
+          mysql -uroot -pbench -h 127.0.0.1 -e "RESET MASTER;" || true
+          sudo systemctl start postgresql
+          sudo -u postgres psql -c "DROP DATABASE IF EXISTS bench;" || true
+          sudo systemctl restart postgresql
+
           sudo PYTHONPATH="$SITE" python3 scripts/measure_resources.py \
             --rows 1000000 --reads 20000 \
             --json-out docs/resources_compare_linux_1m.json
