@@ -273,7 +273,7 @@ SHOW STORAGE FOR chr_orders WHERE order_id = 1042;
 -- chromosome | locus | storage_key   | column  | sql_type | value    | stored_as
 -- chr_orders | 1042  | chr_orders:1042 | order_id | INT      | 1042     | RowCodec tag 1: i64 little-endian (8 B) = 1042
 -- chr_orders | 1042  | chr_orders:1042 | status   | TEXT     | PENDING  | RowCodec tag 3: UTF-8 text, u32 length + 7 B
--- chr_orders | 1042  | chr_orders:1042 | seq      | DNA      | CGCG...  | RowCodec tag 4: nucleotide chain A/C/G/T, 18 nt (18 B ASCII)
+-- chr_orders | 1042  | chr_orders:1042 | seq      | DNA      | CGCG...  | RowCodec tag 4: nucleotide chain A/C/G/T, 17 nt (17 B ASCII)
 
 -- то же работает до записи: где окажутся данные этого INSERT?
 -- (CLI: dna-db-core sql2dnaql --data-dir ./dna_data --sql "INSERT ...")

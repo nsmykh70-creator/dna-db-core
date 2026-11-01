@@ -277,7 +277,7 @@ SHOW STORAGE FOR chr_orders;
 -- chromosome | locus | storage_key | column | sql_type | value | stored_as
 SHOW STORAGE FOR chr_orders WHERE order_id = 1042;
 -- chr_orders | 1042 | chr_orders:1042 | status | TEXT | PENDING | RowCodec tag 3: UTF-8 text, u32 length + 7 B
--- chr_orders | 1042 | chr_orders:1042 | seq    | DNA  | CGCG... | RowCodec tag 4: nucleotide chain A/C/G/T, 18 nt (18 B ASCII)
+-- chr_orders | 1042 | chr_orders:1042 | seq    | DNA  | CGCG... | RowCodec tag 4: nucleotide chain A/C/G/T, 17 nt (17 B ASCII)
 
 -- it also works BEFORE the write: where would this INSERT land?
 -- (CLI: dna-db-core sql2dnaql --data-dir ./dna_data --sql "INSERT ...")

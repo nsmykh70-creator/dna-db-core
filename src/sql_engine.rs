@@ -6921,7 +6921,7 @@ mod tests {
                    Some(&Value::Text("CGCGCGATCGATCGCGC".into())));
         assert!(matches!(
             by_col("seq").get("stored_as"),
-            Some(Value::Text(s)) if s.contains("tag 4") && s.contains("18 nt")
+            Some(Value::Text(s)) if s.contains("tag 4") && s.contains("17 nt")
         ));
 
         // Scan mode: one summary row per stored locus.
