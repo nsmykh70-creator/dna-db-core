@@ -5,8 +5,8 @@
 
 A high-performance embeddable and client/server database engine written in Rust, featuring an LSM-Tree architecture, 2-bit nucleotide compression, dual-strand disk mirroring, the **DnaQL** query language, a **full SQL subset** (aggregates, GROUP BY/HAVING, ORDER BY, IN/subqueries, **secondary and range indexes**), a built-in **web admin panel** (phpMyAdmin-style) and self-healing on sector corruption.
 
-> 🌐 **Landing page:** [landing/index.html](landing/index.html) — features, benchmarks vs MySQL/PostgreSQL, test results and screenshots in one page.
-> 🧪 **v3.5.0 verification:** 197/197 Rust tests · 15/15 smoke · 12/12 security smoke · 123 408 acknowledged writes survived `kill -9` (0 lost) · chaos 3/3 · details in [docs/TEST_RESULTS.md](docs/TEST_RESULTS.md) and [docs/RELEASE_NOTES_v3.5.0.md](docs/RELEASE_NOTES_v3.5.0.md).
+> 🌐 **Landing page:** https://nsmykh70-creator.github.io/dna-db-core/ (source: [landing/index.html](landing/index.html)) — features, charts, benchmarks vs MySQL/PostgreSQL, test results, screenshots and a full guide in one page. Deployed automatically by [.github/workflows/pages.yml](.github/workflows/pages.yml).
+> 🧪 **v4.0.0-GA verification:** 215/215 Rust tests · SQL conformance 32/32 (0 mismatch) · 15/15 smoke · 12/12 security smoke · 123 408 acknowledged writes survived `kill -9` (0 lost) · chaos 3/3 · Raft failover 1.05 s · details in [docs/TEST_RESULTS.md](docs/TEST_RESULTS.md) and [docs/RELEASE_NOTES_v4.0.0.md](docs/RELEASE_NOTES_v4.0.0.md).
 
 ## 0.2. Production security (v3.5)
 

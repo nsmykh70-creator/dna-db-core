@@ -1,8 +1,11 @@
-# DNA-DB Core v3.5 «Granular Access» (закалено аудитом: per-table ACL, proxy SSO, mirror-aware rotation)
+# DNA-DB Enterprise v4.0.0-GA (SQL 32/32, pgwire, Raft, S3-тиринг, PITR, Prometheus)
 
 > **English:** [README.md](README.md) · здесь — [русская версия](README_RU.md)
 
 Высокопроизводительный встраиваемый и клиент-серверный движок баз данных на Rust с архитектурой LSM-Tree, 2-битной компрессией нуклеотидов, двухнитевым зеркалированием дисков, языком **DnaQL**, **полноценным SQL-подмножеством** (агрегаты, GROUP BY/HAVING, ORDER BY, IN/подзапросы, **secondary- и диапазонные индексы**), встроенной **веб-панелью управления** (phpMyAdmin-подобной) и самовосстановлением при повреждении секторов.
+
+> 🌐 **Лендинг проекта:** https://nsmykh70-creator.github.io/dna-db-core/ (исходник: [landing/index.html](landing/index.html)) — описание, графики, бенчмарки против MySQL/PostgreSQL, результаты тестов, скриншоты и руководство на одной странице. Публикуется автоматически через [.github/workflows/pages.yml](.github/workflows/pages.yml).
+> 🧪 **Проверка v4.0.0-GA:** 215/215 Rust-тестов · SQL-соответствие 32/32 (0 несовпадений) · 15/15 smoke · 12/12 security smoke · 123 408 подтверждённых записей пережили `kill -9` (0 потерь) · chaos 3/3 · Raft failover 1,05 c · подробности в [docs/TEST_RESULTS_RU.md](docs/TEST_RESULTS_RU.md) и [docs/RELEASE_NOTES_v4.0.0.md](docs/RELEASE_NOTES_v4.0.0.md).
 
 ## 0.2. Production-безопасность (v3.5)
 

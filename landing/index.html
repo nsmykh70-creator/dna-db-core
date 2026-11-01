@@ -3,8 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>DNA-DB Core v3.5.0 — Rust database for genomic workloads</title>
-<meta name="description" content="DNA-DB Core — LSM engine in Rust with DnaQL, an SQL subset, TLS/Argon2id/ACL, dual-strand mirroring and RS(4+2) self-healing. 197 tests green; benchmarked against MySQL 8.4 and PostgreSQL 17.">
+<title>DNA-DB Enterprise v4.0.0-GA — СУБД на Rust для геномных данных</title>
+<meta name="description" content="DNA-DB Enterprise v4.0.0-GA — LSM-движок на Rust: DnaQL, SQL 32/32 (JOIN/UNION/CTE/оконные/UPSERT/транзакции), pgwire (PostgreSQL protocol), Raft-кластер, S3-тиринг, PITR, TLS 1.3/Argon2id, RS(4+2) самовосстановление, Prometheus, Kubernetes. Бенчмарки против MySQL 8.4 и PostgreSQL 17.">
 <style>
 :root{
   --bg:#070b16; --bg2:#0a1020; --panel:#0d1428; --panel2:#111a33;
@@ -18,29 +18,43 @@ body{background:var(--bg);color:var(--text);font-family:"Segoe UI",system-ui,-ap
 a{color:var(--accent);text-decoration:none}
 a:hover{text-decoration:underline}
 .wrap{max-width:1080px;margin:0 auto;padding:0 20px}
+h2{font-size:30px;letter-spacing:-.4px;margin:6px 0 18px}
+h3{font-size:19px;margin:22px 0 10px;color:var(--text)}
+.kicker{color:var(--accent);font-size:12.5px;font-weight:700;letter-spacing:2.4px;text-transform:uppercase;margin-top:14px}
+.lead{color:var(--muted);font-size:16.5px;max-width:820px;margin-bottom:14px}
+.note{color:var(--dim);font-size:13.5px;margin:10px 0 4px}
+section{padding:64px 0 30px}
+code{background:var(--code);border:1px solid var(--line);border-radius:5px;padding:1px 6px;font-size:.92em;color:#9fd8ff}
+pre{background:var(--code);border:1px solid var(--line);border-radius:12px;padding:16px 18px;overflow-x:auto;font-size:13.5px;line-height:1.55;margin:12px 0 8px;color:#c9e4ff}
+pre .c{color:var(--dim)}
+pre .k{color:#7dd3fc}
+
+/* language visibility */
+html[lang="ru"] .en{display:none}
+html[lang="en"] .ru{display:none}
 
 /* nav */
 nav{position:sticky;top:0;z-index:50;background:rgba(7,11,22,.86);backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
 .nav-in{display:flex;align-items:center;gap:18px;height:58px}
-.logo{display:flex;align-items:center;gap:10px;font-weight:700;font-size:17px;white-space:nowrap}
+.logo{display:flex;align-items:center;gap:10px;font-weight:700;font-size:17px;white-space:nowrap;color:var(--text)}
 .logo .dna{font-size:20px}
 .logo b{color:var(--accent)}
-nav .links{display:flex;gap:16px;margin-left:auto;flex-wrap:wrap}
-nav .links a{color:var(--muted);font-size:14px}
+nav .links{display:flex;gap:15px;margin-left:auto;flex-wrap:wrap}
+nav .links a{color:var(--muted);font-size:13.5px;white-space:nowrap}
 nav .links a:hover{color:var(--accent);text-decoration:none}
-.lang-btn{background:var(--panel2);border:1px solid var(--line);color:var(--text);border-radius:8px;padding:4px 12px;font-size:13px;cursor:pointer}
+.lang-btn{background:var(--panel2);border:1px solid var(--line);color:var(--text);border-radius:8px;padding:4px 12px;font-size:13px;cursor:pointer;margin-left:6px}
 .lang-btn:hover{border-color:var(--accent)}
 
 /* hero */
-header{padding:84px 0 60px;background:
+header{padding:80px 0 60px;background:
   radial-gradient(800px 380px at 15% -10%, rgba(57,208,255,.14), transparent 60%),
   radial-gradient(700px 340px at 90% 0%, rgba(34,197,94,.10), transparent 60%),
   var(--bg)}
-h1{font-size:44px;line-height:1.15;letter-spacing:-.5px}
+h1{font-size:42px;line-height:1.15;letter-spacing:-.5px}
 h1 .accent{color:var(--accent)}
 .ver{display:inline-block;background:rgba(34,197,94,.12);border:1px solid rgba(34,197,94,.4);color:#4ade80;font-size:13px;border-radius:999px;padding:3px 12px;margin-bottom:18px;letter-spacing:.4px}
-.sub{color:var(--muted);font-size:18px;max-width:760px;margin:18px 0 26px}
-.badges{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:30px}
+.sub{color:var(--muted);font-size:17.5px;max-width:800px;margin:18px 0 22px}
+.badges{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:28px}
 .badge{font-size:12.5px;color:var(--muted);border:1px solid var(--line);background:var(--panel);border-radius:8px;padding:4px 10px}
 .badge b{color:var(--text)}
 .cta{display:flex;gap:12px;flex-wrap:wrap}
@@ -51,90 +65,91 @@ h1 .accent{color:var(--accent)}
 .btn.ghost:hover{border-color:var(--accent);text-decoration:none}
 
 /* stats */
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px;margin:-30px auto 0;position:relative;z-index:2;padding-bottom:10px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px;margin:-30px auto 0;position:relative;z-index:2;padding-bottom:10px}
 .stat{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px 20px}
-.stat .n{font-size:26px;font-weight:700;color:var(--accent)}
+.stat .n{font-size:25px;font-weight:700;color:var(--accent)}
 .stat .n.g{color:var(--accent2)} .stat .n.o{color:var(--gold)}
-.stat .t{color:var(--muted);font-size:13px;margin-top:2px}
-
-/* sections */
-section{padding:64px 0 10px}
-h2{font-size:30px;margin-bottom:8px;letter-spacing:-.3px}
-.kicker{color:var(--accent);font-size:13px;text-transform:uppercase;letter-spacing:2px;font-weight:600}
-.lead{color:var(--muted);max-width:820px;margin-bottom:26px}
+.stat .t{color:var(--muted);font-size:12.5px;margin-top:2px}
 
 /* features */
 .feat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px}
-.feat{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px}
-.feat h3{font-size:16.5px;margin-bottom:6px}
+.feat{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px 20px}
+.feat .ico{font-size:22px}
+.feat h3{margin:8px 0 6px;font-size:16.5px}
 .feat p{color:var(--muted);font-size:14px}
-.feat .ico{font-size:22px;margin-bottom:8px;display:block}
+.feat code{font-size:.88em}
+.feat .new{display:inline-block;background:rgba(34,197,94,.14);border:1px solid rgba(34,197,94,.45);color:#4ade80;border-radius:6px;font-size:10.5px;padding:1px 7px;letter-spacing:.5px;vertical-align:2px;margin-left:6px}
 
-/* benchmark */
-.bench-img{width:100%;border-radius:12px;border:1px solid var(--line);background:#fff;margin:14px 0 6px;display:block}
-.bench-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-@media(max-width:820px){.bench-grid{grid-template-columns:1fr}}
-table.data{width:100%;border-collapse:collapse;font-size:14px;margin:18px 0}
-table.data th,table.data td{border:1px solid var(--line);padding:9px 12px;text-align:right}
-table.data th:first-child,table.data td:first-child{text-align:left}
-table.data th{background:var(--panel2);color:var(--text)}
-table.data td{color:var(--muted)}
+/* data table */
+table.data{width:100%;border-collapse:collapse;font-size:14px;margin:16px 0 8px}
+table.data th{color:var(--dim);font-weight:600;text-align:left;border-bottom:1px solid var(--line);padding:8px 10px}
+table.data td{border-bottom:1px solid rgba(28,42,74,.55);padding:8px 10px;color:var(--muted)}
 table.data td.best{color:var(--accent2);font-weight:700}
 table.data td b{color:var(--text)}
-.note{color:var(--dim);font-size:13px}
+
+/* v400 strip */
+.v400{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:16px 0 6px}
+.v400 .cell{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+.v400 .n{font-size:21px;font-weight:700;color:var(--gold)}
+.v400 .n small{font-size:12px;color:var(--muted);font-weight:400}
+.v400 .t{font-size:12.5px;color:var(--muted);margin-top:2px}
+
+/* charts / screenshots */
+.shots,.chart-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px;margin-top:10px}
+.shot,.chart-grid figure{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:10px;cursor:zoom-in}
+.shot img,.chart-grid img{width:100%;display:block;border-radius:8px;background:#fff}
+figcaption{color:var(--muted);font-size:13px;padding:8px 4px 2px;text-align:center}
 
 /* tests */
-.test-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px}
-.test{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px}
-.test .ok{color:#4ade80;font-weight:700;font-size:18px}
-.test h4{font-size:14.5px;margin:6px 0 4px}
-.test p{color:var(--muted);font-size:13px}
+.test-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px}
+.test{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px 18px}
+.test .ok{font-size:21px;font-weight:700;color:var(--accent2)}
+.test .ok.g{color:var(--gold)}
+.test h4{font-size:14.5px;margin:4px 0 4px}
+.test p{color:var(--muted);font-size:13px;margin-bottom:6px}
 .test a{font-size:12.5px}
 
-/* screenshots */
-.shots{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}
-.shot{position:relative;border-radius:12px;overflow:hidden;border:1px solid var(--line);cursor:zoom-in}
-.shot img{width:100%;display:block;transition:transform .25s}
-.shot:hover img{transform:scale(1.02)}
-.shot figcaption{position:absolute;left:0;right:0;bottom:0;background:linear-gradient(transparent,rgba(4,8,18,.92));padding:26px 14px 10px;font-size:13.5px;color:var(--text)}
+/* docs */
+.docs-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px}
+.doc{display:block;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:13px 16px;color:var(--text)}
+.doc:hover{border-color:var(--accent);text-decoration:none}
+.doc b{display:block;font-size:14px;color:var(--accent)}
+.doc span{display:block;color:var(--muted);font-size:12.5px;margin-top:2px}
+
+/* guide */
+.guide h3{margin-top:30px;padding-top:2px}
+.guide h3 .num{color:var(--accent);margin-right:8px}
+
+/* footer */
+footer{border-top:1px solid var(--line);margin-top:50px;padding:30px 0 40px;color:var(--dim);font-size:13.5px;text-align:center}
+footer .f1{margin-bottom:6px}
 
 /* lightbox */
-#lb{position:fixed;inset:0;background:rgba(2,5,12,.93);display:none;align-items:center;justify-content:center;z-index:100;padding:20px}
+#lb{position:fixed;inset:0;background:rgba(4,7,14,.92);display:none;align-items:center;justify-content:center;z-index:100;cursor:zoom-out;padding:24px}
 #lb.open{display:flex}
-#lb img{max-width:96vw;max-height:92vh;border-radius:10px;border:1px solid var(--line)}
+#lb img{max-width:96vw;max-height:92vh;border-radius:10px;box-shadow:0 10px 60px rgba(0,0,0,.7)}
 
-/* docs cards */
-.docs-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}
-.doc{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px;font-size:14px}
-.doc:hover{border-color:var(--accent);text-decoration:none}
-.doc b{color:var(--text);display:block;margin-bottom:2px}
-.doc span{color:var(--muted);font-size:12.5px}
-
-/* code */
-pre{background:var(--code);border:1px solid var(--line);border-radius:12px;padding:18px 20px;overflow-x:auto;font-size:13.5px;line-height:1.55;font-family:"Cascadia Code",Consolas,Menlo,monospace;margin:16px 0}
-pre .c{color:var(--dim)} pre .k{color:#4ade80} pre .s{color:var(--gold)}
-
-footer{border-top:1px solid var(--line);margin-top:70px;padding:26px 0 34px;color:var(--dim);font-size:13.5px}
-footer .wrap{display:flex;gap:14px;flex-wrap:wrap;justify-content:space-between}
-
-/* lang visibility */
-html[lang=ru] .en{display:none}
-html[lang=en] .ru{display:none}
-@media(max-width:640px){h1{font-size:32px}nav .links{display:none}}
+@media(max-width:760px){
+  h1{font-size:31px} h2{font-size:24px}
+  nav .links{display:none}
+  header{padding:56px 0 46px}
+}
 </style>
 </head>
 <body>
 
 <nav>
   <div class="wrap nav-in">
-    <div class="logo"><span class="dna">🧬</span> <span>DNA-DB <b>Core</b></span></div>
+    <div class="logo"><span class="dna">🧬</span> DNA<b>-DB</b> <span style="color:var(--dim);font-weight:400;font-size:13px">Enterprise</span></div>
     <div class="links">
-      <a href="#features" class="ru">Возможности</a><a href="#features" class="en">Features</a>
-      <a href="#bench" class="ru">Бенчмарки</a><a href="#bench" class="en">Benchmarks</a>
-      <a href="#tests" class="ru">Тесты</a><a href="#tests" class="en">Tests</a>
-      <a href="#shots" class="ru">Скриншоты</a><a href="#shots" class="en">Screenshots</a>
-      <a href="#docs" class="ru">Документация</a><a href="#docs" class="en">Docs</a>
-      <a href="#quickstart" class="ru">Быстрый старт</a><a href="#quickstart" class="en">Quick start</a>
+      <a href="#features"><span class="ru">Возможности</span><span class="en">Features</span></a>
+      <a href="#bench"><span class="ru">Бенчмарки</span><span class="en">Benchmarks</span></a>
+      <a href="#charts"><span class="ru">Графики</span><span class="en">Charts</span></a>
+      <a href="#tests"><span class="ru">Тесты</span><span class="en">Testing</span></a>
+      <a href="#shots"><span class="ru">Скриншоты</span><span class="en">Screenshots</span></a>
+      <a href="#guide"><span class="ru">Руководство</span><span class="en">Guide</span></a>
+      <a href="#docs"><span class="ru">Документация</span><span class="en">Docs</span></a>
+      <a href="https://github.com/nsmykh70-creator/dna-db-core">GitHub ↗</a>
     </div>
     <button class="lang-btn" id="lang">EN</button>
   </div>
@@ -142,48 +157,52 @@ html[lang=en] .ru{display:none}
 
 <header>
   <div class="wrap">
-    <span class="ver">v3.5.0 · audit-hardened release · 2026-10-31</span>
-    <h1><span class="ru">База данных на Rust для геномных нагрузок — <span class="accent">LSM-движок</span>, DnaQL, SQL и самовосстановление</span>
-        <span class="en">A Rust database for genomic workloads — <span class="accent">LSM engine</span>, DnaQL, SQL and self-healing</span></h1>
-    <p class="sub">
-      <span class="ru">Встраиваемый и клиент-серверный движок: 2-битная компрессия нуклеотидов, двухнитевое зеркалирование дисков, Рид–Соломон RS(4+2), SQL-подмножество с индексами и JOIN'ами, веб-панель управления. Закалён полным аудитом безопасности: закрыты все P0 и P1 находки.</span>
-      <span class="en">Embeddable and client/server engine: 2-bit nucleotide packing, dual-strand disk mirroring, Reed–Solomon RS(4+2), an SQL subset with indexes and JOINs, a built-in web admin panel. Hardened by a full security audit: every P0 and P1 finding closed.</span>
-    </p>
+    <div class="ver">v4.0.0-GA · Enterprise Production Release · 2026-10-31</div>
+    <h1><span class="ru">СУБД на Rust для геномных данных —<br>от LSM-ядра до <span class="accent">Raft-кластера</span></span>
+        <span class="en">A Rust database for genomic data —<br>from an LSM core to a <span class="accent">Raft cluster</span></span></h1>
+    <p class="sub"><span class="ru">Один бинарник: DnaQL и SQL 32/32, совместимость по проводному протоколу PostgreSQL (pgwire), кворумный Raft, S3-тиринг и PITR, TLS 1.3 / Argon2id / XChaCha20, самовосстановление RS(4+2), Prometheus-метрики и Kubernetes-манифесты. Всё подтверждено 215 тестами, kill&#8209;9-прогоном и сравнением с MySQL 8.4.6 и PostgreSQL 17.11.</span>
+    <span class="en">One binary: DnaQL plus a 32/32 SQL engine, PostgreSQL wire-protocol compatibility (pgwire), quorum Raft, S3 tiering and PITR, TLS 1.3 / Argon2id / XChaCha20, RS(4+2) self-healing, Prometheus metrics and Kubernetes manifests. Proven by 215 tests, a kill&#8209;9 durability run and a comparison against MySQL 8.4.6 and PostgreSQL 17.11.</span></p>
     <div class="badges">
-      <span class="badge"><b>Rust</b> · rustls · zero unsafe in the core</span>
-      <span class="badge"><b>197</b> tests green</span>
-      <span class="badge"><b>TLS 1.3</b> · Argon2id · per-table ACL</span>
-      <span class="badge"><b>XChaCha20</b> at rest</span>
-      <span class="badge"><b>RS(4+2)</b> self-healing</span>
-      <span class="badge"><b>AGPL-3.0</b>/<b>Apache-2.0</b></span>
+      <span class="badge">🦀 Rust · <b>без unsafe в ядре</b></span>
+      <span class="badge">✅ <b>215/215</b> tests</span>
+      <span class="badge">🧪 SQL <b>32/32</b> conformance</span>
+      <span class="badge">🔐 TLS 1.3 · Argon2id · XChaCha20</span>
+      <span class="badge">⚖️ AGPL-3.0 / Apache-2.0</span>
+      <span class="badge">🐧 Linux · macOS</span>
     </div>
     <div class="cta">
-      <a class="btn primary" href="#quickstart"><span class="ru">Начать за 2 минуты</span><span class="en">Start in 2 minutes</span></a>
+      <a class="btn primary" href="#guide"><span class="ru">Руководство: запуск за 2 минуты</span><span class="en">Guide: up in 2 minutes</span></a>
       <a class="btn ghost" href="#bench"><span class="ru">Сравнение с MySQL и PostgreSQL</span><span class="en">MySQL &amp; PostgreSQL comparison</span></a>
+      <a class="btn ghost" href="https://github.com/nsmykh70-creator/dna-db-core/releases">Releases ↗</a>
     </div>
   </div>
 </header>
 
 <div class="wrap stats">
-  <div class="stat"><div class="n">43 779 <small>ops/s</small></div><div class="t ru">точечные чтения (строгий fsync WAL)</div><div class="t en">point reads (strict WAL fsync)</div></div>
-  <div class="stat"><div class="n o">298 936 <small>rows/s</small></div><div class="t ru">пиковая пакетная запись</div><div class="t en">peak batched write</div></div>
-  <div class="stat"><div class="n g">0 / 123 408</div><div class="t ru">потерь после SIGKILL (fsync на каждый ack)</div><div class="t en">losses after SIGKILL (fsync per ack)</div></div>
-  <div class="stat"><div class="n">0 <small>mismatches</small></div><div class="t ru">неверных результатов SQL в 32 сравнительных проверках</div><div class="t en">wrong SQL results across 32 conformance checks</div></div>
+  <div class="stat"><div class="n o">308 423 <small>rows/s</small></div><div class="t ru">пакетная запись v4.0.0-GA (строгий fsync WAL)</div><div class="t en">batched write on v4.0.0-GA (strict WAL fsync)</div></div>
+  <div class="stat"><div class="n g">32 / 32</div><div class="t ru">SQL-соответствие: 0 unsupported, 0 mismatch</div><div class="t en">SQL conformance: 0 unsupported, 0 mismatch</div></div>
+  <div class="stat"><div class="n">215 / 215</div><div class="t ru">cargo test --release: unit + SQL + recovery + Raft + pgwire</div><div class="t en">cargo test --release: unit + SQL + recovery + Raft + pgwire</div></div>
+  <div class="stat"><div class="n g">0 / 123 408</div><div class="t ru">потерь после kill -9 (fsync на каждый ack)</div><div class="t en">losses after kill -9 (fsync per ack)</div></div>
+  <div class="stat"><div class="n">1,05 <small>с</small></div><div class="t ru">Raft failover (SLA &lt; 2 c), 0 потерь закоммиченного</div><div class="t en">Raft failover (SLA &lt; 2 s), zero committed loss</div></div>
 </div>
 
 <section id="features">
   <div class="wrap">
     <div class="kicker">Features</div>
-    <h2 class="ru">Что внутри</h2><h2 class="en">What's inside</h2>
+    <h2><span class="ru">Что внутри</span><span class="en">What's inside</span></h2>
     <div class="feat-grid">
-      <div class="feat"><span class="ico">🌳</span><h3>LSM-движок + WAL</h3><p class="ru">Три режима fsync (strict/relaxed/off), атомарные сегменты, bloom-фильтры, tiered storage, checkpoint и компакция.</p><p class="en">Three fsync modes (strict/relaxed/off), atomic segment writes, bloom filters, tiered storage, checkpoint and compaction.</p></div>
-      <div class="feat"><span class="ico">🧬</span><h3>DnaQL</h3><p class="ru">Пайплайны <code>|&gt;</code>, ANALYZE SEQUENCE/LOCUS, GC_CONTENT, MELTING_TEMP, реверс-комплемент, транскрипция, перевод, нечёткий bitap-поиск (~100 Mbp/s на ядро).</p><p class="en">Pipelines <code>|&gt;</code>, ANALYZE SEQUENCE/LOCUS, GC_CONTENT, MELTING_TEMP, reverse-complement, transcription, translation, fuzzy bitap search (~100 Mbp/s per core).</p></div>
-      <div class="feat"><span class="ico">🛢️</span><h3>SQL-подмножество</h3><p class="ru">JOIN (inner/left), GROUP BY/HAVING, подзапросы IN, ORDER BY/LIMIT/OFFSET, secondary- и range-индексы, EXPLAIN-план, транзакции.</p><p class="en">JOIN (inner/left), GROUP BY/HAVING, IN subqueries, ORDER BY/LIMIT/OFFSET, secondary &amp; range indexes, EXPLAIN plans, transactions.</p></div>
-      <div class="feat"><span class="ico">🔐</span><h3>Безопасность</h3><p class="ru">rustls TLS 1.2/1.3 на обоих слушателях, Argon2id, per-table ACL, lockout по IP/логину, XChaCha20-Poly1305 при хранении, случайный bootstrap-пароль (печатается один раз).</p><p class="en">rustls TLS 1.2/1.3 on both listeners, Argon2id, per-table ACL, IP/username lockout, XChaCha20-Poly1305 at rest, random one-time bootstrap password.</p></div>
-      <div class="feat"><span class="ico">🪞</span><h3>Зеркало и самовосстановление</h3><p class="ru">Зеркало Strand B на внешнем диске, RS(4+2) с CRC на блоки, scrubber, doctor, ремонт на чтении; откат WAL при сбое зеркала (новое в 3.5).</p><p class="en">Strand B mirror on an external disk, RS(4+2) with per-block CRC, scrubber, doctor, repair-on-read; WAL rollback on mirror failure (new in 3.5).</p></div>
-      <div class="feat"><span class="ico">🖥️</span><h3>Веб-панель</h3><p class="ru">phpMyAdmin-подобная: дашборд KPI, просмотр/редактирование строк, SQL- и DnaQL-консоли с планом запроса, управление пользователями и ACL, bearer-сессии с CSP.</p><p class="en">phpMyAdmin-style: KPI dashboard, row browsing/editing, SQL &amp; DnaQL consoles with query plans, user &amp; ACL management, bearer sessions with CSP.</p></div>
-      <div class="feat"><span class="ico">🛡️</span><h3>Закалка v3.5.0 (аудит)</h3><p class="ru">Лимит глубины парсера + catch_unwind (защита от stack-overflow DoS), закрыты 2 ACL-байпасса, настоящий Serializable, slowloris-дедлайн, flock для doctor, проверенная арифметика.</p><p class="en">Parser depth limit + catch_unwind (stack-overflow DoS protection), 2 ACL bypasses closed, real Serializable isolation, slowloris deadline, doctor flock, checked arithmetic.</p></div>
-      <div class="feat"><span class="ico">🧰</span><h3>Инструменты</h3><p class="ru">CLI shell (в т.ч. TLS/mTLS), rotate-key без простоя, demo-data, 15 python-скриптов: smoke, security, kill -9, chaos, бенчмарки против MySQL/PostgreSQL.</p><p class="en">CLI shell (TLS/mTLS aware), zero-downtime rotate-key, demo-data, 15 python scripts: smoke, security, kill -9, chaos, MySQL/PostgreSQL benchmarks.</p></div>
+      <div class="feat"><span class="ico">🌳</span><h3>LSM-движок + WAL</h3><p class="ru">Три режима fsync (strict/relaxed/off), атомарные сегменты, bloom-фильтры, checkpoint и компакция.</p><p class="en">Three fsync modes (strict/relaxed/off), atomic segment writes, bloom filters, checkpoint and compaction.</p></div>
+      <div class="feat"><span class="ico">🧬</span><h3>DnaQL</h3><p class="ru">Пайплайны <code>|&gt;</code>: ANALYZE SEQUENCE/LOCUS, GC_CONTENT, MELTING_TEMP, реверс-комплемент, транскрипция, перевод, нечёткий bitap-поиск.</p><p class="en">Pipelines <code>|&gt;</code>: ANALYZE SEQUENCE/LOCUS, GC_CONTENT, MELTING_TEMP, reverse-complement, transcription, translation, fuzzy bitap search.</p></div>
+      <div class="feat"><span class="ico">🛢️</span><h3><span class="ru">SQL-движок 32/32</span><span class="en">SQL engine 32/32</span><span class="new">v3.6</span></h3><p class="ru">INNER/LEFT/RIGHT/FULL JOIN, UNION [ALL], CTE (WITH), скалярные и коррелированные подзапросы, EXISTS, оконные функции, UPSERT (ON CONFLICT), BEGIN/COMMIT/ROLLBACK, EXPLAIN.</p><p class="en">INNER/LEFT/RIGHT/FULL JOIN, UNION [ALL], CTEs, scalar &amp; correlated subqueries, EXISTS, window functions, UPSERT (ON CONFLICT), BEGIN/COMMIT/ROLLBACK, EXPLAIN.</p></div>
+      <div class="feat"><span class="ico">🐘</span><h3><span class="ru">pgwire — протокол PostgreSQL</span><span class="en">pgwire — PostgreSQL protocol</span><span class="new">v3.7</span></h3><p class="ru"><code>psql</code>, DBeaver, Grafana и любой PG-драйвер подключаются к порту 5432. Тот же движок и ACL, что и у нативного протокола.</p><p class="en"><code>psql</code>, DBeaver, Grafana and any PG driver connect on port 5432. Same engine and ACL as the native protocol.</p></div>
+      <div class="feat"><span class="ico">⚖️</span><h3><span class="ru">Raft-консенсус</span><span class="en">Raft consensus</span><span class="new">v3.8</span></h3><p class="ru">Кворумный кластер (3+ ноды): выборы, персистентный лог, репликация с откатом по conflict_index, редирект NOT_LEADER, failover &lt; 2 c.</p><p class="en">Quorum cluster (3+ nodes): elections, persistent log, replication with conflict-index rollback, NOT_LEADER redirects, failover &lt; 2 s.</p></div>
+      <div class="feat"><span class="ico">☁️</span><h3><span class="ru">S3-тиринг и PITR</span><span class="en">S3 tiering &amp; PITR</span><span class="new">v3.9</span></h3><p class="ru">Демоушн сегментов в S3/MinIO/GCS (AWS SigV4, rustls) с Bloom-сайдкаром; консистентные снапшоты <code>pitr --target</code> и восстановление <code>pitr --restore</code>.</p><p class="en">Segment demotion to S3/MinIO/GCS (AWS SigV4, rustls) with a Bloom sidecar; consistent snapshots via <code>pitr --target</code> and restore via <code>pitr --restore</code>.</p></div>
+      <div class="feat"><span class="ico">⚡</span><h3><span class="ru">Online DDL</span><span class="en">Online DDL</span><span class="new">v3.9</span></h3><p class="ru"><code>ALTER TABLE ... ADD COLUMN</code> — мгновенно, только метаданные, без блокировок и перезаписи строк.</p><p class="en"><code>ALTER TABLE ... ADD COLUMN</code> is instant: metadata-only, no locks, no row rewrites.</p></div>
+      <div class="feat"><span class="ico">🔐</span><h3><span class="ru">Безопасность</span><span class="en">Security</span></h3><p class="ru">TLS 1.2/1.3 и mTLS на всех слушателях, Argon2id, per-table ACL, lockout по IP/логину, XChaCha20-Poly1305 при хранении, trusted-proxy SSO.</p><p class="en">TLS 1.2/1.3 and mTLS on every listener, Argon2id, per-table ACL, IP/username lockout, XChaCha20-Poly1305 at rest, trusted-proxy SSO.</p></div>
+      <div class="feat"><span class="ico">🪞</span><h3><span class="ru">Самовосстановление RS(4+2)</span><span class="en">RS(4+2) self-healing</span></h3><p class="ru">Зеркало Strand B на внешнем диске, коды Рида–Соломона с CRC на блоки, scrubber, doctor, ремонт на чтении, откат WAL.</p><p class="en">Strand B mirror on an external disk, Reed–Solomon with per-block CRC, scrubber, doctor, repair-on-read, WAL rollback.</p></div>
+      <div class="feat"><span class="ico">🖥️</span><h3><span class="ru">Веб-панель</span><span class="en">Web panel</span></h3><p class="ru">phpMyAdmin-подобная: KPI-дашборд, браузер строк, SQL- и DnaQL-консоли с планом запроса, пользователи и ACL, CSP-hardening.</p><p class="en">phpMyAdmin-style: KPI dashboard, row browser, SQL &amp; DnaQL consoles with query plans, users &amp; ACL, CSP-hardened.</p></div>
+      <div class="feat"><span class="ico">📈</span><h3><span class="ru">Prometheus и Kubernetes</span><span class="en">Prometheus &amp; Kubernetes</span><span class="new">v4.0</span></h3><p class="ru"><code>GET /metrics</code> в формате Prometheus 0.0.4: health, lesion found/repaired/unrecoverable, memtable, сегменты. CRD <code>DnaDbCluster</code>, StatefulSet, ServiceMonitor.</p><p class="en"><code>GET /metrics</code> in Prometheus 0.0.4 format: health, lesion found/repaired/unrecoverable, memtable, segments. CRD <code>DnaDbCluster</code>, StatefulSet, ServiceMonitor.</p></div>
+      <div class="feat"><span class="ico">🧰</span><h3><span class="ru">Инструменты</span><span class="en">Tooling</span></h3><p class="ru">CLI shell (TLS/mTLS), rotate-key без простоя, 16 python-скриптов: smoke, security, kill&#8209;9, chaos, трёхсторонний бенчмарк против MySQL/PostgreSQL.</p><p class="en">CLI shell (TLS/mTLS aware), zero-downtime rotate-key, 16 python scripts: smoke, security, kill&#8209;9, chaos, three-way MySQL/PostgreSQL benchmark.</p></div>
     </div>
   </div>
 </section>
@@ -191,46 +210,69 @@ html[lang=en] .ru{display:none}
 <section id="bench">
   <div class="wrap">
     <div class="kicker">Benchmarks</div>
-    <h2 class="ru">DNA-DB против MySQL 8.4.6 и PostgreSQL 17.11</h2><h2 class="en">DNA-DB vs MySQL 8.4.6 &amp; PostgreSQL 17.11</h2>
-    <p class="lead ru">Одинаковая нагрузка, ключи и последовательность RNG на всех трёх системах, у каждой — durability по умолчанию. Одна машина (Debian 13, 2 vCPU), один клиент. Прогон v3.5.0 от 2026-10-31.</p>
-    <p class="lead en">Identical workload, keys and RNG sequence on all three systems, each at its default durability. Same machine (Debian 13, 2 vCPU), one client. v3.5.0 run dated 2026-10-31.</p>
+    <h2><span class="ru">DNA-DB против MySQL 8.4.6 и PostgreSQL 17.11</span><span class="en">DNA-DB vs MySQL 8.4.6 &amp; PostgreSQL 17.11</span></h2>
+    <p class="lead"><span class="ru">Одинаковая нагрузка, ключи и последовательность RNG на всех трёх системах, у каждой — durability по умолчанию. Одна машина (Debian 13, 2 vCPU), один клиент. Прогон v3.5.0 от 2026-10-31, методика <code>scripts/bench_compare.py</code>.</span>
+    <span class="en">Identical workload, keys and RNG sequence on all three systems, each at its default durability. Same machine (Debian 13, 2 vCPU), one client. v3.5.0 run dated 2026-10-31, methodology <code>scripts/bench_compare.py</code>.</span></p>
 
     <table class="data">
-      <tr><th class="ru">Фаза</th><th class="en">Phase</th><th>DNA-DB v3.5.0</th><th>MySQL 8.4.6</th><th>PostgreSQL 17.11</th></tr>
-      <tr><td class="ru">Запись по одной строке (ack на каждую)</td><td class="en">Single-row insert (ack per row)</td><td class="best">36 260</td><td>4 353</td><td>19 182</td></tr>
-      <tr><td class="ru">Параллельная запись, 8 потоков</td><td class="en">Multithreaded insert, 8 threads</td><td>17 636</td><td>8 316</td><td class="best">22 157</td></tr>
-      <tr><td class="ru">Пакетный INSERT (200 строк × 40)</td><td class="en">Batched INSERT (200 rows × 40)</td><td class="best">298 936</td><td>162 166</td><td>215 926</td></tr>
-      <tr><td class="ru">Точечное чтение по ключу</td><td class="en">Point read by key</td><td class="best">43 779</td><td>11 049</td><td>17 565</td></tr>
-      <tr><td class="ru">Смешанная 80/20 (8 потоков)</td><td class="en">Mixed 80/20 (8 threads)</td><td class="best">20 411</td><td>8 403</td><td>17 985</td></tr>
-      <tr><td class="ru">SQL INSERT (3 000 строк)</td><td class="en">SQL INSERT (3 000 rows)</td><td class="best">24 986</td><td>4 003</td><td>16 811</td></tr>
-      <tr><td class="ru">SQL SELECT по PK (×1 500)</td><td class="en">SQL SELECT by PK (×1 500)</td><td>22 470</td><td>8 916</td><td class="best">23 638</td></tr>
-      <tr><td class="ru">Неверных значений при проверке</td><td class="en">Wrong values on verification</td><td class="best">0</td><td>0</td><td>0</td></tr>
+      <tr><th><span class="ru">Фаза</span><span class="en">Phase</span></th><th>DNA-DB v3.5.0</th><th>MySQL 8.4.6</th><th>PostgreSQL 17.11</th></tr>
+      <tr><td><span class="ru">Запись по одной строке (ack на каждую)</span><span class="en">Single-row insert (ack per row)</span></td><td class="best">36 260</td><td>4 353</td><td>19 182</td></tr>
+      <tr><td><span class="ru">Параллельная запись, 8 потоков</span><span class="en">Multithreaded insert, 8 threads</span></td><td>17 636</td><td>8 316</td><td class="best">22 157</td></tr>
+      <tr><td><span class="ru">Пакетный INSERT (200 строк × 40)</span><span class="en">Batched INSERT (200 rows × 40)</span></td><td class="best">298 936</td><td>162 166</td><td>215 926</td></tr>
+      <tr><td><span class="ru">Точечное чтение по ключу</span><span class="en">Point read by key</span></td><td class="best">43 779</td><td>11 049</td><td>17 565</td></tr>
+      <tr><td><span class="ru">Смешанная 80/20 (8 потоков)</span><span class="en">Mixed 80/20 (8 threads)</span></td><td class="best">20 411</td><td>8 403</td><td>17 985</td></tr>
+      <tr><td><span class="ru">SQL INSERT (3 000 строк)</span><span class="en">SQL INSERT (3 000 rows)</span></td><td class="best">24 986</td><td>4 003</td><td>16 811</td></tr>
+      <tr><td><span class="ru">SQL SELECT по PK (×1 500)</span><span class="en">SQL SELECT by PK (×1 500)</span></td><td>22 470</td><td>8 916</td><td class="best">23 638</td></tr>
+      <tr><td><span class="ru">Неверных значений при проверке</span><span class="en">Wrong values on verification</span></td><td class="best">0</td><td>0</td><td>0</td></tr>
     </table>
-    <p class="note ru">rows/s либо ops/s, чем больше — тем лучше. DNA-DB: <code>--sync strict</code> (fsync на каждый ack). MySQL: <code>innodb_flush_log_at_trx_commit=1</code>. PostgreSQL: <code>synchronous_commit=on</code>.</p>
-    <p class="note en">rows/s or ops/s, higher is better. DNA-DB: <code>--sync strict</code> (fsync per ack). MySQL: <code>innodb_flush_log_at_trx_commit=1</code>. PostgreSQL: <code>synchronous_commit=on</code>.</p>
+    <p class="note"><span class="ru">rows/s либо ops/s, чем больше — тем лучше. DNA-DB: <code>--sync strict</code> (fsync на каждый ack). MySQL: <code>innodb_flush_log_at_trx_commit=1</code>. PostgreSQL: <code>synchronous_commit=on</code>. Полная методика: <a href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/docs/DB_COMPARISON_RU.md">DB_COMPARISON_RU.md</a>.</span>
+    <span class="en">rows/s or ops/s, higher is better. DNA-DB: <code>--sync strict</code> (fsync per ack). MySQL: <code>innodb_flush_log_at_trx_commit=1</code>. PostgreSQL: <code>synchronous_commit=on</code>. Full methodology: <a href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/docs/DB_COMPARISON.md">DB_COMPARISON.md</a>.</span></p>
 
-    <div class="bench-grid">
-      <div><img class="bench-img" src="../docs/charts/v350/throughput.png" alt="Throughput by workload phase"></div>
-      <div><img class="bench-img" src="../docs/charts/v350/peak_write.png" alt="Peak write throughput"></div>
-      <div><img class="bench-img" src="../docs/charts/v350/latency_point_read.png" alt="Point read latency"></div>
-      <div><img class="bench-img" src="../docs/charts/v350/sql_features.png" alt="SQL feature conformance"></div>
+    <h3><span class="ru">Движок v4.0.0-GA — быстрее ещё раз</span><span class="en">The v4.0.0-GA engine is faster still</span></h3>
+    <div class="v400">
+      <div class="cell"><div class="n">39 194 <small>ops/s</small></div><div class="t ru">запись по одной строке (p50 0,02 мс)</div><div class="t en">single-row insert (p50 0.02 ms)</div></div>
+      <div class="cell"><div class="n">308 423 <small>rows/s</small></div><div class="t ru">пакетная запись, батчи по 200</div><div class="t en">batched write, 200-row batches</div></div>
+      <div class="cell"><div class="n">35 493 <small>ops/s</small></div><div class="t ru">точечное чтение (p50 0,02 мс)</div><div class="t en">point read (p50 0.02 ms)</div></div>
+      <div class="cell"><div class="n">20 711 <small>ops/s</small></div><div class="t ru">смешанная 80/20, 8 потоков</div><div class="t en">mixed 80/20, 8 threads</div></div>
+      <div class="cell"><div class="n">33 023 <small>ops/s</small></div><div class="t ru">SQL INSERT (3 000 строк)</div><div class="t en">SQL INSERT (3,000 rows)</div></div>
+      <div class="cell"><div class="n">27 074 <small>ops/s</small></div><div class="t ru">SQL SELECT по PK (×1 500)</div><div class="t en">SQL SELECT by PK (×1,500)</div></div>
     </div>
-    <p class="note ru">Сырые данные: <a href="../docs/bench_compare_results_v350_linux.json">bench_compare_results_v350_linux.json</a> · методика: <a href="../docs/DB_COMPARISON_RU.md">DB_COMPARISON_RU.md</a> · SQL-соответствие: <a href="../docs/SQL_FEATURES_RU.md">SQL_FEATURES_RU.md</a></p>
-    <p class="note en">Raw data: <a href="../docs/bench_compare_results_v350_linux.json">bench_compare_results_v350_linux.json</a> · methodology: <a href="../docs/DB_COMPARISON.md">DB_COMPARISON.md</a> · SQL conformance: <a href="../docs/SQL_FEATURES.md">SQL_FEATURES.md</a></p>
+    <p class="note"><span class="ru">Прогон v4.0.0 от 2026-10-31 выполнен на другой машине (8 потоков), поэтому напрямую с таблицей v3.5.0 не сопоставляется: та же методика <code>scripts/bench_compare.py</code>, числа MySQL/PostgreSQL в нём не участвуют. Сырые данные: <a href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/docs/bench_compare_results_v400_linux.json">bench_compare_results_v400_linux.json</a>.</span>
+    <span class="en">The v4.0.0 run dated 2026-10-31 used a different machine (8 threads), so it is not directly comparable to the v3.5.0 table: same <code>scripts/bench_compare.py</code> methodology, MySQL/PostgreSQL did not take part. Raw data: <a href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/docs/bench_compare_results_v400_linux.json">bench_compare_results_v400_linux.json</a>.</span></p>
+
+    <p style="margin-top:18px"><a class="btn ghost" href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/docs/reports/DB_COMPARISON_REPORT_v3.5.0_RU.pdf">📄 <span class="ru">Полный отчёт о сравнении (PDF, 13 стр., RU)</span><span class="en">Full comparison report (PDF, 13 pages, RU)</span></a></p>
+  </div>
+</section>
+
+<section id="charts">
+  <div class="wrap">
+    <div class="kicker">Charts</div>
+    <h2><span class="ru">Графики (прогон v3.5.0, та же машина)</span><span class="en">Charts (v3.5.0 run, same machine)</span></h2>
+    <p class="lead"><span class="ru">Пять диаграмм из полного отчёта: пропускная способность, задержки, масштабирование, ускорение относительно MySQL/PostgreSQL и соответствие SQL. Клик — увеличение.</span>
+    <span class="en">Five diagrams from the full report: throughput, latency, scaling, speed-up vs MySQL/PostgreSQL and SQL conformance. Click to zoom.</span></p>
+    <div class="chart-grid">
+      <figure><img src="assets/charts/throughput.png" alt="Throughput by phase"><figcaption><span class="ru">Пропускная способность по фазам нагрузки</span><span class="en">Throughput by workload phase</span></figcaption></figure>
+      <figure><img src="assets/charts/latency.png" alt="Latency"><figcaption><span class="ru">Задержки точечных чтений и SQL-запросов</span><span class="en">Point-read and SQL query latency</span></figcaption></figure>
+      <figure><img src="assets/charts/scaling.png" alt="Scaling"><figcaption><span class="ru">Масштабирование при росте нагрузки</span><span class="en">Scaling as the workload grows</span></figcaption></figure>
+      <figure><img src="assets/charts/speedup.png" alt="Speedup"><figcaption><span class="ru">Ускорение относительно MySQL 8.4.6 и PostgreSQL 17.11</span><span class="en">Speed-up vs MySQL 8.4.6 and PostgreSQL 17.11</span></figcaption></figure>
+      <figure><img src="assets/charts/sql_conformance.png" alt="SQL conformance"><figcaption><span class="ru">SQL-соответствие: 32 проверки, 0 несовпадений (v4.0: RIGHT/FULL JOIN, UNION, CTE, UPSERT, оконные)</span><span class="en">SQL conformance: 32 checks, 0 mismatches (v4.0 adds RIGHT/FULL JOIN, UNION, CTE, UPSERT, window functions)</span></figcaption></figure>
+    </div>
   </div>
 </section>
 
 <section id="tests">
   <div class="wrap">
     <div class="kicker">Testing</div>
-    <h2 class="ru">Полная батарея тестов — всё зелёное</h2><h2 class="en">Full test battery — all green</h2>
+    <h2><span class="ru">Полная батарея тестов — всё зелёное</span><span class="en">Full test battery — all green</span></h2>
     <div class="test-grid">
-      <div class="test"><div class="ok">197 / 197</div><h4>cargo test --release</h4><p class="ru">182 unit + 2 encryption + 13 recovery, включая 11 регрессионных тестов на фиксы аудита.</p><p class="en">182 unit + 2 encryption + 13 recovery, incl. 11 regression tests for the audit fixes.</p><a href="../docs/TEST_RESULTS_RU.md" class="ru">TEST_RESULTS_RU.md</a><a href="../docs/TEST_RESULTS.md" class="en">TEST_RESULTS.md</a></div>
-      <div class="test"><div class="ok">15 / 15</div><h4 class="ru">Живой smoke протокола</h4><h4 class="en">Live protocol smoke</h4><p class="ru">Аутентификация, pre-auth guard, CRUD, кадры 1 MiB, SQL/DnaQL, checkpoint, восстановление после kill.</p><p class="en">Auth, pre-auth guard, CRUD, 1 MiB frames, SQL/DnaQL, checkpoint, hard-kill recovery.</p><a href="../docs/smoke_test_results_v350.txt">smoke_test_results_v350.txt</a></div>
-      <div class="test"><div class="ok">12 / 12</div><h4 class="ru">Security smoke v3.5</h4><h4 class="en">Security smoke v3.5</h4><p class="ru">Случайный bootstrap, лимит глубины парсера, slowloris-дедлайн, отказ вторых instance и doctor на живой БД.</p><p class="en">Random bootstrap, parser depth limit, slowloris deadline, second-instance &amp; live-doctor refusals.</p><a href="../docs/security_smoke_v350.txt">security_smoke_v350.txt</a></div>
-      <div class="test"><div class="ok g">123 408 → 0</div><h4>kill -9 durability</h4><p class="ru">Подтверждённых записей перед SIGKILL → потеряно/испорчено после перезапуска (WAL replay + ремонт torn-write).</p><p class="en">Acknowledged writes before SIGKILL → lost/corrupt after restart (WAL replay + torn-write repair).</p><a href="../docs/KILL9_TEST_RESULT_v350.txt">KILL9_TEST_RESULT_v350.txt</a></div>
-      <div class="test"><div class="ok">3 / 3</div><h4 class="ru">Chaos и самовосстановление</h4><h4 class="en">Chaos &amp; self-healing</h4><p class="ru">60 повреждённых секторов офлайн и на живом сервере — 300 000 проверок ключей, 0 потерь; пере-повреждение честно помечено UNREPAIRABLE.</p><p class="en">60 damaged sectors offline and under a live server — 300 000 key verifications, 0 losses; over-damage honestly reported UNREPAIRABLE.</p><a href="../docs/chaos_results_v350.txt">chaos_results_v350.txt</a></div>
-      <div class="test"><div class="ok">0 <small style="font-size:13px">errors</small></div><h4>cargo clippy</h4><p class="ru">0 ошибок, 35 предупреждений (стиль/сложность). Ядро без <code>unsafe</code>.</p><p class="en">0 errors, 35 warnings (style/complexity). No <code>unsafe</code> in the core.</p><a href="../docs/clippy_v350.log">clippy_v350.log</a></div>
+      <div class="test"><div class="ok">215 / 215</div><h4>cargo test --release</h4><p class="ru">184 unit + 32 SQL-фичи + 13 recovery + Raft + tiering + pgwire.</p><p class="en">184 unit + 32 SQL features + 13 recovery + Raft + tiering + pgwire.</p><a href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/docs/TEST_RESULTS_RU.md">TEST_RESULTS_RU.md</a></div>
+      <div class="test"><div class="ok">32 / 32</div><h4><span class="ru">SQL-соответствие</span><span class="en">SQL conformance</span></h4><p class="ru">Канонический прогон: 0 unsupported, 0 mismatch, 0 error — включая RIGHT/FULL JOIN, UNION, CTE, UPSERT, оконные функции.</p><p class="en">Canonical run: 0 unsupported, 0 mismatch, 0 error — incl. RIGHT/FULL JOIN, UNION, CTE, UPSERT, window functions.</p><a href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/docs/SQL_FEATURES_RU.md">SQL_FEATURES_RU.md</a></div>
+      <div class="test"><div class="ok g">123 408 → 0</div><h4>kill -9 durability</h4><p class="ru">Подтверждённых записей перед SIGKILL → потеряно/испорчено после перезапуска (WAL replay + ремонт torn-write).</p><p class="en">Acknowledged writes before SIGKILL → lost/corrupt after restart (WAL replay + torn-write repair).</p><a href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/docs/KILL9_TEST_RESULT_v350.txt">KILL9_TEST_RESULT_v350.txt</a></div>
+      <div class="test"><div class="ok">3 / 3</div><h4><span class="ru">Chaos и самовосстановление</span><span class="en">Chaos &amp; self-healing</span></h4><p class="ru">60 повреждённых секторов офлайн и на живом сервере, 300 000 проверок ключей, 0 потерь; пере-повреждение честно помечено UNREPAIRABLE.</p><p class="en">60 damaged sectors offline and under a live server, 300,000 key verifications, 0 losses; over-damage honestly reported UNREPAIRABLE.</p><a href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/docs/chaos_results_v350.txt">chaos_results_v350.txt</a></div>
+      <div class="test"><div class="ok">15 / 15</div><h4><span class="ru">Живой smoke протокола</span><span class="en">Live protocol smoke</span></h4><p class="ru">Аутентификация, pre-auth guard, CRUD, кадры 1 MiB, SQL/DnaQL, checkpoint, восстановление после kill.</p><p class="en">Auth, pre-auth guard, CRUD, 1 MiB frames, SQL/DnaQL, checkpoint, hard-kill recovery.</p><a href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/docs/smoke_test_results_v350.txt">smoke_test_results_v350.txt</a></div>
+      <div class="test"><div class="ok">12 / 12</div><h4><span class="ru">Security smoke v3.5</span><span class="en">Security smoke v3.5</span></h4><p class="ru">Случайный bootstrap, лимит глубины парсера, slowloris-дедлайн, отказ вторых instance и doctor на живой БД.</p><p class="en">Random bootstrap, parser depth limit, slowloris deadline, second-instance &amp; live-doctor refusals.</p><a href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/docs/security_smoke_v350.txt">security_smoke_v350.txt</a></div>
+      <div class="test"><div class="ok">8 / 8</div><h4><span class="ru">pgwire E2E (сырой клиент)</span><span class="en">pgwire E2E (raw client)</span></h4><p class="ru">Handshake, VERSION(), DDL/DML, SELECT, оконные функции через pgwire, NULL, ErrorResponse, BEGIN/ROLLBACK/COMMIT.</p><p class="en">Handshake, VERSION(), DDL/DML, SELECT, window functions over pgwire, NULL, ErrorResponse, BEGIN/ROLLBACK/COMMIT.</p><a href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/tests/test_pgwire_client.py">tests/test_pgwire_client.py</a></div>
+      <div class="test"><div class="ok">1,05 <small style="font-size:13px">c</small></div><h4><span class="ru">Raft failover</span><span class="en">Raft failover</span></h4><p class="ru">3 ноды: выборы, репликация 3/3, отказ лидера — новый лидер за 1,05 c (SLA &lt; 2 c), ноль потерь закоммиченных записей.</p><p class="en">3 nodes: elections, 3/3 replication, leader loss — new leader in 1.05 s (SLA &lt; 2 s), zero loss of committed writes.</p><a href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/tests/raft_cluster.rs">tests/raft_cluster.rs</a></div>
     </div>
   </div>
 </section>
@@ -238,75 +280,138 @@ html[lang=en] .ru{display:none}
 <section id="shots">
   <div class="wrap">
     <div class="kicker">Screenshots</div>
-    <h2 class="ru">Админ-панель (v3.5.0)</h2><h2 class="en">Admin panel (v3.5.0)</h2>
+    <h2><span class="ru">Админ-панель</span><span class="en">Admin panel</span></h2>
     <div class="shots">
-      <figure class="shot"><img src="../docs/screenshots/panel-01-login.png" alt="login"><figcaption class="ru">Вход: Argon2id, lockout по IP/логину</figcaption><figcaption class="en">Login: Argon2id, per-IP/username lockout</figcaption></figure>
-      <figure class="shot"><img src="../docs/screenshots/panel-02-dashboard.png" alt="dashboard"><figcaption class="ru">Дашборд: KPI движка и диагностика HEALTH</figcaption><figcaption class="en">Dashboard: engine KPIs and HEALTH diagnostics</figcaption></figure>
-      <figure class="shot"><img src="../docs/screenshots/panel-03-tables.png" alt="tables"><figcaption class="ru">Таблицы: просмотр данных и индексы</figcaption><figcaption class="en">Tables: data browser and indexes</figcaption></figure>
-      <figure class="shot"><img src="../docs/screenshots/panel-04-sql-console.png" alt="sql console"><figcaption class="ru">SQL-консоль: JOIN с планом запроса</figcaption><figcaption class="en">SQL console: JOIN with query plan</figcaption></figure>
-      <figure class="shot"><img src="../docs/screenshots/panel-05-dnaql.png" alt="dnaql console"><figcaption class="ru">DnaQL-консоль: GC_CONTENT и MELTING_TEMP</figcaption><figcaption class="en">DnaQL console: GC_CONTENT &amp; MELTING_TEMP</figcaption></figure>
-      <figure class="shot"><img src="../docs/screenshots/panel-06-row-editor.png" alt="row editor"><figcaption class="ru">Редактор строки с генерацией UPDATE</figcaption><figcaption class="en">Row editor with generated UPDATE</figcaption></figure>
+      <figure class="shot"><img src="assets/screenshots/panel-01-login.png" alt="login"><figcaption><span class="ru">Вход: Argon2id, lockout по IP/логину</span><span class="en">Login: Argon2id, per-IP/username lockout</span></figcaption></figure>
+      <figure class="shot"><img src="assets/screenshots/panel-02-dashboard.png" alt="dashboard"><figcaption><span class="ru">Дашборд: KPI движка и диагностика HEALTH</span><span class="en">Dashboard: engine KPIs and HEALTH diagnostics</span></figcaption></figure>
+      <figure class="shot"><img src="assets/screenshots/panel-03-tables.png" alt="tables"><figcaption><span class="ru">Таблицы: просмотр данных и индексы</span><span class="en">Tables: data browser and indexes</span></figcaption></figure>
+      <figure class="shot"><img src="assets/screenshots/panel-04-sql-console.png" alt="sql console"><figcaption><span class="ru">SQL-консоль: JOIN с планом запроса</span><span class="en">SQL console: JOIN with query plan</span></figcaption></figure>
+      <figure class="shot"><img src="assets/screenshots/panel-05-dnaql.png" alt="dnaql console"><figcaption><span class="ru">DnaQL-консоль: GC_CONTENT и MELTING_TEMP</span><span class="en">DnaQL console: GC_CONTENT &amp; MELTING_TEMP</span></figcaption></figure>
+      <figure class="shot"><img src="assets/screenshots/panel-06-row-editor.png" alt="row editor"><figcaption><span class="ru">Редактор строки с генерацией UPDATE</span><span class="en">Row editor with generated UPDATE</span></figcaption></figure>
     </div>
+  </div>
+</section>
+
+<section id="guide" class="guide">
+  <div class="wrap">
+    <div class="kicker">Guide</div>
+    <h2><span class="ru">Руководство: от нуля до кластера</span><span class="en">Guide: from zero to a cluster</span></h2>
+
+    <h3><span class="num">1.</span><span class="ru">Сборка и первый запуск</span><span class="en">Build and first run</span></h3>
+<pre><span class="c"># Rust 1.75+</span>
+git clone https://github.com/nsmykh70-creator/dna-db-core.git
+cd dna-db-core &amp;&amp; cargo build --release
+
+<span class="c"># запуск: TCP-протокол на 9999, веб-панель на 8080</span>
+./target/release/dna-db-core serve --data-dir ./dna_data --port 9999 --admin-port 8080
+<span class="c"># панель: https://127.0.0.1:8080/ — TLS включён всегда,</span>
+<span class="c"># пароль администратора генерируется случайно и печатается один раз</span></pre>
+
+    <h3><span class="num">2.</span><span class="ru">Подключение клиентов</span><span class="en">Connecting clients</span></h3>
+<pre><span class="c"># CLI shell поверх TLS (самоподписанный сертификат сервера):</span>
+./target/release/dna-db-core shell --tls-ca ./dna_data/tls/cert.pem
+
+<span class="c"># psql и любой PG-драйвер — через pgwire (PostgreSQL Wire Protocol v3):</span>
+./target/release/dna-db-core serve --data-dir ./dna_data --admin-port 8080 --pgwire-port 5432
+psql "host=127.0.0.1 port=5432 user=admin dbname=dna" -c "SELECT VERSION();"</pre>
+
+    <h3><span class="num">3.</span><span class="ru">SQL, который теперь поддерживается полностью</span><span class="en">SQL now fully supported</span></h3>
+<pre><span class="c">-- CTE + JOIN</span>
+WITH top AS (SELECT dept, COUNT(*) AS n FROM users GROUP BY dept)
+SELECT u.name, t.n FROM users u JOIN top t ON u.dept = t.dept;
+
+<span class="c">-- RIGHT / FULL OUTER JOIN</span>
+SELECT name, total FROM users RIGHT JOIN orders ON users.id = orders.uid;
+SELECT name, total FROM users FULL OUTER JOIN orders ON users.id = orders.uid;
+
+<span class="c">-- UNION и оконные функции</span>
+SELECT dept FROM users WHERE id = 1 UNION SELECT dept FROM users WHERE id = 2;
+SELECT name, RANK() OVER (PARTITION BY dept ORDER BY total DESC) FROM users;
+
+<span class="c">-- UPSERT и транзакция (один атомарный WAL-кадр на COMMIT)</span>
+INSERT INTO kv (k, v) VALUES ('chr1', 3001) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v;
+BEGIN;
+UPDATE accounts SET bal = bal - 100 WHERE id = 1;
+UPDATE accounts SET bal = bal + 100 WHERE id = 2;
+COMMIT;</pre>
+
+    <h3><span class="num">4.</span><span class="ru">DnaQL — запросы к последовательностям</span><span class="en">DnaQL — sequence queries</span></h3>
+<pre><span class="c">-- анализ и реверс-комплемент</span>
+ANALYZE SEQUENCE 'CGCGCGATCGATCGCGC' |> REV_COMP();
+
+<span class="c">-- джойн двух хромосом по комплементарным ID</span>
+FROM chr_a |> LINK chr_b VIA COMPLEMENT(b_id) |> EMIT *;</pre>
+    <p class="note"><span class="ru">Полная грамматика: <a href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/docs/DNAQL_SPEC.md">DNAQL_SPEC.md</a>, руководство: <a href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/docs/DNAQL_MANUAL_RU.md">DNAQL_MANUAL_RU.md</a></span><span class="en">Full grammar: <a href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/docs/DNAQL_SPEC.md">DNAQL_SPEC.md</a></span></p>
+
+    <h3><span class="num">5.</span><span class="ru">Raft-кластер из трёх нод</span><span class="en">A three-node Raft cluster</span></h3>
+<pre><span class="c"># три терминала (id уникален, каждый со своим data-dir):</span>
+./target/release/dna-db-core cluster --id 0 --port 9500 --data-dir ./dna_node0 \
+  --peers 0=127.0.0.1:9500,1=127.0.0.1:9501,2=127.0.0.1:9502
+./target/release/dna-db-core cluster --id 1 --port 9501 --data-dir ./dna_node1 \
+  --peers 0=127.0.0.1:9500,1=127.0.0.1:9501,2=127.0.0.1:9502
+./target/release/dna-db-core cluster --id 2 --port 9502 --data-dir ./dna_node2 \
+  --peers 0=127.0.0.1:9500,1=127.0.0.1:9501,2=127.0.0.1:9502
+
+<span class="c"># запись принимается лидером; при его отказе новый лидер выбирается за &lt;2 c,</span>
+<span class="c"># не-лидер отвечает NOT_LEADER с адресом текущего.</span></pre>
+
+    <h3><span class="num">6.</span><span class="ru">Мониторинг, тиринг, PITR</span><span class="en">Monitoring, tiering, PITR</span></h3>
+<pre><span class="c"># Prometheus-метрики (панель-порт):</span>
+curl -k https://127.0.0.1:8080/metrics | head
+
+<span class="c"># консистентный снапшот и восстановление на момент времени:</span>
+./target/release/dna-db-core pitr --data-dir ./dna_data --target ./snaps/t1
+./target/release/dna-db-core pitr --restore --data-dir ./dna_data --target ./snaps/t1
+
+<span class="c"># ротация ключа шифрования без простоя (включая зеркало Strand B):</span>
+./target/release/dna-db-core rotate-key --data-dir ./dna_data \
+  --new-key-file /secure/dna-new.key --mirror-dir /mnt/dna_mirror</pre>
+
+    <h3><span class="num">7.</span><span class="ru">Проверка всего этого у себя</span><span class="en">Verify it yourself</span></h3>
+<pre>cargo test --release          <span class="c"># 215 тестов</span>
+python3 scripts/smoke_test.py <span class="c"># живой smoke протокола</span>
+python3 scripts/chaos_test.py <span class="c"># хаос-тест самовосстановления</span>
+python3 scripts/bench_compare.py <span class="c"># трёхсторонний бенчмарк (нужны MySQL/PG)</span></pre>
+    <p class="note"><span class="ru">Полное описание сервера, TLS, ACL и протокола: <a href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/README_RU.md">README_RU.md</a> · <a href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/docs/PROTOCOL.md">PROTOCOL.md</a></span><span class="en">Full server, TLS, ACL and protocol reference: <a href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/README.md">README.md</a> · <a href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/docs/PROTOCOL.md">PROTOCOL.md</a></span></p>
   </div>
 </section>
 
 <section id="docs">
   <div class="wrap">
     <div class="kicker">Documentation</div>
-    <h2 class="ru">Документация</h2><h2 class="en">Documentation</h2>
+    <h2><span class="ru">Документация</span><span class="en">Documentation</span></h2>
     <div class="docs-grid">
-      <a class="doc" href="../README.md"><b>README (EN)</b><span class="ru">Обзор, безопасность, запуск</span><span class="en">Overview, security, quick start</span></a>
-      <a class="doc" href="../README_RU.md"><b>README (RU)</b><span class="ru">Обзор, безопасность, запуск</span><span class="en">Overview, security, quick start</span></a>
-      <a class="doc" href="../docs/PROTOCOL.md"><b>PROTOCOL.md</b><span class="ru">Бинарный TCP-протокол</span><span class="en">Binary TCP protocol</span></a>
-      <a class="doc" href="../docs/DNAQL_SPEC.md"><b>DNAQL_SPEC.md</b><span class="ru">Грамматика и пайплайны DnaQL</span><span class="en">DnaQL grammar &amp; pipelines</span></a>
-      <a class="doc" href="../docs/DNAQL_MANUAL_RU.md"><b>DNAQL_MANUAL (RU)</b><span class="ru">Руководство по DnaQL</span><span class="en">DnaQL manual</span></a>
-      <a class="doc" href="../docs/SQL_MANUAL.md"><b>SQL_MANUAL.md</b><span class="ru">SQL-подмножество</span><span class="en">SQL subset</span></a>
-      <a class="doc" href="../docs/TEST_RESULTS.md"><b>TEST_RESULTS.md</b><span class="ru">Полная батарея тестов</span><span class="en">Full test battery</span></a>
-      <a class="doc" href="../docs/DB_COMPARISON.md"><b>DB_COMPARISON.md</b><span class="ru">Методика бенчмарка против MySQL/PG</span><span class="en">MySQL/PG benchmark methodology</span></a>
-      <a class="doc" href="../docs/SECURITY.md"><b>SECURITY.md</b><span class="ru">Модель угроз и безопасность</span><span class="en">Threat model &amp; security</span></a>
-      <a class="doc" href="../docs/RELEASE_NOTES_v3.5.0.md"><b>RELEASE_NOTES v3.5.0</b><span class="ru">Что закрыл аудит</span><span class="en">What the audit closed</span></a>
-      <a class="doc" href="../CHANGELOG.md"><b>CHANGELOG.md</b><span class="ru">История изменений</span><span class="en">Change history</span></a>
-      <a class="doc" href="../docs/ROADMAP.md"><b>ROADMAP.md</b><span class="ru">Планы развития</span><span class="en">Roadmap</span></a>
+      <a class="doc" href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/README.md"><b>README (EN)</b><span class="ru">Обзор, безопасность, запуск</span><span class="en">Overview, security, quick start</span></a>
+      <a class="doc" href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/README_RU.md"><b>README (RU)</b><span class="ru">Обзор, безопасность, запуск</span><span class="en">Обзор, безопасность, запуск</span></a>
+      <a class="doc" href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/docs/DNAQL_SPEC.md"><b>DNAQL_SPEC.md</b><span class="ru">Грамматика и пайплайны DnaQL</span><span class="en">DnaQL grammar &amp; pipelines</span></a>
+      <a class="doc" href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/docs/DNAQL_MANUAL_RU.md"><b>DNAQL_MANUAL (RU)</b><span class="ru">Руководство по DnaQL</span><span class="en">DnaQL manual</span></a>
+      <a class="doc" href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/docs/SQL_MANUAL.md"><b>SQL_MANUAL.md</b><span class="ru">SQL-подмножество движка</span><span class="en">Engine SQL subset</span></a>
+      <a class="doc" href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/docs/SQL_FEATURES_RU.md"><b>SQL_FEATURES (RU)</b><span class="ru">32 проверки соответствия SQL</span><span class="en">32 SQL conformance checks</span></a>
+      <a class="doc" href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/docs/PROTOCOL.md"><b>PROTOCOL.md</b><span class="ru">Бинарный TCP-протокол</span><span class="en">Binary TCP protocol</span></a>
+      <a class="doc" href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/docs/BENCHMARKS.md"><b>BENCHMARKS.md</b><span class="ru">Все прогоны и методики</span><span class="en">All runs and methodologies</span></a>
+      <a class="doc" href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/docs/DB_COMPARISON_RU.md"><b>DB_COMPARISON (RU)</b><span class="ru">Методика бенчмарка против MySQL/PG</span><span class="en">MySQL/PG benchmark methodology</span></a>
+      <a class="doc" href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/docs/reports/DB_COMPARISON_REPORT_v3.5.0_RU.pdf"><b>📄 Отчёт PDF (RU)</b><span class="ru">13-страничное сравнение с таблицами и графиками</span><span class="en">13-page comparison with tables and charts</span></a>
+      <a class="doc" href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/docs/TEST_RESULTS_RU.md"><b>TEST_RESULTS (RU)</b><span class="ru">Полная батарея тестов</span><span class="en">Full test battery</span></a>
+      <a class="doc" href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/docs/SECURITY_RU.md"><b>SECURITY (RU)</b><span class="ru">Модель угроз и безопасность</span><span class="en">Threat model &amp; security</span></a>
+      <a class="doc" href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/docs/RELEASE_NOTES_v4.0.0.md"><b>RELEASE_NOTES v4.0.0</b><span class="ru">Что вошло в GA-релиз</span><span class="en">What shipped in the GA release</span></a>
+      <a class="doc" href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/CHANGELOG.md"><b>CHANGELOG.md</b><span class="ru">История изменений</span><span class="en">Change history</span></a>
+      <a class="doc" href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/docs/ROADMAP_RU.md"><b>ROADMAP (RU)</b><span class="ru">Планы развития</span><span class="en">Roadmap</span></a>
+      <a class="doc" href="https://github.com/nsmykh70-creator/dna-db-core"><b>GitHub ↗</b><span class="ru">Исходный код, issues, releases</span><span class="en">Source, issues, releases</span></a>
     </div>
-  </div>
-</section>
-
-<section id="quickstart">
-  <div class="wrap">
-    <div class="kicker">Quick start</div>
-    <h2 class="ru">Запуск за две минуты</h2><h2 class="en">Up and running in two minutes</h2>
-<pre><span class="c"># build (Rust 1.75+)</span>
-cargo build --release
-
-<span class="c"># start: TLS + at-rest encryption are ON by default.</span>
-<span class="c"># No default password: a random 24-symbol bootstrap password</span>
-<span class="c"># is printed ONCE to stderr (must_change = true)</span>
-./target/release/dna-db-core serve \
-    --data-dir ./dna_data --port 9999 --admin-port 8080
-
-<span class="c"># → [SECURITY] bootstrap admin (shown ONCE): admin / &lt;random&gt;</span>
-<span class="c"># open the panel and change the password:</span>
-<span class="k">https://127.0.0.1:8080/</span>
-
-<span class="c"># or set your own password explicitly:</span>
-./target/release/dna-db-core serve --data-dir ./dna_data \
-    --port 9999 --admin-port 8080 <span class="s">--admin-pass 'change-me-now'</span> <span class="s">--demo-data</span></pre>
-    <p class="note ru">Полное руководство: <a href="../README_RU.md">README_RU.md</a> · протокол: <a href="../docs/PROTOCOL.md">PROTOCOL.md</a></p>
-    <p class="note en">Full guide: <a href="../README.md">README.md</a> · protocol: <a href="../docs/PROTOCOL.md">PROTOCOL.md</a></p>
   </div>
 </section>
 
 <footer>
   <div class="wrap">
-    <div>🧬 <b style="color:var(--text)">DNA-DB Core v3.5.0</b> · <span class="ru">выпуск закалки аудита: закрыты 3×P0, 12×P1 и ключевые P2</span><span class="en">audit remediation release: 3×P0, 12×P1 and key P2 findings closed</span></div>
-    <div>AGPL-3.0 / Apache-2.0 · rustls · Argon2id · XChaCha20-Poly1305 · Reed–Solomon RS(4+2)</div>
+    <div class="f1">🧬 <b style="color:var(--text)">DNA-DB Enterprise v4.0.0-GA</b> · <span class="ru">единый бинарник: SQL 32/32, pgwire, Raft, S3-тиринг, PITR, Prometheus, Kubernetes</span><span class="en">a single binary: SQL 32/32, pgwire, Raft, S3 tiering, PITR, Prometheus, Kubernetes</span></div>
+    <div>AGPL-3.0 / Apache-2.0 · rustls TLS 1.3 · Argon2id · XChaCha20-Poly1305 · Reed–Solomon RS(4+2)</div>
   </div>
 </footer>
 
 <div id="lb"><img id="lb-img" src="" alt=""></div>
 
 <script>
-// language toggle
+// language toggle (RU default)
 var btn = document.getElementById('lang');
 function setLang(l){
   document.documentElement.lang = l;
@@ -318,9 +423,9 @@ btn.addEventListener('click', function(){
 });
 try { var saved = localStorage.getItem('dnadb_lang'); if (saved) setLang(saved); } catch(e){}
 
-// lightbox
+// lightbox for screenshots and charts
 var lb = document.getElementById('lb'), lbImg = document.getElementById('lb-img');
-document.querySelectorAll('.shot img').forEach(function(img){
+document.querySelectorAll('.shot img, .chart-grid img').forEach(function(img){
   img.addEventListener('click', function(){ lbImg.src = img.src; lb.classList.add('open'); });
 });
 lb.addEventListener('click', function(){ lb.classList.remove('open'); });
