@@ -53,34 +53,50 @@ COM_STMT_*. После него работают mysqli, PDO_mysql, phpMyAdmin, 
 
 ## 4. Пробелы движка (чек-лист из аудита)
 
-1. **AUTO_INCREMENT + `LAST_INSERT_ID()`** — сессионное состояние есть
-   (`CmsSession::last_insert_id`), нет генератора на уровне таблицы.
+Состояние после фазы-1 каркаса (ветка `cms-edition`):
+
+1. **AUTO_INCREMENT + `LAST_INSERT_ID()`** — ✅ готово: реестр
+   последовательностей (`cms::sequence`, seed от MAX(pk), bump по явным id),
+   поле `auto_increment_column` в схеме, назначение в `exec_insert_tx`,
+   шим `SELECT LAST_INSERT_ID()` в гейте.
 2. **`SELECT … FOR UPDATE` / deadlock-детект** с кодами 1213/1205 из
-   `cms::errno`.
+   `cms::errno` — фаза 2 (база: `tx.rs`).
 3. **Коллации** `utf8mb4_unicode_ci`: сравнение без регистра, PAD SPACE,
-   составные и префиксные индексы (meta_value 191).
-4. **`FOUND_ROWS()` / `SQL_CALC_FOUND_ROWS`** — поле в `CmsSession` готово.
-5. **Каталог**: `SHOW TABLES LIKE`, `SHOW FULL COLUMNS` (байт-в-байт формат
-   для `dbDelta()`), `SHOW INDEX`, `information_schema`.
-6. **ALTER TABLE**: ADD/DROP COLUMN/INDEX, изменение типа (онлайн).
-7. **Именованные блокировки** — registry готов (`cms::locks`), нужна
-   привязка к SQL-диалекту.
-8. **Типы**: BIGINT UNSIGNED, DECIMAL (WooCommerce-цены), DATETIME с
-   нулевыми датами, ENUM.
-9. **SET-функции сессии**: `SET NAMES` (парсер есть), `USE db`,
-   `SET autocommit`.
-10. **Unix domain socket** для хостингов, persistent connections PHP-FPM.
+   составные и префиксные индексы (meta_value 191) — префиксы сохраняются
+   в оверлее, сравнение — фаза 2.
+4. **`FOUND_ROWS()` / `SQL_CALC_FOUND_ROWS`** — ✅ готово в гейте
+   (приближение: счёт по странице, не по запросу без LIMIT).
+5. **Каталог**: `SHOW TABLES LIKE`, `SHOW FULL COLUMNS`, `SHOW INDEX` —
+   ✅ готово через оверлей (`cms::ddl_meta`: MySQL-точный `Type`, чтобы
+   dbDelta не видел расхождений) + fallback из схемы движка;
+   `information_schema` — фаза 2.
+6. **ALTER TABLE**: ADD/DROP COLUMN/INDEX, изменение типа (онлайн) — фаза 2.
+7. **Именованные блокировки** — ✅ готово: реестр `cms::locks` + SQL-шимы
+   `GET_LOCK/RELEASE_LOCK/IS_FREE_LOCK/IS_USED_LOCK` в гейте.
+8. **Типы**: BIGINT UNSIGNED/DECIMAL/DATETIME/ENUM — частично: имена
+   принимаются и маппятся на базовые типы (cms-грамматика), семантика
+   unsigned/decimal — фаза 2.
+9. **SET-функции сессии**: `SET NAMES`, `USE db`, `SET autocommit`,
+   `SET sql_mode` — ✅ готово в гейте; `CmsSession` хранит состояние.
+10. **Unix domain socket** для хостингов, persistent connections PHP-FPM —
+    фаза 4 (wire-протокол).
+11. **DEFAULT-fill при INSERT** (новое, из тестов фазы 1): колонки,
+    не указанные в INSERT, хранятся разреженно; движку нужна подстановка
+    дефолтов из оверлея — фаза 2 (ядро WP даты шлёт явно, поэтому
+    установку это не блокирует).
 
 ## 5. Фазы
 
-**Фаза 0 — корпус запросов (1–2 нед).** Снять реальный SQL: лог прокси +
-ядро WP 6.x + WooCommerce + Yoast + Elementor + ACF + Joomla 5 installer.
-Результат: `docs/cms/wp_queries_corpus.txt` — это ТЗ транслятора и
-критерий полноты.
+**Фаза 0 — корпус запросов (1–2 нед).** ✅ Выполнено:
+`docs/cms/wp_queries_corpus.txt` — канонический набор SYS/OPTIONS/POSTS/
+TAXONOMY/USERS/COMMENTS/DDL/WOO-запросов; это ТЗ транслятора и критерий
+полноты.
 
-**Фаза 1 — WP drop-in MVP (4–8 нед).** Транслятор подмножества из фазы 0,
-AUTO_INCREMENT, LAST_INSERT_ID/FOUND_ROWS через `CmsSession`, SHOW-семейство
-(dbDelta-совместимый вывод), errno-маппинг через `cms::errno`.
+**Фаза 1 — WP drop-in MVP (4–8 нед).** 🔶 В прогрессе: диалект-гейт
+`cms::compat`, AUTO_INCREMENT, errno-маппинг, SHOW-семейство с
+dbDelta-совместимым выводом и прототип `cms/php/wp-content/db.php` —
+готовы; остаётся: прогон phpunit ядра WP против гейта, ALTER TABLE,
+information_schema.
 Приёмка: установка WP 6.x на DNA-DB, wp-admin работает, phpunit ядра WP.
 
 **Фаза 2 — WooCommerce + Joomla (6–10 нед).** MVCC/`FOR UPDATE`,
@@ -99,7 +115,7 @@ mysqli/PDO_mysql/phpMyAdmin работают сами. CMS-редакция ст
 
 - База — `main`; rebase на main не реже чем раз в фазу.
 - Всё CMS-специфичное — за feature `cms`: `cargo build --release --features cms`.
-- Обычная сборка и 189 тестов main не должны меняться (сейчас: 200 тестов
+- Обычная сборка и 189 тестов main не должны меняться (сейчас: 224 теста
   с feature, main-сборка без изменений).
 - При зрелости фазы 2 — обсуждение слияния `cms` в main как опциональной
   фичи; ветка остаётся для фаз 3–4.

@@ -19,6 +19,45 @@
   - 11 new unit tests (200 total with the feature); plain main build and
     its tests unchanged.
 
+### Phase-1 groundwork (corpus → sequences → dialect gate → drop-in)
+
+- **WordPress query corpus** — `docs/cms/wp_queries_corpus.txt`: the
+  canonical WordPress/WooCommerce statement set (SYS / OPTIONS / POSTS /
+  TAXONOMY / USERS / COMMENTS / DDL / WOO sections) the dialect layer must
+  serve — the phase-1 acceptance spec.
+- **AUTO_INCREMENT engine support** — `ChromosomeTable.auto_increment_column`
+  (serde-default). Behind the cms feature, CREATE TABLE accepts the MySQL
+  dialect: bigint/tinyint/varchar(n)/longtext/datetime/decimal type names,
+  `(n)` lengths, UNSIGNED/NULL/DEFAULT literals, COMMENT, KEY / INDEX /
+  UNIQUE KEY / FULLTEXT constraint lines (single-column keys become engine
+  secondary indexes; composite keys index the first column non-uniquely),
+  composite PRIMARY KEY (engine keys the first column) and trailing
+  ENGINE/AUTO_INCREMENT/CHARSET/COLLATE table options. `exec_insert_tx`
+  assigns sequence ids for missing/NULL/0 values and bumps the counter on
+  explicit ids; sequences are per-table, lazily seeded from MAX(pk).
+- **cms::compat — the dialect gate** — `CmsSqlGate::execute(session, sql)`:
+  per-connection `CmsSession` (SET NAMES / SET sql_mode / SET autocommit /
+  USE), SELECT function shims (`LAST_INSERT_ID()`, `FOUND_ROWS()`,
+  `ROW_COUNT()`, `VERSION()`, `@@sql_mode`/`@@version`),
+  `GET_LOCK/RELEASE_LOCK/IS_FREE_LOCK/IS_USED_LOCK` SQL shims,
+  SQL_CALC_FOUND_ROWS strip + accounting, `SHOW TABLES [LIKE]`,
+  `SHOW [FULL] COLUMNS` / `SHOW INDEX` via the catalog overlay with an
+  engine-derived fallback, a canned `SHOW VARIABLES` subset, and MySQL
+  errno classification (1062/1146/1064/1452/…) on every error.
+- **cms::ddl_meta + cms::wordpress** — MySQL CREATE TABLE parser for the
+  dbDelta-exact catalog overlay (raw `Type` strings round-trip, so dbDelta
+  never sees a diff) and the 12-table WordPress core preset (faithful DDL,
+  auto-increment anchors, composite-key overlay tests).
+- **WordPress drop-in prototype** — `cms/php/wp-content/db.php`:
+  `DNA_DB_wpdb extends wpdb` over `POST /api/query` (login token caching,
+  wp_remote_post with a stream fallback, MySQL string escaping,
+  insert_id from INSERT pk rows, dbDelta-capable SHOW output,
+  utf8mb4-fixed charset reporting) + `cms/php/README_RU.md` (install,
+  coverage, prototype limits).
+- Tests: 35 cms unit tests total (224 with the feature, incl. the dbDelta
+  idempotency comparison and plugin-DDL-through-gate); main build and its
+  189 tests unchanged.
+
 ## Unreleased (v4.1)
 
 - **Transparent storage for SQL operators** — the operator writes plain SQL
