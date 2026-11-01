@@ -3,7 +3,7 @@
 //!
 //! Implements the DNA-repair analogy end to end:
 //!
-//! * *checkpoint kinases*  — CRC32C on every 4 KiB block (segment_block.rs)
+//! * *checkpoint kinases*  — CRC-32 (IEEE, crc32fast) on every 4 KiB block (segment_block.rs)
 //! * *excision repair*     — on-read repair: detect → reconstruct from
 //!   surviving parity shards → rewrite → journal
 //! * *enzyme scanners*     — background scrubber with rate limit

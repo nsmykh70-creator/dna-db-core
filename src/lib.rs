@@ -17,7 +17,7 @@
 //!
 //! v3.0 «Repairosome» — self-healing storage:
 //! - Reed–Solomon erasure coding inside every segment (GF(2^8), k+m blocks)
-//! - CRC32C per 4 KiB block; on-read repair; background scrubber
+//! - CRC-32 (IEEE, crc32fast) per 4 KiB block; on-read repair; background scrubber
 //! - `doctor` offline scan/fix/migration; repair journal; health API
 
 pub mod admin;

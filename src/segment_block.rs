@@ -3,7 +3,7 @@
 //!
 //! A segment is a sequence of 4 KiB blocks organised into Reed–Solomon
 //! stripes of `k` data + `m` parity shards. Every block is covered by a
-//! CRC32C stored in a table at the end of the file, so any 4 KiB sector
+//! CRC-32 (IEEE) stored in a table at the end of the file, so any 4 KiB sector
 //! damage (bit-rot, dead sector, torn write) is *detected* per block and
 //! *repairable* from parity as long as ≤ m blocks of its stripe survive.
 //!
@@ -13,7 +13,7 @@
 //! [superblock   4096 B]  magic, geometry, counters, self-CRC
 //! [data region]          S_data  * (k+m) blocks (records, packed)
 //! [index region]         S_index * (k+m) blocks (block index, packed)
-//! [crc table]            (S_data + S_index) * (k+m) * u32  (CRC32C per block)
+//! [crc table]            (S_data + S_index) * (k+m) * u32  (CRC-32 per block)
 //! [footer        32 B]   cross-check copies + table CRC + magic
 //! ```
 //!
