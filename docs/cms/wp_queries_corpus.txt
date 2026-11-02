@@ -135,6 +135,19 @@
 [P2] SELECT id FROM wp_wc_orders WHERE status = 'processing' ORDER BY date_created_gmt DESC LIMIT 25
 [P2] SELECT COUNT(DISTINCT customer_id) FROM wp_wc_orders WHERE status IN ('wc-completed','wc-processing')
 
+# HPOS-легаси позиции заказа (Woo 11.2.1). Критичная форма: wpdb->insert()
+# БЕЗ массива формата шлёт каждое значение СТРОКОЙ — order_id приходит
+# '42' в bigint unsigned. MariaDB приводит к типу колонки при записи;
+# иначе ключ вторичного индекса не совпадает с Int-литералом чтения
+# (регрессия E2E 2026-11-02: get_items() пуст, склад не списывается).
+[P2] SELECT order_item_id, order_item_name FROM wp_woocommerce_order_items WHERE order_id = 42 ORDER BY order_item_id
+[P2] SELECT COUNT(*) FROM wp_woocommerce_order_items WHERE order_id = '42'
+[P2] SELECT meta_key, meta_value FROM wp_woocommerce_order_itemmeta WHERE order_item_id = 1 AND meta_key = '_qty'
+[P2] INSERT INTO wp_woocommerce_order_items (order_item_name, order_item_type, order_id) VALUES ('Строковая форма', 'line_item', '42')
+[P2] SELECT LAST_INSERT_ID()
+[P2] UPDATE wp_woocommerce_order_itemmeta SET meta_value = '3' WHERE order_item_id = 1 AND meta_key = '_qty'
+[P2] SELECT meta_value FROM wp_woocommerce_order_itemmeta WHERE order_item_id = 1 AND meta_key = '_qty'
+
 # ---------------------------------------------------------------------
 # WP 7.1.4 E2E (установка wp-cli на DNA-DB, ноябрь 2026) — паттерны,
 # найденные живым ядром и закрытые в cms::compat/sql_engine.

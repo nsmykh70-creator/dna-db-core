@@ -365,49 +365,10 @@ fn cast_value(ty: CastTy, v: &Value) -> Value {
 /// Leading numeric prefix of a value per MySQL string-to-number rules.
 /// Returns None when there is no numeric prefix at all (caller maps it to
 /// 0); for text, parses an optional sign, digits, fraction and exponent.
+/// Delegates to `Value::mysql_numeric_prefix` (relational.rs) — the single
+/// source of truth shared with the CMS insert/update column-type coercion.
 fn numeric_prefix(v: &Value) -> Option<f64> {
-    match v {
-        Value::Int(i) => Some(*i as f64),
-        Value::Float(f) => Some(*f),
-        Value::Text(s) | Value::Dna(s) => {
-            let t = s.trim_start();
-            let bytes = t.as_bytes();
-            let mut i = 0;
-            if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
-                i += 1;
-            }
-            let digits_start = i;
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                i += 1;
-            }
-            if i < bytes.len() && bytes[i] == b'.' {
-                i += 1;
-                while i < bytes.len() && bytes[i].is_ascii_digit() {
-                    i += 1;
-                }
-            }
-            if i == digits_start {
-                return None; // no digits at all
-            }
-            // Optional exponent (only if at least one digit precedes it).
-            if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
-                let save = i;
-                i += 1;
-                if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
-                    i += 1;
-                }
-                let exp_start = i;
-                while i < bytes.len() && bytes[i].is_ascii_digit() {
-                    i += 1;
-                }
-                if i == exp_start {
-                    i = save; // not a valid exponent, rewind
-                }
-            }
-            t[..i].parse::<f64>().ok()
-        }
-        Value::Null => None,
-    }
+    v.mysql_numeric_prefix()
 }
 
 /// MySQL LIKE with % (any run) and _ (one char), case-insensitive (ci

@@ -2,6 +2,39 @@
 
 ## Unreleased (CMS Edition — branch `cms-edition`)
 
+### WooCommerce 11.2.1 e2e order on DNA-DB — phase-2 acceptance (2026-11-02)
+
+**Full order lifecycle matches the MariaDB 10.11.11 reference**: product
+with stock management → `wc_create_order` (HPOS) → `add_product` → billing
+(Cyrillic ok) → `calculate_totals` → `save` → `wc_reduce_stock_levels`.
+Artifacts identical: product/order ids (10/11 — AUTO_INCREMENT parity),
+total 500.00, status, `wp_woocommerce_order_itemmeta` byte-identical
+incl. `_reduced_stock = 2`. Methodology and results:
+`docs/cms/E2E_WOO_REPORT.md`. WooCommerce activation itself (dbDelta,
+~40 tables through the dialect gate) already succeeded on both sides.
+
+**Root defect found and fixed — column types were not applied on write.**
+`wpdb::insert()` without a format array sends every value as a string;
+HPOS writes `order_id` as `'15'` into `bigint unsigned`. MariaDB coerces
+on write; we stored `Text("15")`, so the secondary-index key (encoded from
+text) never matched lookups by an Int literal — `get_items()` returned
+`[]` and stock reduction silently no-oped. Fixes (unit test
+`hpos_string_insert_into_bigint_indexed_column`):
+
+- `Value::mysql_numeric_prefix()` — single source of truth for the MySQL
+  numeric prefix (previously three divergent copies; `Value::compare` now
+  also treats Dna-stored strings as numbers);
+- `Value::coerce_for_column()` — INSERT (`exec_insert_tx`) and UPDATE
+  (`exec_update_tx`) store values with the COLUMN's declared type
+  (non-numeric text → 0, MySQL non-strict `sql_mode=''`);
+- read-side parity: PointGet PK literals and `IndexAccess` Eq/Range scan
+  literals coerce to the column type before key encoding.
+
+Differential run #6 (corpus 71 → 78: +7 HPOS statements, fixtures +
+`wp_woocommerce_order_items` / `wp_woocommerce_order_itemmeta`): **MATCH=76,
+BOTH-ERR=2** (`docs/cms/COMPARISON_RUN6.md`). Test suite: 262 green with
+`--features cms` (base build unchanged).
+
 ### Real WordPress 7.1.4 installed on DNA-DB — E2E acceptance (2026-11-02)
 
 Phase-1 acceptance criterion met: **`wp core install` succeeds on DNA-DB**

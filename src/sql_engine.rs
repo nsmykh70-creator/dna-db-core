@@ -4670,6 +4670,23 @@ impl SqlEngine {
                 }
                 map
             };
+            // CMS edition: column-type coercion on write. MySQL stores the
+            // value with the COLUMN's type, not the literal's — wpdb::insert()
+            // without a format array sends every value as a string, so an
+            // `order_id` reaches `bigint unsigned` as '15'. Without the same
+            // conversion the secondary-index key (encoded from the stored
+            // Text) never matches lookups by an Int literal (IndexScan →
+            // 0 rows) — WooCommerce order items/stock broke exactly this way.
+            #[cfg(feature = "cms")]
+            let map = {
+                let mut map = map;
+                for (col, v) in map.iter_mut() {
+                    if let Some(ct) = schema.columns.get(col.as_str()) {
+                        *v = Value::coerce_for_column(ct, v.clone());
+                    }
+                }
+                map
+            };
             let pk = Self::pk_of(&schema, &map)?;
             let key = Self::row_key(table, &pk);
             if !seen_keys.insert(key.clone()) {
@@ -4970,7 +4987,14 @@ impl SqlEngine {
                 // MySQL semantics: every SET rhs sees the row's OLD values
                 // (`stock_quantity = stock_quantity - 1`). Eval failure
                 // (unknown column/subquery) yields NULL — three-valued logic.
-                new_row.insert(col.clone(), e.eval(&row).unwrap_or(Value::Null));
+                let mut v = e.eval(&row).unwrap_or(Value::Null);
+                // CMS edition: store with the COLUMN's type (MariaDB coerces
+                // on write; wpdb sends strings everywhere — see exec_insert_tx).
+                #[cfg(feature = "cms")]
+                if let Some(ct) = schema.columns.get(col.as_str()) {
+                    v = Value::coerce_for_column(ct, v);
+                }
+                new_row.insert(col.clone(), v);
             }
             let pk = Self::pk_of(&schema, &new_row)?;
             let key = Self::row_key(table, &pk);
@@ -5831,6 +5855,15 @@ impl SqlEngine {
             if let Some(lits) =
                 where_clause.and_then(|e| Self::pk_eq_literals(e, &schema.primary_locus_column))
             {
+                let mut lits = lits;
+                // CMS edition: PointGet keys must be encoded with the stored
+                // PK representation (read-side coercion mirrors write-side).
+                #[cfg(feature = "cms")]
+                if let Some(ct) = schema.columns.get(schema.primary_locus_column.as_str()) {
+                    for lit in lits.iter_mut() {
+                        *lit = Value::coerce_for_column(ct, lit.clone());
+                    }
+                }
                 let mut out = Vec::with_capacity(lits.len());
                 for lit in &lits {
                     if let Some(row) = self.read_row_point(from, lit)? {
@@ -5852,7 +5885,13 @@ impl SqlEngine {
                 return Ok((out, plan));
             }
             if let Some(expr) = where_clause {
-                if let Some((col, access)) = index_access_for(schema, expr) {
+                if let Some((col, mut access)) = index_access_for(schema, expr) {
+                    // CMS edition: lookup literals coerce to the column type
+                    // so the encoded scan key matches the stored one.
+                    #[cfg(feature = "cms")]
+                    if let Some(ct) = schema.columns.get(col.as_str()) {
+                        access.coerce_values(ct);
+                    }
                     let keys = self.index_candidate_keys(from, &col, &access)?;
                     let mut out = Vec::with_capacity(keys.len());
                     let mut seen = std::collections::HashSet::new();
@@ -6235,6 +6274,29 @@ enum IndexAccess {
         lo: Option<(Value, bool)>,
         hi: Option<(Value, bool)>,
     },
+}
+
+impl IndexAccess {
+    /// CMS edition: coerce lookup literals to the column's declared type
+    /// before key encoding. Writes already store with the column type
+    /// (Value::coerce_for_column); the same conversion must apply on the
+    /// read side, or `WHERE order_id = '15'` encodes a Text key against
+    /// Int-written entries (and vice versa) and IndexScan finds nothing.
+    #[cfg(feature = "cms")]
+    fn coerce_values(&mut self, ct: &ColumnType) {
+        match self {
+            IndexAccess::Eq(values) => {
+                for v in values.iter_mut() {
+                    *v = Value::coerce_for_column(ct, v.clone());
+                }
+            }
+            IndexAccess::Range { lo, hi } => {
+                for bound in [lo, hi].into_iter().flatten() {
+                    bound.0 = Value::coerce_for_column(ct, bound.0.clone());
+                }
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for IndexAccess {

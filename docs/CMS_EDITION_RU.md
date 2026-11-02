@@ -118,6 +118,29 @@ affected = изменённые строки, `LAST_INSERT_ID()` = первый 
 независимость WHERE/GROUP BY — фаза 2 (коллации); DECIMAL-форматирование
 по scale — фаза 2. Полный отчёт: `docs/cms/COMPARISON_MYSQL_REPORT.md`.
 
+### Прогон №6 + e2e-заказ WooCommerce 11.2.1 (2026-11-02)
+
+**Фаза 2, приёмка: e2e-заказ WooCommerce выполнен.** Полный цикл —
+товар со складом → `wc_create_order` (HPOS) → позиция ×2 → billing
+(кириллица) → `calculate_totals` → `save` → `wc_reduce_stock_levels` —
+даёт на DNA-DB артефакты, идентичные эталону MariaDB 10.11.11: ids 10/11,
+итого 500.00, `wp_woocommerce_order_itemmeta` побайтно (включая
+`_reduced_stock = 2`), склад 10 → 8. Активация самого Woo (dbDelta, ~40
+таблиц через гейт) проходит на обеих сторонах. Детали:
+`docs/cms/E2E_WOO_REPORT.md`.
+
+E2E вскрыл и закрыл **дефект применения типов колонок при записи**:
+`wpdb::insert()` без формата шлёт все значения строками — HPOS пишет
+`order_id` как `'15'` в `bigint unsigned`; без приведения ключ вторичного
+индекса не совпадал с поиском по Int (`get_items()` пуст, склад не
+списывался). Теперь: `Value::mysql_numeric_prefix()` — единый числовой
+префикс (Text/Dna); `Value::coerce_for_column()` — приведение к типу
+колонки в INSERT/UPDATE (non-strict `sql_mode=''`); приведение литералов
+поиска PointGet/IndexScan на чтении. Юнит-тест
+`hpos_string_insert_into_bigint_indexed_column`. Корпус 71 → 78
+(+7 HPOS-запросов, +2 фикстуры HPOS-легаси); дифф-прогон №6:
+MATCH=76, BOTH-ERR=2 (`docs/cms/COMPARISON_RUN6.md`). Тестов: 262 с фичей.
+
 ### Прогон №5 + реальный WordPress 7.1.4 (2026-11-02)
 
 **Фаза 1, приёмка: установка WordPress выполнена.** `wp core install` на
@@ -162,9 +185,12 @@ phpunit ядра WP, ALTER TABLE (частично готов), information_sche
 Приёмка: установка WP 6.x на DNA-DB ✅ (7.1.4, см. E2E-отчёт), wp-admin
 работает 🔶, phpunit ядра WP ⬜.
 
-**Фаза 2 — WooCommerce + Joomla (6–10 нед).** MVCC/`FOR UPDATE`,
-deadlock-коды, DECIMAL, GET_LOCK в диалекте. Параллельно — эксперимент B
-(Joomla через pgwire). Приёмка: e2e-заказ WooCommerce, установка Joomla 5.
+**Фаза 2 — WooCommerce + Joomla (6–10 нед).** 🔶 В прогрессе: **e2e-заказ
+WooCommerce ✅ (11.2.1, HPOS, артефакты = MariaDB, см. E2E_WOO_REPORT)**,
+типы колонок при записи ✅, GET_LOCK/транзакции в корпусе ✅; остаётся:
+MVCC/`FOR UPDATE` (errno 1213/1205 в живом заказе), deadlock-retry,
+DECIMAL по scale, установка Joomla 5 (pgwire). Приёмка: e2e-заказ ✅,
+установка Joomla ⬜.
 
 **Фаза 3 — эксплуатация (2–4 нед).** mysqldump-совместимый импорт/экспорт,
 бэкап/рестор, docker-образ, гайд «миграция WP с MySQL за 3 шага»,

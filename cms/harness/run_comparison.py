@@ -224,6 +224,27 @@ WOO_DDL = [
         KEY status (status),
         KEY customer_id (customer_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+    # HPOS-легаси позиции заказа (Woo 11.2.1 dbDelta shape) — регрессия E2E
+    # 2026-11-02: wpdb->insert() без формата шлёт order_id СТРОКОЙ в bigint
+    # unsigned; MariaDB приводит к типу колонки при записи — мы обязаны тоже,
+    # иначе ключ вторичного индекса не совпадает с Int-литералом.
+    """CREATE TABLE wp_woocommerce_order_items (
+        order_item_id bigint(20) unsigned NOT NULL auto_increment,
+        order_item_name text NOT NULL,
+        order_item_type varchar(200) NOT NULL default '',
+        order_id bigint(20) unsigned NOT NULL default 0,
+        PRIMARY KEY  (order_item_id),
+        KEY order_id (order_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+    """CREATE TABLE wp_woocommerce_order_itemmeta (
+        meta_id bigint(20) unsigned NOT NULL auto_increment,
+        order_item_id bigint(20) unsigned NOT NULL default 0,
+        meta_key varchar(255) default NULL,
+        meta_value longtext,
+        PRIMARY KEY  (meta_id),
+        KEY order_item_id (order_item_id),
+        KEY meta_key (meta_key(191))
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
 ]
 
 SEEDS = [
@@ -268,6 +289,13 @@ SEEDS = [
     "('processing', 'USD', 1, '2026-01-20 12:00:00'), "
     "('wc-completed', 'USD', 1, '2026-01-21 12:00:00'), "
     "('wc-completed', 'USD', 2, '2026-01-22 12:00:00')",
+
+    # HPOS: заказ 42 из сидов — позиции в форме Woo CRUD (wpdb->insert без
+    # формата → все значения СТРОКИ) и в форме wc_add_order_item (%s,%s,%d).
+    "INSERT INTO wp_woocommerce_order_items (order_item_name, order_item_type, order_id) VALUES "
+    "('Тестовый товар DNA', 'line_item', '42'), ('Прямая вставка', 'line_item', 42)",
+    "INSERT INTO wp_woocommerce_order_itemmeta (order_item_id, meta_key, meta_value) VALUES "
+    "(1, '_product_id', '42'), (1, '_qty', '2'), (2, '_product_id', '42'), (2, '_qty', '1')",
 ]
 
 ALL_TABLES = [
@@ -275,6 +303,7 @@ ALL_TABLES = [
     "wp_posts", "wp_terms", "wp_termmeta", "wp_term_relationships",
     "wp_term_taxonomy", "wp_usermeta", "wp_users",
     "wp_wc_product_meta_lookup", "wp_wc_orders",
+    "wp_woocommerce_order_items", "wp_woocommerce_order_itemmeta",
 ]
 
 

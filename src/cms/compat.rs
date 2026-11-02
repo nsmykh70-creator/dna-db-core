@@ -1587,6 +1587,51 @@ mod tests {
     }
 
     #[test]
+    fn hpos_string_insert_into_bigint_indexed_column() {
+        // WooCommerce HPOS regression (E2E 2026-11-02): WC_Order_Item_Data_Store
+        // uses wpdb::insert() WITHOUT a format array — every value travels as a
+        // string, so `order_id` lands in `bigint unsigned` as '15'. MariaDB
+        // coerces on write; we must too, else the secondary-index key (encoded
+        // from Text) never matches `WHERE order_id = 15` (IndexScan → 0 rows),
+        // get_items() returns [] and stock reduction silently no-ops.
+        let g = gate("hpos_types");
+        let s = g.open_session();
+        g.execute(s, "CREATE TABLE wp_woocommerce_order_items (
+            order_item_id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+            order_item_name text NOT NULL,
+            order_item_type varchar(200) NOT NULL DEFAULT '',
+            order_id bigint(20) unsigned NOT NULL DEFAULT '0',
+            PRIMARY KEY  (order_item_id),
+            KEY order_id (order_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_520_ci").unwrap();
+
+        // HPOS shape: wpdb->insert without format → all values quoted.
+        g.execute(s, "INSERT INTO wp_woocommerce_order_items (order_item_name, order_item_type, order_id) VALUES ('Тестовый товар DNA', 'line_item', '15')").unwrap();
+        // Classic wc_add_order_item shape: %s, %s, %d → id unquoted.
+        g.execute(s, "INSERT INTO wp_woocommerce_order_items (order_item_name, order_item_type, order_id) VALUES ('Прямая вставка', 'line_item', 15)").unwrap();
+
+        // Int-literal lookup must see BOTH rows (index keys coerced on write).
+        let r = g.execute(s, "SELECT order_item_id FROM wp_woocommerce_order_items WHERE order_id = 15 ORDER BY order_item_id").unwrap();
+        assert_eq!(r.rows.len(), 2, "string- and int-written rows both match = 15");
+        assert_eq!(v(&r.rows[0], "order_item_id"), "1");
+        // String-literal lookup too.
+        let r = g.execute(s, "SELECT COUNT(*) AS c FROM wp_woocommerce_order_items WHERE order_id = '15'").unwrap();
+        assert_eq!(v(&r.rows[0], "c"), "2");
+        // The stored value became numeric (MariaDB representation).
+        let r = g.execute(s, "SELECT order_item_id FROM wp_woocommerce_order_items WHERE order_item_id = 1 AND order_id + 0 = 15").unwrap();
+        assert_eq!(r.rows.len(), 1);
+
+        // UPDATE coercion: string SET into an int column stores a number.
+        g.execute(s, "UPDATE wp_woocommerce_order_items SET order_id = '16' WHERE order_item_id = 1").unwrap();
+        let r = g.execute(s, "SELECT COUNT(*) AS c FROM wp_woocommerce_order_items WHERE order_id = 16").unwrap();
+        assert_eq!(v(&r.rows[0], "c"), "1", "UPDATE '16' coerced to 16 (index rebuilt)");
+        // Non-numeric text into an int column → 0 (non-strict, sql_mode='').
+        g.execute(s, "UPDATE wp_woocommerce_order_items SET order_id = 'abc' WHERE order_item_id = 2").unwrap();
+        let r = g.execute(s, "SELECT COUNT(*) AS c FROM wp_woocommerce_order_items WHERE order_id = 0").unwrap();
+        assert_eq!(v(&r.rows[0], "c"), "1");
+    }
+
+    #[test]
     fn fallback_catalog_for_non_cms_tables() {
         let g = gate("fallback");
         g.engine

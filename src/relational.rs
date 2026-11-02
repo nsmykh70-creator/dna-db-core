@@ -71,17 +71,19 @@ impl Value {
             match v {
                 Value::Int(i) => Some(*i as f64),
                 Value::Float(f) => Some(*f),
-                Value::Text(s) => s.trim().parse::<f64>().ok(),
-                Value::Dna(_) => None,
+                Value::Text(s) | Value::Dna(s) => s.trim().parse::<f64>().ok(),
                 Value::Null => None,
             }
         }
-        // Numeric coercion: number vs numeric-looking string.
+        // Numeric coercion: number vs numeric-looking string (either side —
+        // a Text/Dna-stored column value vs an Int literal, or the reverse).
         if !matches!(self, Value::Null) && !matches!(other, Value::Null) {
             if let (Some(a), Some(b)) = (numeric(self), numeric(other)) {
                 // Only apply when at least one side is text — two numbers
                 // (or number vs float) already compare in the match below.
-                if matches!(self, Value::Text(_)) || matches!(other, Value::Text(_)) {
+                if matches!(self, Value::Text(_) | Value::Dna(_))
+                    || matches!(other, Value::Text(_) | Value::Dna(_))
+                {
                     return a.partial_cmp(&b).unwrap_or(Equal);
                 }
             }
@@ -102,6 +104,90 @@ impl Value {
 
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
+    }
+
+    /// Leading numeric prefix of the value per MySQL string-to-number
+    /// rules ("150abc" → 150, "abc" → None). Single source of truth for
+    /// CAST, arithmetic coercion and CMS insert/update type coercion.
+    pub fn mysql_numeric_prefix(&self) -> Option<f64> {
+        let s = match self {
+            Value::Int(i) => return Some(*i as f64),
+            Value::Float(f) => return Some(*f),
+            Value::Text(s) | Value::Dna(s) => s,
+            Value::Null => return None,
+        };
+        let t = s.trim_start();
+        let bytes = t.as_bytes();
+        let mut i = 0;
+        if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+            i += 1;
+        }
+        let digits_start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i < bytes.len() && bytes[i] == b'.' {
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+        }
+        if i == digits_start {
+            return None; // no digits at all
+        }
+        // Optional exponent (only if at least one digit precedes it).
+        if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
+            let save = i;
+            i += 1;
+            if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+                i += 1;
+            }
+            if i < bytes.len() && bytes[i].is_ascii_digit() {
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+            } else {
+                i = save; // 'e' without exponent digits — not part of number
+            }
+        }
+        t[..i].parse::<f64>().ok()
+    }
+
+    /// CMS edition (branch `cms-edition`): coerce a value to the declared
+    /// column type the way MariaDB does on write — `$wpdb->insert()` without
+    /// a format array sends EVERY value as a string, so `order_id` reaches
+    /// a `bigint unsigned` column as '15'. MySQL converts on store; without
+    /// the same conversion the secondary-index key (built from the stored
+    /// Text) never matches lookups by an Int literal (`IndexScan → 0 rows`)
+    /// and JOINs on the column go blind. Non-numeric text becomes 0 (the
+    /// non-strict mode WordPress runs with, `sql_mode=''`).
+    #[cfg(feature = "cms")]
+    pub fn coerce_for_column(ct: &ColumnType, v: Value) -> Value {
+        match ct {
+            ColumnType::Int64 => match v {
+                Value::Int(_) | Value::Null => v,
+                other => {
+                    let f = other.mysql_numeric_prefix().unwrap_or(0.0);
+                    let rounded = f.round();
+                    let i = if rounded >= i64::MAX as f64 {
+                        i64::MAX
+                    } else if rounded <= i64::MIN as f64 {
+                        i64::MIN
+                    } else {
+                        rounded as i64
+                    };
+                    Value::Int(i)
+                }
+            },
+            ColumnType::Float64 => match v {
+                Value::Float(_) | Value::Null => v,
+                Value::Int(i) => Value::Float(i as f64),
+                other => Value::Float(other.mysql_numeric_prefix().unwrap_or(0.0)),
+            },
+            // TEXT / DNA / TIMESTAMP / FK keep the value as-is (already the
+            // engine's storage representation for string-ish columns).
+            _ => v,
+        }
     }
 
     /// SQL-ish name of the value's variant (SHOW STORAGE / storage maps).
