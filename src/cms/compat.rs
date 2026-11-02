@@ -191,7 +191,15 @@ impl CmsSqlGate {
     pub fn execute(&self, session: u64, sql: &str) -> Result<CmsQueryResult, CmsError> {
         // MySQL-dialect preprocessing before any dispatch: backtick-quoted
         // identifiers, `DESCRIBE` → SHOW FULL COLUMNS, `NOW()` in DML.
-        let pre = preprocess_mysql_dialect(sql);
+        let mut pre = preprocess_mysql_dialect(sql);
+        // CMS edition: MySQL-only SELECT forms that the core engine does not
+        // parse — SELECT DISTINCT (strip + post-dedupe) and comma-FROM lists
+        // (`FROM a, b WHERE …`, rewritten to cross joins). Both are emitted
+        // by WordPress core (update_object_term_cache, transient cleanup).
+        let want_distinct = strip_select_distinct(&mut pre);
+        if pre.trim_start()[..3.min(pre.trim_start().len())].eq_ignore_ascii_case("sel") {
+            pre = rewrite_comma_from(&pre);
+        }
         let sql = pre.trim();
         let sql = sql.strip_suffix(';').unwrap_or(sql).trim();
         if sql.is_empty() {
@@ -280,6 +288,14 @@ impl CmsSqlGate {
             found_rows: 0,
             is_select,
         };
+        // SELECT DISTINCT: MySQL returns the projection deduplicated; keep
+        // the first occurrence so ORDER BY output stays stable.
+        if want_distinct && is_select {
+            use std::collections::HashSet;
+            let mut seen: HashSet<String> = HashSet::new();
+            out.rows.retain(|row| seen.insert(format!("{:?}", row)));
+            out.message = Some(format!("{} row(s)", out.rows.len()));
+        }
         // MySQL accounting.
         if is_select || upper.starts_with("SHOW") || upper.starts_with("DESCRIBE") {
             out.found_rows = out.rows.len() as u64;
@@ -824,6 +840,232 @@ fn strip_backticks(s: &str) -> String {
     out
 }
 
+/// CMS edition: strips a leading `SELECT DISTINCT` (also `DISTINCTROW`),
+/// returns true when the flag was present. The dedupe happens after
+/// execution (see `execute`) because the engine has no DISTINCT projection.
+fn strip_select_distinct(sql: &mut String) -> bool {
+    let trimmed = sql.trim_start();
+    let upper_head = trimmed.to_ascii_uppercase();
+    for kw in ["SELECT DISTINCTROW", "SELECT DISTINCT"] {
+        if upper_head.starts_with(kw) {
+            let rest = &trimmed[kw.len()..];
+            // Guard against a column actually named DISTINCT…: require the
+            // next character to start a new token (space) or nothing.
+            if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                *sql = format!("SELECT{}", rest);
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// CMS edition: rewrites MySQL comma-FROM lists into the engine's join
+/// grammar. `FROM a AS x, b AS y WHERE …` becomes
+/// `FROM a AS x INNER JOIN b AS y ON 1=1 WHERE …` — MySQL evaluates the
+/// comma form as a cross join filtered by WHERE; the engine does the same
+/// with `ON 1=1` (see `SParser` / `cross_join`). Only the first (top-level)
+/// FROM of a SELECT is rewritten; commas inside parens/strings are ignored.
+fn rewrite_comma_from(sql: &str) -> String {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut i = 0usize;
+    let mut in_string: Option<char> = None;
+    let mut in_backtick = false;
+    let mut depth = 0i32;
+    // 1) find the top-level FROM keyword (word boundary, outside literals).
+    let mut from_pos: Option<usize> = None;
+    while i < chars.len() {
+        let c = chars[i];
+        match in_string {
+            Some(q) => {
+                if c == '\\' && i + 1 < chars.len() {
+                    i += 2;
+                    continue;
+                }
+                if c == q {
+                    in_string = None;
+                }
+            }
+            None => {
+                if in_backtick {
+                    if c == '`' {
+                        in_backtick = false;
+                    }
+                } else if c == '`' {
+                    in_backtick = true;
+                } else if c == '\'' || c == '"' {
+                    in_string = Some(c);
+                } else if c == '(' {
+                    depth += 1;
+                } else if c == ')' {
+                    depth -= 1;
+                } else if depth == 0
+                    && c.to_ascii_uppercase() == 'F'
+                    && is_word_at(&chars, i, "FROM")
+                {
+                    from_pos = Some(i);
+                    break;
+                }
+            }
+        }
+        i += 1;
+    }
+    let from_start = match from_pos {
+        Some(p) => p,
+        None => return sql.to_string(),
+    };
+    // 2) scan the table-ref list; stop at the first top-level keyword that
+    //    terminates FROM (or end of statement). Track top-level commas.
+    let stops: [&str; 13] = [
+        "WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "OFFSET", "UNION", "JOIN",
+        "INNER", "LEFT", "RIGHT", "FULL", "CROSS",
+    ];
+    let mut j = from_start + 4; // past "FROM"
+    let mut depth2 = 0i32;
+    let mut in_string2: Option<char> = None;
+    let mut in_backtick2 = false;
+    let mut commas: Vec<usize> = Vec::new();
+    let mut end = chars.len();
+    while j < chars.len() {
+        let c = chars[j];
+        match in_string2 {
+            Some(q) => {
+                if c == '\\' && j + 1 < chars.len() {
+                    j += 2;
+                    continue;
+                }
+                if c == q {
+                    in_string2 = None;
+                }
+            }
+            None => {
+                if in_backtick2 {
+                    if c == '`' {
+                        in_backtick2 = false;
+                    }
+                } else if c == '`' {
+                    in_backtick2 = true;
+                } else if c == '\'' || c == '"' {
+                    in_string2 = Some(c);
+                } else if c == '(' {
+                    depth2 += 1;
+                } else if c == ')' {
+                    if depth2 == 0 {
+                        end = j;
+                        break;
+                    }
+                    depth2 -= 1;
+                } else if depth2 == 0 {
+                    if c == ',' {
+                        commas.push(j);
+                    } else if c.is_ascii_alphabetic() || c == '_' {
+                        if let Some(w) = word_at(&chars, j) {
+                            if stops.iter().any(|s| s.eq_ignore_ascii_case(&w)) {
+                                end = j;
+                                break;
+                            }
+                            // skip the rest of this word
+                            j += w.len() - 1;
+                        }
+                    } else if c == ';' {
+                        end = j;
+                        break;
+                    }
+                }
+            }
+        }
+        j += 1;
+    }
+    if commas.is_empty() {
+        return sql.to_string();
+    }
+    // 3) rebuild: split on top-level commas inside [from+4, end) and rejoin
+    //    every ref after the first with INNER JOIN … ON 1=1. The original
+    //    spacing is preserved: refs keep their raw text (only trimmed for
+    //    the emptiness check), and explicit separators are inserted where
+    //    parts were joined back together.
+    let mut refs: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for k in from_start + 4..end {
+        let c = chars[k];
+        if commas.contains(&k) {
+            refs.push(cur.clone());
+            cur.clear();
+        } else {
+            cur.push(c);
+        }
+    }
+    refs.push(cur);
+    if refs.iter().any(|r| r.trim().is_empty()) {
+        return sql.to_string();
+    }
+    let mut rebuilt = String::with_capacity(sql.len() + 24 * refs.len());
+    rebuilt.push_str(&chars[..from_start + 4].iter().collect::<String>());
+    let first = &refs[0];
+    if !first.starts_with(char::is_whitespace) {
+        rebuilt.push(' ');
+    }
+    rebuilt.push_str(first.trim_end());
+    for r in &refs[1..] {
+        rebuilt.push_str(" INNER JOIN ");
+        rebuilt.push_str(r.trim());
+        rebuilt.push_str(" ON 1=1");
+    }
+    let tail: String = chars[end..].iter().collect();
+    if !tail.is_empty()
+        && !tail.starts_with(char::is_whitespace)
+        && !tail.starts_with(';')
+        && !tail.starts_with(')')
+    {
+        rebuilt.push(' ');
+    }
+    rebuilt.push_str(&tail);
+    rebuilt
+}
+
+/// The word at `pos` equals `word` (case-insensitive) and has a non-word
+/// character (or boundary) on both sides.
+fn is_word_at(chars: &[char], pos: usize, word: &str) -> bool {
+    let w: Vec<char> = word.chars().collect();
+    if pos > 0 {
+        let prev = chars[pos - 1];
+        if prev.is_ascii_alphanumeric() || prev == '_' {
+            return false;
+        }
+    }
+    if pos + w.len() > chars.len() {
+        return false;
+    }
+    for (k, wc) in w.iter().enumerate() {
+        if chars[pos + k].to_ascii_uppercase() != *wc {
+            return false;
+        }
+    }
+    let after = pos + w.len();
+    if after < chars.len() {
+        let next = chars[after];
+        if next.is_ascii_alphanumeric() || next == '_' {
+            return false;
+        }
+    }
+    true
+}
+
+/// The alphanumeric word starting exactly at `pos`, or None.
+fn word_at(chars: &[char], pos: usize) -> Option<String> {
+    let mut out = String::new();
+    let mut i = pos;
+    while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+        out.push(chars[i]);
+        i += 1;
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
 /// Case-insensitive replacement of a function call token (`NOW()`) outside
 /// string literals; string contents are never touched.
 fn replace_fn_ci_outside_strings(s: &str, needle: &str, replacement: &str) -> String {
@@ -1088,6 +1330,61 @@ mod tests {
         let r = g.execute(s, "SHOW TABLES LIKE 'wp_opt%'").unwrap();
         assert_eq!(r.rows.len(), 1);
         assert_eq!(v(&r.rows[0], "Tables_in_wordpress"), "wp_options");
+    }
+
+    #[test]
+    fn distinct_and_comma_from_and_numeric_coercion() {
+        let g = gate("wp7gaps");
+        let s = g.open_session();
+        g.bootstrap_wordpress().unwrap();
+
+        // Seed: two terms referenced by the same object (distinct pairs).
+        g.execute(s, "INSERT INTO wp_terms (name, slug, term_group) VALUES ('T1','t1',0), ('T2','t2',0)").unwrap();
+
+        // 1) SELECT DISTINCT — engine has no DISTINCT projection; the gate
+        //    strips it and dedupes rows (WP update_object_term_cache shape).
+        let r = g
+            .execute(s, "SELECT DISTINCT term_group FROM wp_terms ORDER BY term_group")
+            .unwrap();
+        assert_eq!(r.rows.len(), 1, "distinct single column collapses to 1 row");
+
+        // 2) Comma-FROM list — rewritten to INNER JOIN … ON 1=1 (cross join)
+        //    with the join predicate left in WHERE, MySQL style.
+        g.execute(s, "INSERT INTO wp_options (option_name, option_value, autoload) VALUES ('numcheck', '7', 'yes')").unwrap();
+        let r = g
+            .execute(
+                s,
+                "SELECT COUNT(*) AS c FROM wp_terms, wp_options WHERE wp_terms.term_id = 1 AND wp_options.option_name = 'numcheck'",
+            )
+            .unwrap();
+        assert_eq!(v(&r.rows[0], "c"), "1", "comma-FROM cross join + WHERE filter");
+
+        // 3) Numeric coercion: MySQL compares numbers and numeric strings
+        //    numerically (`WHERE ID = '2'` — WP_User::get_data_by uses %s).
+        let r = g
+            .execute(s, "SELECT option_name FROM wp_options WHERE option_id = '1'")
+            .unwrap();
+        assert_eq!(r.rows.len(), 1, "string '1' matches numeric option_id 1");
+
+        // 4) …but non-numeric text does NOT silently match numbers (we do
+        //    not replicate MySQL's "everything casts to 0" footgun).
+        let r = g
+            .execute(s, "SELECT option_name FROM wp_options WHERE option_id = 'abc'")
+            .unwrap();
+        assert_eq!(r.rows.len(), 0, "non-numeric text stays non-equal");
+
+        // 5) NOT IN — WP core emits it everywhere (`comment_type NOT IN
+        //    ('note')` breaks comments queries otherwise).
+        g.execute(s, "INSERT INTO wp_options (option_name, option_value, autoload) VALUES ('other1', 'x', 'yes'), ('other2', 'y', 'yes')").unwrap();
+        let r = g
+            .execute(
+                s,
+                "SELECT option_name FROM wp_options WHERE option_name NOT IN ('numcheck') AND autoload = 'yes' ORDER BY option_name",
+            )
+            .unwrap();
+        let names: Vec<String> = r.rows.iter().map(|r| v(r, "option_name")).collect();
+        assert!(!names.contains(&"numcheck".to_string()));
+        assert_eq!(names, vec!["other1", "other2"], "NOT IN keeps the other rows");
     }
 
     #[test]
@@ -1509,3 +1806,4 @@ mod tests {
         );
     }
 }
+

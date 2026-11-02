@@ -32,11 +32,13 @@ pub enum Expr {
         left: Box<Expr>,
         right: Box<Expr>,
     },
-    /// `col IN (v1, v2, ...)` — evaluated here; NULL semantics: no match
-    /// when the column value is NULL or the list contains NULL only.
+    /// `col [NOT] IN (v1, v2, ...)` — evaluated here; NULL semantics: no
+    /// match when the column value is NULL, or (NOT IN) the list contains
+    /// NULL without a match — MySQL three-valued logic.
     InList {
         column: String,
         values: Vec<Value>,
+        negated: bool,
     },
     /// `col IN (SELECT ...)` — SQL-only node. Must be materialised into an
     /// InList by the executor before evaluation (eval returns NULL).
@@ -172,17 +174,27 @@ impl Expr {
                 }
                 arith(*op, &l, &r)
             }
-            Expr::InList { column, values } => {
+            Expr::InList { column, values, negated } => {
                 let v = row.get(column).cloned()?;
                 if v.is_null() {
                     return Some(Value::Null);
                 }
-                Some(Value::Int(
-                    values
-                        .iter()
-                        .any(|c| c.compare(&v) == std::cmp::Ordering::Equal)
-                        as i64,
-                ))
+                let matched = values
+                    .iter()
+                    .any(|c| c.compare(&v) == std::cmp::Ordering::Equal);
+                if *negated {
+                    // MySQL: x NOT IN (…) with NULL in the list is UNKNOWN
+                    // when x matches nothing, so the row is excluded.
+                    if matched {
+                        Some(Value::Int(0))
+                    } else if values.iter().any(|c| c.is_null()) {
+                        Some(Value::Null)
+                    } else {
+                        Some(Value::Int(1))
+                    }
+                } else {
+                    Some(Value::Int(matched as i64))
+                }
             }
             Expr::InSubquery { .. }
             | Expr::ScalarSubquery { .. }
@@ -243,8 +255,9 @@ impl Expr {
             Expr::Arith { op, left, right } => {
                 format!("{} {} {}", left.describe(), op.as_str(), right.describe())
             }
-            Expr::InList { column, values } => format!(
-                "{} IN ({})",
+            Expr::InList { column, values, negated } => format!(
+                "{}{} IN ({})",
+                if *negated { "NOT " } else { "" },
                 column,
                 values
                     .iter()

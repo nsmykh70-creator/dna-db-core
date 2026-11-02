@@ -1,5 +1,9 @@
 # DNA-DB CMS Edition — дифференциальные тесты против MySQL (MariaDB 10.11.11)
 
+> Актуальные прогоны: №4/№5 — `docs/cms/COMPARISON_RUN5.md` (71 запрос,
+> MATCH=69 + BOTH-ERR=2), реальная установка WordPress 7.1.4 —
+> `docs/cms/E2E_WP_REPORT.md`. Ниже — отчёт прогона №3 (66 запросов).
+
 Методика: один и тот же корпус SQL WordPress/WooCommerce (`docs/cms/wp_queries_corpus.txt`),
 одни и те же фикстуры (12 таблиц WP-пресета + 2 таблицы WooCommerce/HPOS-lookup) и одни и те же
 данные подаются в MariaDB 10.11.11 (sql_mode='', как на WP-хостингах) и в DNA-DB CMS Edition

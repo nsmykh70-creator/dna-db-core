@@ -1079,7 +1079,7 @@ impl Parser {
                 }
             }
             self.expect(Tok::RParen)?;
-            return Ok(Expr::InList { column, values });
+            return Ok(Expr::InList { column, values, negated: false });
         }
         Ok(left)
     }

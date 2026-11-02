@@ -47,23 +47,42 @@
 
 - Транзакций в API drop-in пока нет (фаза 2: WooCommerce требует
   `SELECT … FOR UPDATE` — их ведёт `cms::compat` + `tx.rs`).
+- HTTP-транспорт одноэлементный: каждый запрос — своя сессия гейта, поэтому
+  `GET_LOCK` не держится между запросами и `FOUND_ROWS()`/`LAST_INSERT_ID()`
+  отвечаются из кэша последнего ответа drop-in'а (см. db.php).
 - Составные PK/UNIQUE ключи: движок хранит первую колонку, полный ключ —
   в каталоге-оверлее (`cms::ddl_meta`).
 - Двоичные данные проходят как строки (JSON-транспорт).
 - Единый HTTP-путь: ~1 RTT на запрос; для продакшена фаза 4 заменит его
   wire-протоколом MySQL.
+- Multi-table `DELETE a, b FROM …`, `REGEXP` и строковые функции (`LEFT()`)
+  пока не поддержаны (фаза 2; WP переживает их отсутствие — см. E2E-отчёт).
 
 ## Проверка без WordPress
 
+Реальная проверка выполнена: **WordPress 7.1.4 устанавливается на DNA-DB
+через этот drop-in** (`wp core install` через wp-cli, артефакты совпадают с
+эталоном MariaDB 10.11.11) — методика и результаты:
+`docs/cms/E2E_WP_REPORT.md`.
+
 Минимальный PHP-скрипт (без WP-функций): убедиться, что `/api/query`
-отвечает, — ghp-токен не нужен, достаточно login/query:
+отвечает, — токен нужен как Bearer на каждый запрос:
 
 ```php
 <?php // php -S для тестов не требуется; CLI-проверка
-$c = file_get_contents('http://127.0.0.1:8443/api/query', false, stream_context_create(['http' => [
+$login = file_get_contents('https://127.0.0.1:8443/api/login', false, stream_context_create(['http' => [
     'method' => 'POST', 'ignore_errors' => true,
-    'header' => "Content-Type: application/json\r\nAuthorization: Bearer <TOKEN>\r\n",
+    'header' => "Content-Type: application/json\r\n",
+    'content' => json_encode(['user' => 'wp_app', 'pass' => '…']),
+    // самоподписанный сертификат панели:
+    'ssl' => ['verify_peer' => false, 'verify_peer_name' => false, 'allow_self_signed' => true],
+]]));
+$token = json_decode($login, true)['token'] ?? '';
+$c = file_get_contents('https://127.0.0.1:8443/api/query', false, stream_context_create(['http' => [
+    'method' => 'POST', 'ignore_errors' => true,
+    'header' => "Content-Type: application/json\r\nAuthorization: Bearer {$token}\r\n",
     'content' => json_encode(['query' => 'SELECT option_name FROM wp_options LIMIT 3', 'kind' => 'sql']),
+    'ssl' => ['verify_peer' => false, 'verify_peer_name' => false, 'allow_self_signed' => true],
 ]]));
 var_dump(json_decode($c, true));
 ```

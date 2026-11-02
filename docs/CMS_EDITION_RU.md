@@ -118,6 +118,17 @@ affected = изменённые строки, `LAST_INSERT_ID()` = первый 
 независимость WHERE/GROUP BY — фаза 2 (коллации); DECIMAL-форматирование
 по scale — фаза 2. Полный отчёт: `docs/cms/COMPARISON_MYSQL_REPORT.md`.
 
+### Прогон №5 + реальный WordPress 7.1.4 (2026-11-02)
+
+**Фаза 1, приёмка: установка WordPress выполнена.** `wp core install` на
+DNA-DB через drop-in db.php — Success; артефакты (12 таблиц, 125 опций,
+пользователи/посты/меты, LAST_INSERT_ID, FOUND_ROWS) совпадают с эталоном
+MariaDB 10.11.11 — детали в `docs/cms/E2E_WP_REPORT.md`.
+E2E вскрыл и закрыл: Bearer-заголовок drop-in, TLS/стрим-транспорт,
+числовое приведение `WHERE ID = '2'`, `SELECT DISTINCT`, comma-FROM
+(→ cross join), `NOT IN`. Корпус 66 → 71; дифф-прогон №5: MATCH=69,
+BOTH-ERR=2 (`docs/cms/COMPARISON_RUN5.md`). Тестов: 261 с фичей.
+
 ### Прогон №3: что закрыто (2026-11-02)
 
 Арифметические ключи `ORDER BY` (`SelectItem::OrderKeyOnly` —
@@ -145,10 +156,11 @@ TAXONOMY/USERS/COMMENTS/DDL/WOO-запросов; это ТЗ транслято
 
 **Фаза 1 — WP drop-in MVP (4–8 нед).** 🔶 В прогрессе: диалект-гейт
 `cms::compat`, AUTO_INCREMENT, errno-маппинг, SHOW-семейство с
-dbDelta-совместимым выводом и прототип `cms/php/wp-content/db.php` —
-готовы; остаётся: прогон phpunit ядра WP против гейта, ALTER TABLE,
-information_schema.
-Приёмка: установка WP 6.x на DNA-DB, wp-admin работает, phpunit ядра WP.
+dbDelta-совместимым выводом, прототип `cms/php/wp-content/db.php` и
+**установка WP 7.1.4 через wp-cli** — готовы; остаётся: wp-admin в браузере,
+phpunit ядра WP, ALTER TABLE (частично готов), information_schema.
+Приёмка: установка WP 6.x на DNA-DB ✅ (7.1.4, см. E2E-отчёт), wp-admin
+работает 🔶, phpunit ядра WP ⬜.
 
 **Фаза 2 — WooCommerce + Joomla (6–10 нед).** MVCC/`FOR UPDATE`,
 deadlock-коды, DECIMAL, GET_LOCK в диалекте. Параллельно — эксперимент B

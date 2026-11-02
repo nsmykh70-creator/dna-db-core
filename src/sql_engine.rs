@@ -980,6 +980,28 @@ impl SParser {
             if paren {
                 self.next();
             }
+            // CMS edition (branch `cms-edition`): ON 1=1 marks a pure cross
+            // join. The compat gate rewrites MySQL comma-FROM lists
+            // (`FROM a, b WHERE …`) into `a INNER JOIN b ON 1=1`, keeping the
+            // filter predicates in WHERE exactly like MySQL does.
+            if matches!(self.peek(), STok::Int(1)) {
+                let save = self.pos;
+                self.next();
+                if matches!(self.next(), STok::Eq) && matches!(self.next(), STok::Int(1)) {
+                    if paren {
+                        self.expect(STok::RParen)?;
+                    }
+                    joins.push(JoinSpec {
+                        join_type,
+                        table,
+                        alias: jalias,
+                        left_col: "1".to_string(),
+                        right_col: "1".to_string(),
+                    });
+                    continue;
+                }
+                self.pos = save;
+            }
             let left_col = self.ident()?;
             // optional qualified name a.col
             let mut lc = left_col;
@@ -2104,8 +2126,24 @@ impl SParser {
                 right: Box::new(right),
             });
         }
-        // `col IN (v1, v2, ...)` / `col IN (SELECT ...)`
-        if self.kw("IN") {
+        // `col [NOT] IN (v1, v2, ...)` / `col [NOT] IN (SELECT ...)`
+        // CMS edition: NOT IN is emitted by WordPress core constantly
+        // (`comment_type NOT IN ('note')`, post_status NOT IN, …).
+        let mut negated_in = false;
+        if self.kw("NOT") {
+            if self.kw("IN") {
+                negated_in = true;
+            } else {
+                self.expect_kw("LIKE")?;
+                let pattern = self.like_pattern()?;
+                return Ok(Expr::Like {
+                    operand: Box::new(left),
+                    pattern,
+                    negated: true,
+                });
+            }
+        }
+        if negated_in || self.kw("IN") {
             let column = match left {
                 Expr::Column(c) => c,
                 other => {
@@ -2126,7 +2164,13 @@ impl SParser {
                     return Err("SQL: expected ')' after IN subquery".into());
                 }
                 let query = render_select_sql(&sub);
-                return Ok(Expr::InSubquery { column, query });
+                let in_sub = Expr::InSubquery { column, query };
+                // NOT IN (SELECT …): negate the materialised IN node.
+                return if negated_in {
+                    Ok(Expr::Not(Box::new(in_sub)))
+                } else {
+                    Ok(in_sub)
+                };
             }
             let mut values = Vec::new();
             loop {
@@ -2138,7 +2182,7 @@ impl SParser {
                 }
             }
             self.expect(STok::RParen)?;
-            return Ok(Expr::InList { column, values });
+            return Ok(Expr::InList { column, values, negated: negated_in });
         }
         if self.kw("IS") {
             if self.kw("NOT") {
@@ -2148,18 +2192,9 @@ impl SParser {
             self.expect_kw("NULL")?;
             return Ok(Expr::IsNull(Box::new(left)));
         }
-        // MySQL `expr [NOT] LIKE 'pattern'` (postfix NOT — distinct from the
-        // prefix `NOT <predicate>` handled above). WordPress core uses LIKE
-        // for transient cleanup, slug lookups and meta searches.
-        if self.kw("NOT") {
-            self.expect_kw("LIKE")?;
-            let pattern = self.like_pattern()?;
-            return Ok(Expr::Like {
-                operand: Box::new(left),
-                pattern,
-                negated: true,
-            });
-        }
+        // MySQL `expr LIKE 'pattern'` (the `NOT` variant is handled in the
+        // IN/NOT-IN block above). WordPress core uses LIKE for transient
+        // cleanup, slug lookups and meta searches.
         if self.kw("LIKE") {
             let pattern = self.like_pattern()?;
             return Ok(Expr::Like {
@@ -3576,6 +3611,7 @@ impl SqlEngine {
                 Expr::InList {
                     column: column.clone(),
                     values,
+                    negated: false,
                 }
             }
             Expr::Not(inner) => Expr::Not(Box::new(self.resolve_expr_for_row(inner, row)?)),
@@ -5350,18 +5386,25 @@ impl SqlEngine {
         // JOINs (hash join on equi-condition; O(n+m) build+probe)
         for j in joins {
             let right = self.read_table_rows(&j.table)?;
-            let next = match j.join_type {
-                JoinType::Inner => hash_join(&current, &right, &j.left_col, &j.right_col),
-                JoinType::Left => hash_join_left(&current, &right, &j.left_col, &j.right_col),
-                // RIGHT JOIN == LEFT JOIN with the sides swapped (the row
-                // model is single-namespace, so column naming is unchanged).
-                JoinType::Right => {
-                    hash_join_left(&right, &current, &j.right_col, &j.left_col)
-                }
-                // FULL OUTER JOIN: left join + every right row that never
-                // matched, padded with NULLs on the left columns.
-                JoinType::Full => {
-                    hash_join_full(&current, &right, &j.left_col, &j.right_col)
+            // ON 1=1 (cross join): merge every left row with every right row;
+            // the surviving filter lives in WHERE, exactly like MySQL.
+            let is_cross = j.left_col == "1" && j.right_col == "1";
+            let next = if is_cross {
+                cross_join(&current, &right)
+            } else {
+                match j.join_type {
+                    JoinType::Inner => hash_join(&current, &right, &j.left_col, &j.right_col),
+                    JoinType::Left => hash_join_left(&current, &right, &j.left_col, &j.right_col),
+                    // RIGHT JOIN == LEFT JOIN with the sides swapped (the row
+                    // model is single-namespace, so column naming is unchanged).
+                    JoinType::Right => {
+                        hash_join_left(&right, &current, &j.right_col, &j.left_col)
+                    }
+                    // FULL OUTER JOIN: left join + every right row that never
+                    // matched, padded with NULLs on the left columns.
+                    JoinType::Full => {
+                        hash_join_full(&current, &right, &j.left_col, &j.right_col)
+                    }
                 }
             };
             plan.push_str(&format!(
@@ -5930,6 +5973,10 @@ impl SqlEngine {
                     Ok(Expr::InList {
                         column: column.clone(),
                         values,
+                        negated: match e {
+                            Expr::InList { negated, .. } => *negated,
+                            _ => false,
+                        },
                     })
                 }
                 Expr::ScalarSubquery { stmt } => {
@@ -6298,8 +6345,9 @@ fn index_access_for(
                     }
                 }
             }
-            Expr::InList { column, values } => {
-                if schema.secondary_index_on(column).is_some()
+            Expr::InList { column, values, negated } => {
+                if !negated
+                    && schema.secondary_index_on(column).is_some()
                     && !values.is_empty()
                     && values.iter().all(|v| !v.is_null())
                 {
@@ -6571,8 +6619,9 @@ fn expr_to_sql(e: &Expr) -> String {
         Expr::Cast { inner, ty } => {
             format!("CAST({} AS {})", expr_to_sql(inner), ty.as_str())
         }
-        Expr::InList { column, values } => format!(
-            "{} IN ({})",
+        Expr::InList { column, values, negated } => format!(
+            "{}{} IN ({})",
+            if *negated { "NOT " } else { "" },
             column,
             values
                 .iter()
@@ -6734,6 +6783,32 @@ fn hash_join(
                     }
                 }
             }
+        }
+    }
+    out
+}
+
+/// CMS edition (branch `cms-edition`): pure cross join — the executor form
+/// of `INNER JOIN … ON 1=1`, which the compat gate produces when rewriting
+/// MySQL comma-FROM lists (`FROM a, b WHERE …`). Same merge rules as the
+/// equi-joins: right-side colliding columns get the `joined_` prefix.
+fn cross_join(
+    left: &[BTreeMap<String, Value>],
+    right: &[BTreeMap<String, Value>],
+) -> Vec<BTreeMap<String, Value>> {
+    let mut out = Vec::with_capacity(left.len() * right.len());
+    for l in left {
+        for r in right {
+            let mut merged = l.clone();
+            for (k, val) in r.iter() {
+                let name = if merged.contains_key(k) {
+                    format!("joined_{}", k)
+                } else {
+                    k.clone()
+                };
+                merged.insert(name, val.clone());
+            }
+            out.push(merged);
         }
     }
     out

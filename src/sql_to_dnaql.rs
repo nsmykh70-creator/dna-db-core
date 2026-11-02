@@ -447,12 +447,17 @@ fn expr(e: &Expr) -> Result<String, String> {
             op.as_str(),
             expr(right)?
         )),
-        Expr::InList { column, values } => {
+        Expr::InList { column, values, negated } => {
             let lits = values
                 .iter()
                 .map(literal)
                 .collect::<Result<Vec<_>, String>>()?;
-            Ok(format!("{} IN ({})", column, lits.join(", ")))
+            Ok(format!(
+                "{}{} IN ({})",
+                if *negated { "NOT " } else { "" },
+                column,
+                lits.join(", ")
+            ))
         }
         Expr::InSubquery { column, .. } => Err(format!(
             "SQL→DnaQL: `{} IN (SELECT ...)` needs the subquery materialised first — DnaQL \

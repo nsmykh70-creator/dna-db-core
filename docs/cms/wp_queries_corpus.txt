@@ -136,6 +136,24 @@
 [P2] SELECT COUNT(DISTINCT customer_id) FROM wp_wc_orders WHERE status IN ('wc-completed','wc-processing')
 
 # ---------------------------------------------------------------------
+# WP 7.1.4 E2E (установка wp-cli на DNA-DB, ноябрь 2026) — паттерны,
+# найденные живым ядром и закрытые в cms::compat/sql_engine.
+# ---------------------------------------------------------------------
+[P1] SELECT DISTINCT t.term_id, tr.object_id FROM wp_terms AS t INNER JOIN wp_term_taxonomy AS tt ON t.term_id = tt.term_id INNER JOIN wp_term_relationships AS tr ON tr.term_taxonomy_id = tt.term_taxonomy_id WHERE tt.taxonomy IN ('category','post_tag','post_format') AND tr.object_id IN (4,1) ORDER BY t.name ASC   -- update_object_term_cache: DISTINCT поверх цепочки JOIN
+[P1] SELECT COUNT(*) FROM wp_term_relationships, wp_posts WHERE wp_posts.ID = wp_term_relationships.object_id AND post_status IN ('publish') AND post_type IN ('post') AND term_taxonomy_id = 1   -- comma-FROM (кросс-джойн + WHERE), счётчики терминов
+[P1] SELECT * FROM wp_users WHERE ID = '2' LIMIT 1     -- WP_User::get_data_by шлёт id СТРОКОЙ (%s): числовое приведение обязательно
+[P1] SELECT wp_comments.comment_ID FROM wp_comments WHERE ( ( comment_approved = '0' OR comment_approved = '1' ) ) AND comment_type NOT IN ('note')   -- NOT IN: без него падает вывод комментариев
+[P1] INSERT INTO wp_terms (name, slug, term_group) VALUES ('News','news',0), ('Docs','docs',0)   -- multi-row INSERT терминов
+
+# ---------------------------------------------------------------------
+# Открытые пробелы диалекта (фаза 2) — WP их переживает, но надо закрыть:
+#   DELETE a, b FROM wp_options a, wp_options b WHERE ...  (multi-table DELETE,
+#       чистка просроченных транзиентов; WP продолжает работу при ошибке)
+#   DELETE FROM wp_options WHERE option_name REGEXP '^rss_[0-9a-f]{32}(_ts)?$'
+#   LEFT(meta_value, 40) и прочие строковые функции (встречаются в плагинах)
+# ---------------------------------------------------------------------
+
+# ---------------------------------------------------------------------
 # Известные расширения диалекта, которые надо не сломать:
 #   ORDER BY wp_posts.post_date DESC, wp_posts.ID DESC   (multi-key)
 #   ORDER BY FIELD(post_status, 'publish','draft')       (редко, плагины)

@@ -2,6 +2,46 @@
 
 ## Unreleased (CMS Edition — branch `cms-edition`)
 
+### Real WordPress 7.1.4 installed on DNA-DB — E2E acceptance (2026-11-02)
+
+Phase-1 acceptance criterion met: **`wp core install` succeeds on DNA-DB**
+through the `wp-content/db.php` drop-in (wp-cli 2.12, PHP 8.4.23), and the
+installation artifacts match the MariaDB 10.11.11 reference: same 12 tables,
+125 options, identical AUTO_INCREMENT ids (post → 4, user → 2),
+`wp user get` roles, `wp post list`, `LAST_INSERT_ID()`/`FOUND_ROWS()`.
+Full methodology and results: `docs/cms/E2E_WP_REPORT.md`.
+
+Drop-in fixes (each a real prototype defect surfaced by live WordPress):
+- `dna_post()` never attached the Bearer token to `/api/query` — every
+  query failed with `not authenticated`;
+- the panel serves HTTPS with a self-signed pair by default — `sslverify`
+  / `verify_peer` handling added, and the stream transport is now primary
+  (WP_Http/Requests exhausted 512 MB of memory during install);
+- stateless HTTP shims: `FOUND_ROWS()` and `LAST_INSERT_ID()` are answered
+  from the cached response fields (each request opens its own gate session);
+- WP 7.1.x compatibility: `wpdb::select($db, $dbh = null)` signature,
+  `db_server_info()` override used by dbDelta.
+
+Engine gaps closed (all exercised by WP 7.1.4 core, unit-tested, and added
+to the corpus — 66 → 71 statements):
+- **numeric type coercion in comparisons** (`Value::compare`):
+  `WHERE ID = '2'` now matches — `WP_User::get_data_by()` sends ids as
+  strings (`%s`); non-numeric text deliberately does NOT cast to 0;
+- **`SELECT DISTINCT`** — gate strips the flag and dedupes result rows
+  (the engine has no DISTINCT projection);
+- **comma-FROM lists** (`FROM a, b WHERE …`, WP term counters) — rewritten
+  to `a INNER JOIN b ON 1=1`; the engine gains a cross-join form
+  (`ON 1=1` → `cross_join` executor);
+- **`NOT IN`** — the parser previously only accepted `NOT LIKE`, which
+  broke comments queries (`comment_type NOT IN ('note')`); full support
+  with MySQL three-valued NULL logic, incl. `NOT IN (SELECT …)`.
+
+Differential run #5 (extended corpus) vs MariaDB 10.11.11: **MATCH=69,
+BOTH-ERR=2** — the new WP-derived patterns (DISTINCT-join, comma-FROM,
+string-id lookup, NOT IN, multi-row term INSERT) all agree with the
+reference (`docs/cms/COMPARISON_RUN5.md`). Test suite: 261 green with
+`--features cms`.
+
 ### Differential run #3 vs MariaDB 10.11.11 — 66/66 (2026-11-02)
 
 The last two corpus divergences are closed; the corpus itself grew

@@ -50,6 +50,13 @@ impl fmt::Display for Value {
 
 impl Value {
     /// Total ordering for comparisons (NULL < Int < Float < Text < Dna).
+    ///
+    /// CMS edition (branch `cms-edition`): numeric coercion for mixed
+    /// Int/Float vs Text — MySQL compares numbers and numeric strings
+    /// numerically (`WHERE id = '2'` matches the row with id 2). WordPress
+    /// relies on this: `WP_User::get_data_by()` sends `WHERE ID = %s`.
+    /// Non-numeric text keeps the rank ordering (Text > numbers) instead of
+    /// MySQL's "any string casts to 0" rule, which is a known footgun.
     pub fn compare(&self, other: &Value) -> std::cmp::Ordering {
         use std::cmp::Ordering::*;
         fn rank(v: &Value) -> u8 {
@@ -58,6 +65,25 @@ impl Value {
                 Value::Int(_) | Value::Float(_) => 1,
                 Value::Text(_) => 2,
                 Value::Dna(_) => 3,
+            }
+        }
+        fn numeric(v: &Value) -> Option<f64> {
+            match v {
+                Value::Int(i) => Some(*i as f64),
+                Value::Float(f) => Some(*f),
+                Value::Text(s) => s.trim().parse::<f64>().ok(),
+                Value::Dna(_) => None,
+                Value::Null => None,
+            }
+        }
+        // Numeric coercion: number vs numeric-looking string.
+        if !matches!(self, Value::Null) && !matches!(other, Value::Null) {
+            if let (Some(a), Some(b)) = (numeric(self), numeric(other)) {
+                // Only apply when at least one side is text — two numbers
+                // (or number vs float) already compare in the match below.
+                if matches!(self, Value::Text(_)) || matches!(other, Value::Text(_)) {
+                    return a.partial_cmp(&b).unwrap_or(Equal);
+                }
             }
         }
         let (ra, rb) = (rank(self), rank(other));

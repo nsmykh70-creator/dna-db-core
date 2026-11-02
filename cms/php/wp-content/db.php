@@ -61,6 +61,10 @@ if (!class_exists('DNA_DB_wpdb')) {
         public $dna_last;
         /** @var string|null Bearer token, per PHP request. */
         protected static $dna_token;
+        /** @var int Result of the last SQL_CALC_FOUND_ROWS query. */
+        protected $dna_found_rows = 0;
+        /** @var bool The last query carried SQL_CALC_FOUND_ROWS. */
+        protected $dna_calc_found = false;
 
         /**
          * Replaces wpdb::__construct: no mysqli connection is opened, the
@@ -102,50 +106,68 @@ if (!class_exists('DNA_DB_wpdb')) {
          *
          * @param string $url  Full URL.
          * @param string $body Raw JSON body.
+         * @param string $token Bearer token ('' for /api/login itself).
          * @return array{code:int, body:string}|null
          */
-        protected function dna_post($url, $body)
+        protected function dna_post($url, $body, $token = '')
         {
-            if (function_exists('wp_remote_post')) {
-                $res = wp_remote_post($url, array(
-                    'timeout' => 30,
-                    'headers' => array('Content-Type' => 'application/json'),
-                    'body'    => $body,
-                ));
-                if (is_wp_error($res)) {
-                    $this->last_error = 'DNA-DB request failed: ' . $res->get_error_message();
-                    return null;
-                }
-                return array(
-                    'code' => (int) wp_remote_retrieve_response_code($res),
-                    'body' => (string) wp_remote_retrieve_body($res),
-                );
-            }
+            $auth = ('' === $token) ? '' : "Authorization: Bearer {$token}\r\n";
+            // Stream transport FIRST: no WP_Http/Requests involvement (they
+            // are heavy and may hit memory limits during CLI bootstraps),
+            // works with the panel's self-signed TLS, and is available even
+            // before WP HTTP APIs are loaded. wp_remote_post stays as a
+            // fallback when allow_url_fopen is disabled.
             $ctx = stream_context_create(array(
                 'http' => array(
                     'method'        => 'POST',
                     'timeout'       => 30,
-                    'header'        => "Content-Type: application/json\r\n",
+                    'header'        => "Content-Type: application/json\r\n" . $auth,
                     'content'       => $body,
                     'ignore_errors' => true,
                 ),
+                // Self-signed development certificate of the panel.
+                'ssl' => array(
+                    'verify_peer'      => false,
+                    'verify_peer_name' => false,
+                    'allow_self_signed'=> true,
+                ),
             ));
             $raw = @file_get_contents($url, false, $ctx);
-            if (false === $raw) {
+            if (false !== $raw) {
+                $code = 0;
+                if (!empty($http_response_header)) {
+                    foreach ($http_response_header as $h) {
+                        if (preg_match('#^HTTP/\S+\s+(\d{3})#', $h, $m)) {
+                            $code = (int) $m[1];
+                        }
+                    }
+                }
+                return array('code' => $code, 'body' => $raw);
+            }
+            if (!function_exists('wp_remote_post')) {
                 $err = error_get_last();
                 $this->last_error = 'DNA-DB request failed: '
                     . (isset($err['message']) ? $err['message'] : 'transport error');
                 return null;
             }
-            $code = 0;
-            if (!empty($http_response_header)) {
-                foreach ($http_response_header as $h) {
-                    if (preg_match('#^HTTP/\S+\s+(\d{3})#', $h, $m)) {
-                        $code = (int) $m[1];
-                    }
-                }
+            $res = wp_remote_post($url, array(
+                'timeout' => 30,
+                // The panel ships a self-signed TLS pair by default.
+                'sslverify' => false,
+                'headers' => array(
+                    'Content-Type'  => 'application/json',
+                    'Authorization' => ('' === $token) ? '' : 'Bearer ' . $token,
+                ),
+                'body'    => $body,
+            ));
+            if (is_wp_error($res)) {
+                $this->last_error = 'DNA-DB request failed: ' . $res->get_error_message();
+                return null;
             }
-            return array('code' => $code, 'body' => $raw);
+            return array(
+                'code' => (int) wp_remote_retrieve_response_code($res),
+                'body' => (string) wp_remote_retrieve_body($res),
+            );
         }
 
         /** Bearer token for the panel API (cached per PHP request). */
@@ -156,7 +178,8 @@ if (!class_exists('DNA_DB_wpdb')) {
             }
             $res = $this->dna_post(
                 $this->dna_url . '/api/login',
-                (string) wp_json_encode(array('user' => $this->dna_user, 'pass' => $this->dna_pass))
+                (string) wp_json_encode(array('user' => $this->dna_user, 'pass' => $this->dna_pass)),
+                ''
             );
             if (null === $res) {
                 $this->last_error = 'DNA-DB login failed: ' . $this->last_error;
@@ -188,7 +211,8 @@ if (!class_exists('DNA_DB_wpdb')) {
             }
             $res = $this->dna_post(
                 $this->dna_url . '/api/query',
-                (string) wp_json_encode(array('query' => $sql, 'kind' => 'sql'))
+                (string) wp_json_encode(array('query' => $sql, 'kind' => 'sql')),
+                $token
             );
             if (null === $res) {
                 $this->last_error = 'DNA-DB request failed: ' . $this->last_error;
@@ -196,9 +220,14 @@ if (!class_exists('DNA_DB_wpdb')) {
             }
             $json = json_decode($res['body'], true);
             if ($res['code'] >= 400 || !is_array($json)) {
-                $this->last_error = (is_array($json) && isset($json['error']))
+                $detail = is_array($json) && isset($json['error'])
                     ? (string) $json['error']
                     : ('DNA-DB HTTP ' . $res['code']);
+                $this->last_error = $detail;
+                // Debug trail for wp-config WP_DEBUG_LOG (diagnostics only).
+                if (defined('WP_DEBUG') && WP_DEBUG) {
+                    error_log('DNA-DB query failed: ' . $sql . ' => ' . $detail);
+                }
                 return null;
             }
             $this->dna_last = $json;
@@ -230,6 +259,29 @@ if (!class_exists('DNA_DB_wpdb')) {
             $this->last_query = $query;
             $this->num_queries++;
 
+            $upper_head = strtoupper(ltrim($query));
+
+            // The HTTP transport is stateless: each /api/query opens its own
+            // gate session, so session-scoped shims (FOUND_ROWS(),
+            // LAST_INSERT_ID()) must be answered from cached values instead
+            // of a round trip that would land in a fresh session.
+            if (preg_match('/^SELECT\s+FOUND_ROWS\(\)/i', $upper_head)) {
+                $value = (int) $this->dna_found_rows;
+                $obj               = new stdClass();
+                $obj->{'FOUND_ROWS()'} = $value;
+                $this->last_result = array($obj);
+                $this->num_rows    = 1;
+                return 1;
+            }
+            if (preg_match('/^SELECT\s+LAST_INSERT_ID\(\)/i', $upper_head)) {
+                $value = (int) $this->insert_id;
+                $obj = new stdClass();
+                $obj->{'LAST_INSERT_ID()'} = $value;
+                $this->last_result = array($obj);
+                $this->num_rows    = 1;
+                return 1;
+            }
+
             $res = $this->dna_query($query);
             if (null === $res) {
                 $this->last_result = array();
@@ -241,6 +293,13 @@ if (!class_exists('DNA_DB_wpdb')) {
             $upper = strtoupper(ltrim($query));
             $is_read = (0 === strpos($upper, 'SELECT')) || (0 === strpos($upper, 'SHOW'))
                 || (0 === strpos($upper, 'DESCRIBE')) || (0 === strpos($upper, 'EXPLAIN'));
+
+            // Cache the companion value of SQL_CALC_FOUND_ROWS for the
+            // follow-up SELECT FOUND_ROWS() (see the stateless note above).
+            $this->dna_calc_found = false !== strpos($upper, 'SQL_CALC_FOUND_ROWS');
+            if ($this->dna_calc_found && isset($res['found_rows'])) {
+                $this->dna_found_rows = (int) $res['found_rows'];
+            }
 
             if ($is_read) {
                 // wpdb expects an array of stdClass objects in last_result.
@@ -266,10 +325,17 @@ if (!class_exists('DNA_DB_wpdb')) {
                 $this->rows_affected = (int) $m[1];
             }
             if (0 === strpos($upper, 'INSERT')) {
+                // Preferred: the gate reports last_insert_id at the top level
+                // of every /api/query response; the pk-row scan stays as a
+                // fallback for older builds.
                 $this->insert_id = 0;
-                foreach ($rows as $row) {
-                    if (isset($row['pk']) && is_numeric($row['pk'])) {
-                        $this->insert_id = max($this->insert_id, (int) $row['pk']);
+                if (isset($res['last_insert_id']) && is_numeric($res['last_insert_id'])) {
+                    $this->insert_id = (int) $res['last_insert_id'];
+                } else {
+                    foreach ($rows as $row) {
+                        if (isset($row['pk']) && is_numeric($row['pk'])) {
+                            $this->insert_id = max($this->insert_id, (int) $row['pk']);
+                        }
                     }
                 }
             }
@@ -318,10 +384,12 @@ if (!class_exists('DNA_DB_wpdb')) {
         /**
          * Database selection is bookkeeping only (single-tenant gate).
          * @param string $db
+         * @param mysqli|null $dbh Unused (signature-compatible with WP 7.x).
          * @return bool
          */
-        public function select($db)
+        public function select($db, $dbh = null)
         {
+            unset($dbh);
             $this->dbname = (string) $db;
             return true;
         }
@@ -343,6 +411,17 @@ if (!class_exists('DNA_DB_wpdb')) {
          * @return string
          */
         public function db_version()
+        {
+            return '8.0.36';
+        }
+
+        /**
+         * dbDelta() (WP 7.x) calls db_server_info() to pick MySQL-vs-MariaDB
+         * index quirks; there is no live mysqli handle — report the same
+         * MySQL 8.0 tag as db_version().
+         * @return string
+         */
+        public function db_server_info()
         {
             return '8.0.36';
         }
