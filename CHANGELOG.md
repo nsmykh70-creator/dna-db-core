@@ -7,6 +7,13 @@
 The wire adapter was validated end-to-end against REAL applications, with
 no client-side changes at all (stock mysqli / wp-cli / PyMySQL / Connector/Py):
 
+Both E2E batteries were reproduced on a separate machine (portable
+MariaDB 11.8.6, PHP 8.4.27 from Debian debs, WP-CLI 2.12.0): WordPress
+verdict MATCH again with byte-equal artifacts, WooCommerce 12/12 artifacts
+with the two documented cosmetic `wp_term_relationships` notices identical
+to the report (`docs/cms/E2E_WP_MYSQLWIRE_REPORT.md`,
+`docs/cms/E2E_WOO_MYSQLWIRE_REPORT.md`).
+
 - Real WordPress 7.1.4 over the wire (no drop-in): `wp core install`, dbDelta
   creating all 12 core tables, posts/meta/users CRUD, `wp_authenticate`,
   cron artifacts — **21/21 artifacts identical to MariaDB** through a byte-equal
