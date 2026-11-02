@@ -25,6 +25,7 @@ use std::time::Duration;
 use crate::cms::ddl_meta::CmsTableMeta;
 use crate::cms::errno;
 use crate::cms::locks::{LockRegistry, ReleaseResult};
+use crate::cms::row_locks::{RowLockRegistry, RowLockWait};
 use crate::cms::session::CmsSession;
 use crate::cms::wordpress;
 use crate::relational::{ColumnType, Value};
@@ -92,6 +93,10 @@ pub fn classify_error(message: &str) -> u16 {
 pub struct CmsSqlGate {
     pub engine: Arc<SqlEngine>,
     pub locks: LockRegistry,
+    /// Row-level locks for `SELECT … FOR UPDATE` / blocked DML (§4 item 2):
+    /// InnoDB-style waits (1205), `NOWAIT` (3572) and deadlock detection
+    /// (1213) over a waits-for graph.
+    pub row_locks: RowLockRegistry,
     sessions: Mutex<HashMap<u64, CmsSession>>,
     next_session: AtomicU64,
     /// Catalog overlay: MySQL-exact schema metadata per table (dbDelta).
@@ -106,6 +111,7 @@ impl CmsSqlGate {
         CmsSqlGate {
             engine,
             locks: LockRegistry::new(),
+            row_locks: RowLockRegistry::new(),
             sessions: Mutex::new(HashMap::new()),
             next_session: AtomicU64::new(1),
             meta: RwLock::new(HashMap::new()),
@@ -124,10 +130,12 @@ impl CmsSqlGate {
         id
     }
 
-    /// Releases per-connection state (connection close): named locks and
-    /// the session record. Returns the number of locks freed.
+    /// Releases per-connection state (connection close): named locks, row
+    /// locks and the session record. Returns the number of locks freed.
     pub fn close_session(&self, id: u64) -> usize {
-        let freed = self.locks.release_all(id);
+        // MySQL rolls an open transaction back on disconnect — row locks die
+        // with it.
+        let freed = self.locks.release_all(id) + self.row_locks.release_session(id);
         // Uncommitted transaction state dies with the connection (MySQL
         // rolls an open transaction back on disconnect).
         self.txs.lock().expect("tx map poisoned").remove(&id);
@@ -248,13 +256,32 @@ impl CmsSqlGate {
             forwarded = forwarded.split_whitespace().collect::<Vec<_>>().join(" ");
         }
 
+        // ---------- row locks (CMS_EDITION_RU.md §4 item 2) ----------
+        // `SELECT … FOR UPDATE|SHARE` takes row locks on the returned rows;
+        // `UPDATE`/`DELETE` wait for (or take, inside a tx) the same locks on
+        // their target rows — WooCommerce stock serialization.
+        let sel_locking = if upper.starts_with("SELECT") {
+            find_locking_tail(sql)
+        } else {
+            None
+        };
+        let write_probe = if upper.starts_with("UPDATE") || upper.starts_with("DELETE ") {
+            self.write_target_probe(sql)
+        } else {
+            None
+        };
+        // InnoDB: DML blocks while an open transaction holds a target row.
+        if let Some((table, key_sql)) = &write_probe {
+            self.wait_write_targets(session, table, key_sql)?;
+        }
+
         // ---------- real execution ----------
         let is_select = upper.starts_with("SELECT") || upper.starts_with("WITH");
         // The session owns the BEGIN..COMMIT buffer: while a transaction is
         // active, DML is buffered here and applied as one atomic WAL batch
         // on COMMIT (v3.6 transaction semantics, one buffer per connection).
         let mut tx_buf = self.txs.lock().expect("tx map poisoned").remove(&session);
-        let res = match self.engine.execute_in_tx(&forwarded, &mut tx_buf) {
+        let mut res = match self.engine.execute_in_tx(&forwarded, &mut tx_buf) {
             Ok(res) => {
                 if let Some(buf) = tx_buf.take() {
                     self.txs
@@ -278,11 +305,29 @@ impl CmsSqlGate {
             }
         };
 
+        // InnoDB two-phase locking: COMMIT / ROLLBACK end the transaction and
+        // release every row lock it holds.
+        if upper == "COMMIT" || upper == "ROLLBACK" {
+            self.row_locks.release_session(session);
+        }
+        // `SELECT … FOR UPDATE`: lock the returned rows. Inside a transaction
+        // the holds survive until COMMIT/ROLLBACK; in autocommit they end
+        // with the statement (MySQL semantics).
+        let mut out_note = String::new();
+        if let Some((tail_pos, nowait, skip_locked)) = sel_locking {
+            let mut rows = std::mem::take(&mut res.rows);
+            let locked = self.lock_select_rows(session, sql, tail_pos, nowait, skip_locked, &mut rows)?;
+            res.rows = rows;
+            if locked > 0 {
+                out_note.push_str(&format!(" row_locks={}", locked));
+            }
+        }
+
         let mut out = CmsQueryResult {
             columns: res.columns,
             rows: res.rows,
             message: res.message.clone(),
-            plan: res.execution_plan,
+            plan: format!("{}{}", res.execution_plan, out_note),
             affected_rows: 0,
             last_insert_id: 0,
             found_rows: 0,
@@ -336,6 +381,206 @@ impl CmsSqlGate {
 
     // ---------------- SET / USE ----------------
 
+    // ---------------- row locks (§4 item 2) ----------------
+
+    /// Is a BEGIN..COMMIT transaction open for this session?
+    fn tx_active(&self, session: u64) -> bool {
+        self.txs
+            .lock()
+            .expect("tx map poisoned")
+            .get(&session)
+            .map(|b| b.active)
+            .unwrap_or(false)
+    }
+
+    /// Runs a statement with the session's tx buffer (same read visibility
+    /// as client statements — the probe must see the transaction's writes).
+    fn run_with_tx(
+        &self,
+        session: u64,
+        sql: &str,
+    ) -> Result<crate::sql_engine::QueryResult, String> {
+        let mut tx_buf = self.txs.lock().expect("tx map poisoned").remove(&session);
+        let res = self.engine.execute_in_tx(sql, &mut tx_buf);
+        if let Some(buf) = tx_buf.take() {
+            self.txs
+                .lock()
+                .expect("tx map poisoned")
+                .insert(session, buf);
+        }
+        res
+    }
+
+    /// Row-lock wait budget of the session (`innodb_lock_wait_timeout`);
+    /// `NOWAIT` means zero — a held row errors immediately.
+    fn lock_timeout_of(&self, session: u64, nowait: bool) -> Duration {
+        if nowait {
+            return Duration::ZERO;
+        }
+        let secs = self
+            .with_session(session, |s| s.lock_wait_timeout)
+            .unwrap_or(50.0);
+        Duration::from_secs_f64(secs.clamp(0.0, 3600.0))
+    }
+
+    /// Locks the rows a `SELECT … FOR UPDATE` returned. Resolves the PK of
+    /// the main table from the overlay metadata — from the result rows when
+    /// the projection carries it (`SELECT *`, Action Scheduler), otherwise
+    /// by re-querying the same FROM/WHERE for `SELECT <pk>`. Returns the
+    /// number of rows locked; with `skip_locked`, foreign-held rows are
+    /// dropped from the result instead of waited on (queue semantics).
+    #[allow(clippy::too_many_arguments)]
+    fn lock_select_rows(
+        &self,
+        session: u64,
+        sql: &str,
+        tail_pos: usize,
+        nowait: bool,
+        skip_locked: bool,
+        rows: &mut Vec<BTreeMap<String, Value>>,
+    ) -> Result<usize, CmsError> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let Some(from_pos) = top_level_find_ci(sql, "FROM") else { return Ok(0) };
+        if from_pos >= tail_pos {
+            return Ok(0);
+        }
+        let tail = &sql[from_pos..tail_pos];
+        // Aggregates change the row identity — InnoDB locks the scanned
+        // rows; we conservatively skip (documented divergence).
+        if top_level_find_ci(tail, "GROUP").is_some() {
+            return Ok(0);
+        }
+        let Some(table) = first_table_ident(&tail[4..]) else { return Ok(0) };
+        let Some(pk) = self.table_meta(&table).and_then(|m| m.primary_key.first().cloned())
+        else {
+            return Ok(0);
+        };
+        let in_tx = self.tx_active(session);
+        // SKIP LOCKED never waits: try once, drop on foreign hold.
+        let timeout = self.lock_timeout_of(session, nowait || skip_locked);
+        // Fast path: the projection already carries the PK.
+        let projected = rows[0].contains_key(&pk);
+        let keys: Vec<String> = if projected {
+            rows.iter().filter_map(|r| r.get(&pk).and_then(value_key)).collect()
+        } else {
+            let key_sql = format!("SELECT {} {}", pk, tail);
+            match self.run_with_tx(session, &key_sql) {
+                Ok(r) => {
+                    r.rows
+                        .iter()
+                        .filter_map(|row| row.get(&pk).and_then(value_key))
+                        .collect()
+                }
+                // Best-effort: a key query the engine cannot parse must
+                // never fail the client statement.
+                Err(_) => return Ok(0),
+            }
+        };
+        let mut locked = 0usize;
+        let mut skipped: Vec<usize> = Vec::new();
+        for (idx, key) in keys.iter().enumerate() {
+            if skip_locked && self.row_locks.probe(&table, key, session).is_some() {
+                skipped.push(idx);
+                continue;
+            }
+            match self.row_locks.acquire(&table, key, session, timeout) {
+                Ok(_) => {
+                    if in_tx {
+                        locked += 1;
+                    }
+                }
+                Err(w) => {
+                    if skip_locked {
+                        skipped.push(idx);
+                        continue;
+                    }
+                    if !in_tx {
+                        self.row_locks.release_session(session);
+                    }
+                    return Err(row_lock_error(w, nowait));
+                }
+            }
+        }
+        if !in_tx {
+            // Autocommit: the statement's locks end with the statement.
+            self.row_locks.release_session(session);
+        }
+        // SKIP LOCKED with a projected PK: excluded rows leave the result
+        // (InnoDB returns only the rows it actually locked).
+        if projected && !skipped.is_empty() {
+            let mut i = 0usize;
+            rows.retain(|_| {
+                let keep = !skipped.contains(&i);
+                i += 1;
+                keep
+            });
+        }
+        Ok(locked)
+    }
+
+    /// Textual probe plan for an UPDATE/DELETE: (main table, `SELECT <pk>`
+    /// query over the same WHERE). `None` when the target set cannot be
+    /// derived (no WHERE, multi-table DELETE, unknown table, subquery FROM).
+    fn write_target_probe(&self, sql: &str) -> Option<(String, String)> {
+        let up = sql.to_ascii_uppercase();
+        if up.starts_with("UPDATE") {
+            let set_pos = top_level_find_ci(sql, "SET")?;
+            let table = first_table_ident(&sql[6..set_pos])?;
+            let pk = self
+                .table_meta(&table)
+                .and_then(|m| m.primary_key.first().cloned())?;
+            let where_pos = top_level_find_ci(sql, "WHERE")?;
+            Some((
+                table.clone(),
+                format!("SELECT {} FROM {} {}", pk, table, &sql[where_pos..]),
+            ))
+        } else if up.starts_with("DELETE ") {
+            let from_pos = top_level_find_ci(sql, "FROM")?;
+            // Multi-table DELETE (`DELETE a, b FROM …`) — not targeted here.
+            if sql[..from_pos].contains(',') {
+                return None;
+            }
+            let table = first_table_ident(&sql[from_pos + 4..])?;
+            let pk = self
+                .table_meta(&table)
+                .and_then(|m| m.primary_key.first().cloned())?;
+            Some((table, format!("SELECT {} {}", pk, &sql[from_pos..])))
+        } else {
+            None
+        }
+    }
+
+    /// InnoDB write-write conflict: while an open transaction holds a
+    /// target row, the DML waits. Inside a transaction the DML *takes* the
+    /// locks (X-locks held until COMMIT) so opposite-order updates deadlock
+    /// with errno 1213 exactly like InnoDB.
+    fn wait_write_targets(&self, session: u64, table: &str, key_sql: &str) -> Result<(), CmsError> {
+        let rows = match self.run_with_tx(session, key_sql) {
+            Ok(r) => r.rows,
+            Err(_) => return Ok(()),
+        };
+        let Some(pk) = self.table_meta(table).and_then(|m| m.primary_key.first().cloned())
+        else {
+            return Ok(());
+        };
+        let timeout = self.lock_timeout_of(session, false);
+        let in_tx = self.tx_active(session);
+        for row in &rows {
+            let Some(v) = row.get(&pk) else { continue };
+            let Some(key) = value_key(v) else { continue };
+            let res = if in_tx {
+                self.row_locks.acquire(table, &key, session, timeout).map(|_| ())
+            } else {
+                self.row_locks
+                    .wait_until_free(table, &key, session, timeout)
+            };
+            res.map_err(|w| row_lock_error(w, false))?;
+        }
+        Ok(())
+    }
+
     fn exec_set(&self, session: u64, sql: &str, upper: &str) -> Result<CmsQueryResult, CmsError> {
         let body = sql[4..].trim();
         let upper_body = upper[4..].trim();
@@ -366,6 +611,26 @@ impl CmsSqlGate {
             let on = val == "1" || val.eq_ignore_ascii_case("ON") || val.eq_ignore_ascii_case("TRUE");
             self.with_session(session, |s| s.autocommit = on);
             return Ok(empty_ok(format!("autocommit = {}", if on { 1 } else { 0 })));
+        }
+        // SET [SESSION|@@session.] innodb_lock_wait_timeout = <seconds>
+        if body_up.contains("INNODB_LOCK_WAIT_TIMEOUT") {
+            let val = after_eq(body)
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_string();
+            match val.parse::<f64>() {
+                Ok(v) if v.is_finite() && (0.0..=3600.0).contains(&v) => {
+                    self.with_session(session, |s| s.lock_wait_timeout = v);
+                    return Ok(empty_ok(format!("innodb_lock_wait_timeout = {}", v)));
+                }
+                _ => {
+                    return Err(CmsError {
+                        errno: errno::ER_WRONG_VALUE_FOR_VAR,
+                        message: format!("Incorrect argument type to variable 'innodb_lock_wait_timeout': {}", val),
+                    });
+                }
+            }
         }
         // Other SETs (character_set_client, collation_connection, ...) are
         // accepted and ignored: the CMS edition always speaks utf8mb4.
@@ -708,6 +973,164 @@ fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
     let h = haystack.to_ascii_lowercase();
     let n = needle.to_ascii_lowercase();
     h.find(&n)
+}
+
+/// Finds `needle` (a keyword) as a *top-level* token in `hay`: outside
+/// string literals, backtick identifiers, parentheses and SQL comments.
+/// Locking-tail and table extraction must not trip over
+/// `WHERE note = 'send for update'` or subqueries. Byte-index result.
+fn top_level_find_ci(hay: &str, needle: &str) -> Option<usize> {
+    let b = hay.as_bytes();
+    let n = needle.as_bytes();
+    let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let (mut in_s, mut in_d, mut in_b) = (false, false, false);
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    while i < b.len() {
+        let c = b[i];
+        if in_s {
+            match c {
+                b'\\' => { i += 2; continue; }
+                b'\'' => in_s = false,
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+        if in_d {
+            match c {
+                b'\\' => { i += 2; continue; }
+                b'"' => in_d = false,
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+        if in_b {
+            if c == b'`' {
+                in_b = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\'' => in_s = true,
+            b'"' => in_d = true,
+            b'`' => in_b = true,
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b'-' if i + 1 < b.len() && b[i + 1] == b'-' => {
+                while i < b.len() && b[i] != b'\n' { i += 1; }
+                continue;
+            }
+            b'/' if i + 1 < b.len() && b[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') { i += 1; }
+                i += 2;
+                continue;
+            }
+            _ if depth == 0
+                && is_word(c)
+                && (i == 0 || !is_word(b[i - 1]))
+                && i + n.len() <= b.len()
+                && b[i..i + n.len()].eq_ignore_ascii_case(n)
+                && (i + n.len() == b.len() || !is_word(b[i + n.len()])) =>
+            {
+                return Some(i);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Detects a MySQL row-locking tail: `FOR UPDATE|SHARE [OF …] [NOWAIT |
+/// SKIP LOCKED]`. Returns `(byte pos of FOR, nowait, skip_locked)`.
+fn find_locking_tail(sql: &str) -> Option<(usize, bool, bool)> {
+    let mut search_from = 0usize;
+    while let Some(p) = top_level_find_ci(&sql[search_from..], "FOR") {
+        let abs = search_from + p;
+        let rest = sql[abs + 3..].trim_start().to_ascii_uppercase();
+        if rest.starts_with("UPDATE") || rest.starts_with("SHARE") {
+            let nowait = rest.contains("NOWAIT");
+            let skip_locked = rest.contains("SKIP LOCKED");
+            return Some((abs, nowait, skip_locked));
+        }
+        search_from = abs + 3;
+    }
+    None
+}
+
+/// First identifier of a FROM/WHERE-head clause: `wp_options AS o`,
+/// `` `wp_terms` t ``, `d.wp_options`. `None` for derived tables (`(…)`).
+fn first_table_ident(clause: &str) -> Option<String> {
+    let clause = clause.trim_start();
+    if clause.starts_with('(') {
+        return None; // subquery / derived table — no single row identity
+    }
+    let b: Vec<char> = clause.chars().collect();
+    let mut i = 0usize;
+    while i < b.len() && b[i].is_whitespace() {
+        i += 1;
+    }
+    if i >= b.len() {
+        return None;
+    }
+    if b[i] == '`' {
+        i += 1;
+        let start = i;
+        while i < b.len() && b[i] != '`' {
+            i += 1;
+        }
+        return Some(b[start..i].iter().collect());
+    }
+    let start = i;
+    while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == '_' || b[i] == '.') {
+        i += 1;
+    }
+    if i == start {
+        return None;
+    }
+    Some(b[start..i].iter().collect())
+}
+
+/// Canonical string form of a row key (the PK value as stored).
+fn value_key(v: &Value) -> Option<String> {
+    match v {
+        Value::Int(i) => Some(i.to_string()),
+        Value::Float(x) => Some(x.to_string()),
+        Value::Text(s) | Value::Dna(s) => Some(s.clone()),
+        Value::Null => None,
+    }
+}
+
+/// Maps a lock-wait outcome to the MySQL server error CMS code branches on:
+/// deadlock → 1213 (SQLSTATE 40001), NOWAIT → 3572, wait expiry → 1205.
+fn row_lock_error(wait: RowLockWait, nowait: bool) -> CmsError {
+    match wait {
+        RowLockWait::Deadlock { chain } => CmsError {
+            errno: errno::ER_LOCK_DEADLOCK,
+            message: format!(
+                "Deadlock found when trying to get lock; try restarting transaction (session chain {:?})",
+                chain
+            ),
+        },
+        RowLockWait::Timeout { holder } if nowait => CmsError {
+            errno: errno::ER_LOCK_NOWAIT,
+            message: format!(
+                "Statement aborted because lock(s) could not be acquired immediately and NOWAIT is set (held by session {})",
+                holder
+            ),
+        },
+        RowLockWait::Timeout { holder } => CmsError {
+            errno: errno::ER_LOCK_WAIT_TIMEOUT,
+            message: format!(
+                "Lock wait timeout exceeded; try restarting transaction (row held by session {})",
+                holder
+            ),
+        },
+    }
 }
 
 /// Extracts the argument list of `FN(...)` in `sql` (first occurrence).
@@ -1849,6 +2272,250 @@ mod tests {
             r.columns,
             vec!["term_id", "name", "slug", "term_group", "new_col"]
         );
+    }
+
+    // ---------------- row locks: SELECT … FOR UPDATE (§4 item 2) ----------------
+
+    /// Small stock table for lock scenarios (Woo `_stock` meta shape).
+    fn stock_gate(name: &str) -> CmsSqlGate {
+        let g = gate(name);
+        g.execute(
+            g.open_session(),
+            "CREATE TABLE wp_stock_meta (meta_id bigint(20) unsigned NOT NULL auto_increment, post_id bigint(20) unsigned NOT NULL default 0, meta_key varchar(255) NOT NULL default '', meta_value longtext, PRIMARY KEY (meta_id))",
+        )
+        .unwrap();
+        g
+    }
+
+    #[test]
+    fn for_update_blocks_second_session_until_commit() {
+        let g = stock_gate("fu_block");
+        let s1 = g.open_session();
+        let s2 = g.open_session();
+        g.execute(s1, "INSERT INTO wp_stock_meta (post_id, meta_key, meta_value) VALUES (7, '_stock', '10')").unwrap();
+
+        // s1: read-and-lock inside a transaction.
+        g.execute(s1, "BEGIN").unwrap();
+        let r = g
+            .execute(s1, "SELECT meta_value FROM wp_stock_meta WHERE post_id = 7 AND meta_key = '_stock' FOR UPDATE")
+            .unwrap();
+        assert_eq!(v(&r.rows[0], "meta_value"), "10");
+        assert_eq!(g.row_locks.held_len(), 1, "one row lock held inside tx");
+
+        // s2: the same FOR UPDATE waits → 1205 with a tiny session timeout.
+        g.execute(s2, "SET innodb_lock_wait_timeout = 0.15").unwrap();
+        g.execute(s2, "BEGIN").unwrap();
+        let err = g
+            .execute(s2, "SELECT meta_value FROM wp_stock_meta WHERE post_id = 7 AND meta_key = '_stock' FOR UPDATE")
+            .unwrap_err();
+        assert_eq!(err.errno, errno::ER_LOCK_WAIT_TIMEOUT, "1205 expected, got {:?}", err);
+        // s2's tx survived the failed statement (statement-level rollback).
+        assert!(g.tx_active(s2));
+
+        // NOWAIT on a held row → 3572 immediately.
+        g.execute(s1, "SET innodb_lock_wait_timeout = 5").unwrap();
+        let err = g
+            .execute(s2, "SELECT meta_value FROM wp_stock_meta WHERE post_id = 7 AND meta_key = '_stock' FOR UPDATE NOWAIT")
+            .unwrap_err();
+        assert_eq!(err.errno, errno::ER_LOCK_NOWAIT, "3572 expected, got {:?}", err);
+
+        // COMMIT releases; the waiter then succeeds (its tx still open).
+        g.execute(s1, "COMMIT").unwrap();
+        assert_eq!(g.row_locks.held_len(), 0, "commit releases row locks");
+        let r = g
+            .execute(s2, "SELECT meta_value FROM wp_stock_meta WHERE post_id = 7 AND meta_key = '_stock' FOR UPDATE")
+            .unwrap();
+        assert_eq!(v(&r.rows[0], "meta_value"), "10");
+        g.execute(s2, "ROLLBACK").unwrap();
+        assert_eq!(g.row_locks.held_len(), 0);
+    }
+
+    #[test]
+    fn for_update_reentrant_same_session_and_row() {
+        let g = stock_gate("fu_reentrant");
+        let s = g.open_session();
+        g.execute(s, "INSERT INTO wp_stock_meta (post_id, meta_key, meta_value) VALUES (1, '_stock', '5')").unwrap();
+        g.execute(s, "BEGIN").unwrap();
+        g.execute(s, "SELECT meta_value FROM wp_stock_meta WHERE post_id = 1 FOR UPDATE").unwrap();
+        // Same transaction locks the row again — no self-deadlock.
+        let r = g.execute(s, "SELECT meta_value FROM wp_stock_meta WHERE post_id = 1 AND meta_key = '_stock' FOR UPDATE").unwrap();
+        assert_eq!(v(&r.rows[0], "meta_value"), "5");
+        g.execute(s, "COMMIT").unwrap();
+        assert_eq!(g.row_locks.held_len(), 0);
+    }
+
+    #[test]
+    fn opposite_order_updates_deadlock_1213() {
+        // InnoDB pattern: T1 locks A then wants B; T2 locks B then wants A →
+        // one of them gets 1213 and WooCommerce retries.
+        let g = stock_gate("fu_deadlock");
+        let s1 = g.open_session();
+        let s2 = g.open_session();
+        g.execute(s1, "INSERT INTO wp_stock_meta (post_id, meta_key, meta_value) VALUES (100, '_stock', '1')").unwrap();
+        g.execute(s1, "INSERT INTO wp_stock_meta (post_id, meta_key, meta_value) VALUES (200, '_stock', '2')").unwrap();
+
+        g.execute(s1, "SET innodb_lock_wait_timeout = 3").unwrap();
+        g.execute(s2, "SET innodb_lock_wait_timeout = 3").unwrap();
+
+        // T1 holds row A (post_id=100); T2 holds row B (post_id=200).
+        g.execute(s1, "BEGIN").unwrap();
+        g.execute(s1, "SELECT meta_value FROM wp_stock_meta WHERE post_id = 100 FOR UPDATE").unwrap();
+        g.execute(s2, "BEGIN").unwrap();
+        g.execute(s2, "SELECT meta_value FROM wp_stock_meta WHERE post_id = 200 FOR UPDATE").unwrap();
+
+        // T1 starts waiting for B on a background thread…
+        let g2 = std::sync::Arc::new(g);
+        let g3 = g2.clone();
+        let t1 = std::thread::spawn(move || {
+            g3.execute(s1, "SELECT meta_value FROM wp_stock_meta WHERE post_id = 200 FOR UPDATE")
+        });
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        // …then T2 asks for A: cycle (s2→B→s1→A→s2) → 1213 immediately.
+        let err = g2
+            .execute(s2, "SELECT meta_value FROM wp_stock_meta WHERE post_id = 100 FOR UPDATE")
+            .unwrap_err();
+        assert_eq!(err.errno, errno::ER_LOCK_DEADLOCK, "1213 expected, got {:?}", err);
+        assert_eq!(err.sqlstate(), "40001");
+
+        // Victim "rolled back its statement" (tx survives per MySQL); after
+        // T2 rolls back fully, T1's wait completes.
+        g2.execute(s2, "ROLLBACK").unwrap();
+        let r = t1.join().unwrap().expect("T1 must acquire row B after T2 died");
+        assert_eq!(v(&r.rows[0], "meta_value"), "2");
+        g2.execute(s1, "COMMIT").unwrap();
+    }
+
+    #[test]
+    fn autocommit_update_waits_for_held_row() {
+        // Woo path: order A reduced stock in a tx (FOR UPDATE); order B's
+        // autocommit UPDATE of the same row must wait, not stomp.
+        let g = stock_gate("fu_autocommit");
+        let s1 = g.open_session();
+        let s2 = g.open_session();
+        g.execute(s1, "INSERT INTO wp_stock_meta (post_id, meta_key, meta_value) VALUES (77, '_stock', '10')").unwrap();
+
+        g.execute(s1, "BEGIN").unwrap();
+        g.execute(s1, "SELECT meta_value FROM wp_stock_meta WHERE post_id = 77 AND meta_key = '_stock' FOR UPDATE").unwrap();
+
+        // Autocommit UPDATE blocked by the open tx → 1205 (short timeout).
+        g.execute(s2, "SET innodb_lock_wait_timeout = 0.15").unwrap();
+        let err = g
+            .execute(s2, "UPDATE wp_stock_meta SET meta_value = '8' WHERE post_id = 77 AND meta_key = '_stock'")
+            .unwrap_err();
+        assert_eq!(err.errno, errno::ER_LOCK_WAIT_TIMEOUT, "1205 expected, got {:?}", err);
+        // The row still holds the old value.
+        let r = g.execute(s1, "SELECT meta_value FROM wp_stock_meta WHERE post_id = 77").unwrap();
+        assert_eq!(v(&r.rows[0], "meta_value"), "10");
+
+        // Commit, then the UPDATE goes through.
+        g.execute(s1, "COMMIT").unwrap();
+        let r = g.execute(s2, "UPDATE wp_stock_meta SET meta_value = '8' WHERE post_id = 77 AND meta_key = '_stock'").unwrap();
+        assert_eq!(r.affected_rows, 1);
+        let r = g.execute(s2, "SELECT meta_value FROM wp_stock_meta WHERE post_id = 77").unwrap();
+        assert_eq!(v(&r.rows[0], "meta_value"), "8");
+    }
+
+    #[test]
+    fn update_in_tx_takes_hold_until_commit() {
+        let g = stock_gate("fu_upd_tx");
+        let s1 = g.open_session();
+        let s2 = g.open_session();
+        g.execute(s1, "INSERT INTO wp_stock_meta (post_id, meta_key, meta_value) VALUES (9, '_stock', '4')").unwrap();
+
+        g.execute(s1, "BEGIN").unwrap();
+        g.execute(s1, "UPDATE wp_stock_meta SET meta_value = '3' WHERE post_id = 9 AND meta_key = '_stock'").unwrap();
+        assert!(g.row_locks.held_len() >= 1, "UPDATE in tx holds an X lock");
+
+        g.execute(s2, "SET innodb_lock_wait_timeout = 0.15").unwrap();
+        g.execute(s2, "BEGIN").unwrap();
+        let err = g
+            .execute(s2, "UPDATE wp_stock_meta SET meta_value = '2' WHERE post_id = 9 AND meta_key = '_stock'")
+            .unwrap_err();
+        assert_eq!(err.errno, errno::ER_LOCK_WAIT_TIMEOUT, "1205 expected, got {:?}", err);
+        g.execute(s2, "ROLLBACK").unwrap();
+
+        g.execute(s1, "COMMIT").unwrap();
+        assert_eq!(g.row_locks.held_len(), 0);
+        let r = g.execute(s2, "SELECT meta_value FROM wp_stock_meta WHERE post_id = 9").unwrap();
+        assert_eq!(v(&r.rows[0], "meta_value"), "3", "first tx's write committed");
+    }
+
+    #[test]
+    fn delete_blocked_by_held_row_and_locking_tail_skips_literals() {
+        let g = stock_gate("fu_delete");
+        let s1 = g.open_session();
+        let s2 = g.open_session();
+        g.execute(s1, "INSERT INTO wp_stock_meta (post_id, meta_key, meta_value) VALUES (5, '_stock', '1')").unwrap();
+
+        g.execute(s1, "BEGIN").unwrap();
+        g.execute(s1, "SELECT meta_value FROM wp_stock_meta WHERE post_id = 5 FOR UPDATE").unwrap();
+
+        // A literal 'for update' inside a string must NOT take the lock path.
+        let r = g.execute(s2, "SELECT meta_value FROM wp_stock_meta WHERE meta_value = 'wait for update'").unwrap();
+        assert_eq!(r.rows.len(), 0, "literal containing 'for update' is not a locking tail");
+
+        g.execute(s2, "SET innodb_lock_wait_timeout = 0.15").unwrap();
+        let err = g.execute(s2, "DELETE FROM wp_stock_meta WHERE post_id = 5").unwrap_err();
+        assert_eq!(err.errno, errno::ER_LOCK_WAIT_TIMEOUT, "DELETE waits too");
+
+        g.execute(s1, "COMMIT").unwrap();
+        let r = g.execute(s2, "DELETE FROM wp_stock_meta WHERE post_id = 5").unwrap();
+        assert_eq!(r.affected_rows, 1);
+    }
+
+    #[test]
+    fn close_session_releases_row_locks() {
+        let g = stock_gate("fu_close");
+        let s1 = g.open_session();
+        let s2 = g.open_session();
+        g.execute(s1, "INSERT INTO wp_stock_meta (post_id, meta_key, meta_value) VALUES (3, '_stock', '9')").unwrap();
+        g.execute(s1, "BEGIN").unwrap();
+        g.execute(s1, "SELECT meta_value FROM wp_stock_meta WHERE post_id = 3 FOR UPDATE").unwrap();
+        assert_eq!(g.row_locks.held_len(), 1);
+        // PHP-FPM worker dies mid-transaction → disconnect rolls the tx back.
+        g.close_session(s1);
+        assert_eq!(g.row_locks.held_len(), 0, "disconnect releases row locks");
+        let r = g.execute(s2, "SELECT meta_value FROM wp_stock_meta WHERE post_id = 3").unwrap();
+        assert_eq!(v(&r.rows[0], "meta_value"), "9");
+    }
+
+    #[test]
+    fn skip_locked_claims_only_free_rows() {
+        // Action Scheduler: two queue workers claim pending jobs with
+        // FOR UPDATE SKIP LOCKED — each must get a DIFFERENT row.
+        let g = stock_gate("fu_skip");
+        let s1 = g.open_session();
+        let s2 = g.open_session();
+        g.execute(s1, "INSERT INTO wp_stock_meta (post_id, meta_key, meta_value) VALUES (11, '_job', 'a')").unwrap();
+        g.execute(s1, "INSERT INTO wp_stock_meta (post_id, meta_key, meta_value) VALUES (12, '_job', 'b')").unwrap();
+
+        // Worker 1 claims job 11 (projection carries the PK → exact rows).
+        g.execute(s1, "BEGIN").unwrap();
+        let r = g
+            .execute(s1, "SELECT meta_id, post_id FROM wp_stock_meta WHERE post_id = 11 FOR UPDATE")
+            .unwrap();
+        assert_eq!(v(&r.rows[0], "post_id"), "11");
+
+        // Worker 2 asks for both jobs, skipping held ones → only 12 left.
+        g.execute(s2, "BEGIN").unwrap();
+        let r = g
+            .execute(s2, "SELECT meta_id, post_id FROM wp_stock_meta WHERE post_id IN (11, 12) ORDER BY meta_id FOR UPDATE SKIP LOCKED")
+            .unwrap();
+        assert_eq!(r.rows.len(), 1, "held job 11 excluded by SKIP LOCKED");
+        assert_eq!(v(&r.rows[0], "post_id"), "12");
+
+        // Plain FOR UPDATE on the same set still blocks (0.15s → 1205).
+        let s3 = g.open_session();
+        g.execute(s3, "SET innodb_lock_wait_timeout = 0.15").unwrap();
+        let err = g
+            .execute(s3, "SELECT meta_id FROM wp_stock_meta WHERE post_id IN (11, 12) ORDER BY meta_id FOR UPDATE")
+            .unwrap_err();
+        assert_eq!(err.errno, errno::ER_LOCK_WAIT_TIMEOUT);
+
+        g.execute(s1, "COMMIT").unwrap();
+        g.execute(s2, "ROLLBACK").unwrap();
+        assert_eq!(g.row_locks.held_len(), 0);
     }
 }
 

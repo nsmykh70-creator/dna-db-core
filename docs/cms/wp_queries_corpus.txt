@@ -159,6 +159,20 @@
 [P1] INSERT INTO wp_terms (name, slug, term_group) VALUES ('News','news',0), ('Docs','docs',0)   -- multi-row INSERT терминов
 
 # ---------------------------------------------------------------------
+# LOCK. Строчные блокировки (ноябрь 2026, §4 item 2): конкурентные заказы
+# Woo и планировщик Action Scheduler. Ошибки: 1205 (wait timeout),
+# 1213 (deadlock, SQLSTATE 40001 → retry), 3572 (NOWAIT).
+# ---------------------------------------------------------------------
+[P2:LOCK] SET innodb_lock_wait_timeout = 3          -- сессия-конкретный бюджет ожидания
+[P2:LOCK] START TRANSACTION
+[P2:LOCK] SELECT meta_value FROM wp_postmeta WHERE post_id = 77 AND meta_key = '_stock' FOR UPDATE   -- wc_reduce_stock_levels: блокировка строки склада до COMMIT
+[P2:LOCK] UPDATE wp_postmeta SET meta_value = '8' WHERE post_id = 77 AND meta_key = '_stock'         -- DML в той же транзакции: X-лок реентерабелен
+[P2:LOCK] COMMIT                                     -- снимает все строчные блокировки сессии
+[P2:LOCK] SELECT action_id FROM wp_actionscheduler_actions WHERE hook = 'wc_schedule_sale' AND status IN ('pending') ORDER BY action_id FOR UPDATE SKIP LOCKED   -- два воркера очереди: чужие строки исключаются, а не ждут
+[P2:LOCK] SELECT stock FROM wp_wc_product_meta_lookup WHERE product_id = 42 FOR UPDATE NOWAIT        -- немедленный отказ 3572 на чужой блокировке
+[P2:LOCK] UPDATE wp_wc_product_meta_lookup SET stock_quantity = stock_quantity - 1 WHERE product_id = 42   -- вне транзакции: ждёт чужой FOR UPDATE, сам не держит
+
+# ---------------------------------------------------------------------
 # Открытые пробелы диалекта (фаза 2) — WP их переживает, но надо закрыть:
 #   DELETE a, b FROM wp_options a, wp_options b WHERE ...  (multi-table DELETE,
 #       чистка просроченных транзиентов; WP продолжает работу при ошибке)

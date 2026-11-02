@@ -145,6 +145,9 @@ pub struct CmsSession {
     pub sql_mode: SqlMode,
     /// Connection charset, see [`Charset`].
     pub charset: Charset,
+    /// `innodb_lock_wait_timeout` (seconds, InnoDB default 50) — how long a
+    /// row-lock wait (`FOR UPDATE`, blocked DML) lasts before errno 1205.
+    pub lock_wait_timeout: f64,
 }
 
 impl CmsSession {
@@ -160,6 +163,8 @@ impl CmsSession {
             // WordPress sets utf8mb4 explicitly, but MySQL 8 defaults to
             // utf8mb4 too — a safe CMS-edition default.
             charset: Charset::Utf8Mb4,
+            // InnoDB default innodb_lock_wait_timeout = 50s.
+            lock_wait_timeout: 50.0,
         }
     }
 

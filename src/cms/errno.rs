@@ -40,10 +40,15 @@ pub const ER_INCORRECT_STRING_VALUE: u16 = 1366;
 pub const ER_TRUNCATED_WRONG_VALUE: u16 = 1292;
 /// `Unknown system variable '…'` — `SET sql_mode`/`SET NAMES` dialect.
 pub const ER_UNKNOWN_SYSTEM_VARIABLE: u16 = 1193;
+/// `Incorrect argument type to variable '…'` — bad SET value.
+pub const ER_WRONG_VALUE_FOR_VAR: u16 = 1231;
 /// `Lock wait timeout exceeded` — innodb_lock_wait_timeout analogue.
 pub const ER_LOCK_WAIT_TIMEOUT: u16 = 1205;
 /// `Deadlock found when trying to get lock` — WooCommerce retry loop target.
 pub const ER_LOCK_DEADLOCK: u16 = 1213;
+/// `Statement aborted because lock(s) could not be acquired immediately and
+/// NOWAIT is set` — `SELECT … FOR UPDATE NOWAIT` on a held row.
+pub const ER_LOCK_NOWAIT: u16 = 3572;
 /// `FUNCTION … does not exist` — plugins calling MySQL built-ins we lack.
 pub const ER_SP_DOES_NOT_EXIST: u16 = 1305;
 /// `Data too long for column '…'`.
@@ -71,8 +76,10 @@ pub fn name(code: u16) -> Option<&'static str> {
         ER_INCORRECT_STRING_VALUE => "ER_INCORRECT_STRING_VALUE",
         ER_TRUNCATED_WRONG_VALUE => "ER_TRUNCATED_WRONG_VALUE",
         ER_UNKNOWN_SYSTEM_VARIABLE => "ER_UNKNOWN_SYSTEM_VARIABLE",
+        ER_WRONG_VALUE_FOR_VAR => "ER_WRONG_VALUE_FOR_VAR",
         ER_LOCK_WAIT_TIMEOUT => "ER_LOCK_WAIT_TIMEOUT",
         ER_LOCK_DEADLOCK => "ER_LOCK_DEADLOCK",
+        ER_LOCK_NOWAIT => "ER_LOCK_NOWAIT",
         ER_SP_DOES_NOT_EXIST => "ER_SP_DOES_NOT_EXIST",
         ER_DATA_TOO_LONG => "ER_DATA_TOO_LONG",
         ER_NO_REFERENCED_ROW_2 => "ER_NO_REFERENCED_ROW_2",
@@ -96,7 +103,7 @@ pub fn sqlstate(code: u16) -> &'static str {
         ER_BAD_DB_ERROR => "42000",
         // Transaction deadlock — J2C/ISO class for serialization failures.
         ER_LOCK_DEADLOCK => "40001",
-        ER_LOCK_WAIT_TIMEOUT => "HY000",
+        ER_LOCK_WAIT_TIMEOUT | ER_LOCK_NOWAIT => "HY000",
         // Data-length violations.
         ER_DATA_TOO_LONG => "22001",
         ER_TRUNCATED_WRONG_VALUE => "22007",

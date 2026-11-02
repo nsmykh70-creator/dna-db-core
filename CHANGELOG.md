@@ -2,6 +2,41 @@
 
 ## Unreleased (CMS Edition — branch `cms-edition`)
 
+### Row locks: `SELECT … FOR UPDATE` with InnoDB semantics (2026-11-02)
+
+Closed the last blocker for **concurrent** WooCommerce orders
+(CMS_EDITION_RU.md §4 item 2). New module `cms::row_locks` — a
+`(table, primary-key) → holder` registry with a waits-for graph — wired
+into the dialect gate (`cms::compat`):
+
+- `SELECT … FOR UPDATE|SHARE` inside a transaction holds X-locks on the
+  returned rows until COMMIT / ROLLBACK / disconnect; in autocommit the
+  locks end with the statement (MySQL semantics). Row keys are taken from
+  the projection when it carries the PK (`SELECT *`, Action Scheduler),
+  otherwise from an internal `SELECT <pk>` probe over the same FROM/WHERE.
+- Blocked DML: `UPDATE`/`DELETE` wait while an open transaction holds a
+  target row; inside a transaction the DML *takes* the X-locks, so
+  opposite-order updates produce a genuine **1213 deadlock**
+  (SQLSTATE `40001`) — exactly the code WooCommerce's retry loop expects.
+  Wait expiry → **1205** (`innodb_lock_wait_timeout`, per session,
+  default 50 s; bad values → errno 1231).
+- `FOR UPDATE NOWAIT` → immediate **3572**; `FOR UPDATE SKIP LOCKED` →
+  foreign-held rows are excluded instead of waited on (with the PK in the
+  projection the result itself is filtered — two queue workers claim
+  different rows, the WooCommerce Action Scheduler pattern).
+- Statement-level guards: string literals containing "for update" are
+  not locking tails (quote/comment/paren-aware top-level scanner);
+  GROUP BY/aggregate FOR UPDATE statements keep the old accept-and-ignore
+  behaviour (documented divergence); multi-table DELETE is not probed;
+  composite PKs resolve by the first column (overlay-wide convention).
+
+Tests: 6 registry unit tests + 8 gate scenarios (1205 blocking, 3572,
+1213 with a background waiter, reentrancy, autocommit-UPDATE waiting,
+in-tx UPDATE X-lock, DELETE waiting, disconnect release, SKIP LOCKED
+queue). Suite: **276 green with `--features cms`, 221 without** (base
+build untouched). Corpus: new `[P2:LOCK]` section
+(`docs/cms/wp_queries_corpus.txt`).
+
 ### WooCommerce 11.2.1 e2e order on DNA-DB — phase-2 acceptance (2026-11-02)
 
 **Full order lifecycle matches the MariaDB 10.11.11 reference**: product

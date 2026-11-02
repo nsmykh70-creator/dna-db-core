@@ -16,6 +16,9 @@
 //! - [`locks`] — named advisory locks with `GET_LOCK()` / `RELEASE_LOCK()` /
 //!   `IS_FREE_LOCK()` / `IS_USED_LOCK()` semantics (used by WooCommerce
 //!   stock/coupon flows and many plugins).
+//! - [`row_locks`] — row-level locks for `SELECT … FOR UPDATE` with lock
+//!   waits (errno 1205), `NOWAIT` (3572) and deadlock detection (1213) via
+//!   a waits-for graph — the serialization WooCommerce stock paths need.
 //!
 //! What intentionally does NOT live here yet: the SQL dialect translator
 //! (extends `sql_to_dnaql`), AUTO_INCREMENT sequences, collations, the
@@ -28,6 +31,7 @@ pub mod compat;
 pub mod ddl_meta;
 pub mod errno;
 pub mod locks;
+pub mod row_locks;
 pub mod sequence;
 pub mod session;
 pub mod wordpress;
@@ -35,6 +39,7 @@ pub mod wordpress;
 pub use compat::{CmsError, CmsQueryResult, CmsSqlGate};
 pub use ddl_meta::{CmsColumnMeta, CmsIndexMeta, CmsTableMeta};
 pub use locks::LockRegistry;
+pub use row_locks::RowLockRegistry;
 pub use sequence::AutoIncrementRegistry;
 pub use session::{CmsSession, Charset, SqlModeFlag};
 
