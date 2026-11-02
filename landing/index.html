@@ -162,6 +162,7 @@ footer .f1{margin-bottom:6px}
     <div class="links">
       <a href="#features"><span class="ru">Возможности</span><span class="en">Features</span></a>
       <a href="#bench"><span class="ru">Бенчмарки</span><span class="en">Benchmarks</span></a>
+      <a href="#mysql"><span class="ru">MySQL-режим</span><span class="en">MySQL mode</span></a>
       <a href="#resources"><span class="ru">Ресурсы</span><span class="en">Resources</span></a>
       <a href="#charts"><span class="ru">Графики</span><span class="en">Charts</span></a>
       <a href="#tests"><span class="ru">Тесты</span><span class="en">Testing</span></a>
@@ -186,6 +187,7 @@ footer .f1{margin-bottom:6px}
       <span class="badge">🦀 Rust · <b><span class="ru">без unsafe в ядре</span><span class="en">no unsafe in the core</span></b></span>
       <span class="badge">✅ <b>215/215</b> tests</span>
       <span class="badge">🧪 SQL <b>32/32</b> conformance</span>
+      <span class="badge">🔌 <b>MySQL wire :3306</b> — <span class="ru">WordPress без плагинов</span><span class="en">WordPress with zero plugins</span></span>
       <span class="badge">🔐 TLS 1.3 · Argon2id · XChaCha20</span>
       <span class="badge">⚖️ AGPL-3.0 / Apache-2.0</span>
       <span class="badge">🐧 Linux · macOS</span>
@@ -265,6 +267,49 @@ footer .f1{margin-bottom:6px}
   </div>
 </section>
 
+
+<section id="mysql">
+  <div class="wrap">
+    <div class="kicker">MySQL wire</div>
+    <h2><span class="ru">Универсальный MySQL-адаптер: WordPress и WooCommerce работают без единой строчки своего кода</span><span class="en">The universal MySQL adapter: WordPress and WooCommerce run with zero code changes</span></h2>
+    <p class="lead"><span class="ru">Подкоманда <code>dna-db-core mysqld</code> слушает порт 3306 и говорит на протоколе MySQL 4.1: handshake v10, mysql_native_password, text и binary протоколы, COM_STMT_PREPARE/EXECUTE, multi-statement, реальные errno (1045/1062/1146/1054/1205). Любая CMS, фреймворк или драйвер — mysqli, PDO, PyMySQL, Connector/Py — подключаются как к обычному MySQL и работают с одним и тем же DNA-хранилищем. SQL от клиента транслируется в DNAQL на лету, ответы возвращаются в MySQL-формате.</span>
+    <span class="en">The <code>dna-db-core mysqld</code> subcommand listens on port 3306 and speaks the MySQL 4.1 wire protocol: handshake v10, mysql_native_password, text and binary resultsets, COM_STMT_PREPARE/EXECUTE, multi-statement, real errno (1045/1062/1146/1054/1205). Any CMS, framework or driver — mysqli, PDO, PyMySQL, Connector/Py — connects as to a regular MySQL server and works against the same DNA storage. Client SQL is translated to DNAQL on the fly, replies come back in MySQL format.</span></p>
+
+    <div class="v400">
+      <div class="cell"><div class="n">21 / 21</div><div class="t ru">артефактов установки WordPress 7.1.4 совпали с MariaDB побайтово (wp-cli, dbDelta, wp_authenticate)</div><div class="t en">WordPress 7.1.4 install artifacts match MariaDB byte-for-byte (wp-cli, dbDelta, wp_authenticate)</div></div>
+      <div class="cell"><div class="n">12 / 12</div><div class="t ru">артефактов заказа WooCommerce 11.2.1 (HPOS): итог 500.00, склад 10−2, кириллица, 0 SQL-ошибок на 48 таблицах</div><div class="t en">WooCommerce 11.2.1 (HPOS) order artifacts: total 500.00, stock 10−2, UTF-8 billing, 0 SQL errors across 48 tables</div></div>
+      <div class="cell"><div class="n">85 / 86</div><div class="t ru">дифференциальных запросов WP/Woo совпали с MariaDB 11.8.6 (1 — только строка VERSION())</div><div class="t en">WP/Woo differential queries match MariaDB 11.8.6 (the 1 diff is the VERSION() string only)</div></div>
+      <div class="cell"><div class="n">24 / 24</div><div class="t ru">security-проверок wire-поверхности: инъекции, auth, malformed-пакеты, живучесть</div><div class="t en">wire-surface security checks: injections, auth, malformed packets, liveness</div></div>
+    </div>
+
+    <h3><span class="ru">wp-config.php без плагинов и drop-in'ов</span><span class="en">wp-config.php with no plugins and no drop-ins</span></h3>
+<pre><span class="c"># один запуск — и DNA-DB выглядит как MySQL:</span>
+./dna-db-core mysqld --data-dir /var/lib/dnadb --port 3306 --wordpress --user wp:секрет
+
+<span class="c"># WordPress подключается штатным mysqli:</span>
+define( 'DB_NAME', 'wordpress' );
+define( 'DB_USER', 'wp' );
+define( 'DB_PASSWORD', 'секрет' );
+define( 'DB_HOST', '127.0.0.1:3306' );</pre>
+
+    <h3><span class="ru">Скорость и память: DNA-DB mysqld против MariaDB 11.8.6</span><span class="en">Speed &amp; RAM: DNA-DB mysqld vs MariaDB 11.8.6</span></h3>
+    <p class="note"><span class="ru">Одинаковый SQL через pymysql (text-протокол, как wpdb), одинаковая схема wp_posts/wp_options, 8 000 операций на фазу, одна машина. Методика: <code>scripts/cms_wire_bench.py</code>. Память — максимум RSS процесса демона в фазе.</span>
+    <span class="en">Identical SQL over pymysql (text protocol, like wpdb), identical wp_posts/wp_options schema, 8,000 ops per phase, same machine. Methodology: <code>scripts/cms_wire_bench.py</code>. Memory is the daemon's max RSS per phase.</span></p>
+    <table class="data">
+      <tr><th><span class="ru">Фаза</span><span class="en">Phase</span></th><th>DNA-DB mysqld</th><th>MariaDB 11.8.6</th><th><span class="ru">Отношение</span><span class="en">Ratio</span></th></tr>
+      <tr><td><span class="ru">INSERT по одной строке (autocommit)</span><span class="en">Single-row INSERT (autocommit)</span></td><td class="best">18 043 <small>ops/s</small></td><td>14 799 <small>ops/s</small></td><td class="best">×1,22</td></tr>
+      <tr><td><span class="ru">Пакетный INSERT (100 строк)</span><span class="en">Batched INSERT (100 rows)</span></td><td>172 028 <small>ops/s</small></td><td class="best">237 882 <small>ops/s</small></td><td>×0,72</td></tr>
+      <tr><td><span class="ru">SELECT по PK (×8 000)</span><span class="en">SELECT by PK (×8,000)</span></td><td>9 429 <small>ops/s</small></td><td class="best">10 177 <small>ops/s</small></td><td>×0,93</td></tr>
+      <tr><td><span class="ru">SELECT по вторичному индексу</span><span class="en">SELECT by secondary index</span></td><td class="best">10 031 <small>ops/s</small></td><td>9 683 <small>ops/s</small></td><td class="best">×1,04</td></tr>
+      <tr><td><span class="ru">UPDATE по PK (×8 000)</span><span class="en">UPDATE by PK (×8,000)</span></td><td>14 434 <small>ops/s</small></td><td class="best">14 853 <small>ops/s</small></td><td>×0,97</td></tr>
+      <tr><td><span class="ru">WordPress-микс (SELECT+UPSERT опций)</span><span class="en">WordPress mix (options SELECT+UPSERT)</span></td><td class="best">6 388 <small>ops/s</small></td><td>5 306 <small>ops/s</small></td><td class="best">×1,20</td></tr>
+      <tr><td><span class="ru">Память демона (максимум RSS в фазах)</span><span class="en">Daemon RAM (max RSS across phases)</span></td><td class="best">188 <small>MiB</small></td><td>195 <small>MiB</small></td><td class="best">−4%</td></tr>
+    </table>
+    <p class="note"><span class="ru">Сырые данные: <a href="https://github.com/nsmykh70-creator/dna-db-core/blob/cms-edition/docs/cms/wire_bench_results.json">wire_bench_results.json</a>. Безопасность wire-поверхности: <code>scripts/mysqlwire_security_test.py</code> — 24/24.</span>
+    <span class="en">Raw data: <a href="https://github.com/nsmykh70-creator/dna-db-core/blob/cms-edition/docs/cms/wire_bench_results.json">wire_bench_results.json</a>. Wire-surface security: <code>scripts/mysqlwire_security_test.py</code> — 24/24.</span></p>
+  </div>
+</section>
+
 <section id="resources">
   <div class="wrap">
     <div class="kicker">Resources</div>
@@ -337,6 +382,8 @@ footer .f1{margin-bottom:6px}
       <div class="test"><div class="ok">15 / 15</div><h4><span class="ru">Живой smoke протокола</span><span class="en">Live protocol smoke</span></h4><p class="ru">Аутентификация, pre-auth guard, CRUD, кадры 1 MiB, SQL/DnaQL, checkpoint, восстановление после kill.</p><p class="en">Auth, pre-auth guard, CRUD, 1 MiB frames, SQL/DnaQL, checkpoint, hard-kill recovery.</p><a href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/docs/smoke_test_results_v350.txt">smoke_test_results_v350.txt</a></div>
       <div class="test"><div class="ok">12 / 12</div><h4><span class="ru">Security smoke v3.5</span><span class="en">Security smoke v3.5</span></h4><p class="ru">Случайный bootstrap, лимит глубины парсера, slowloris-дедлайн, отказ вторых instance и doctor на живой БД.</p><p class="en">Random bootstrap, parser depth limit, slowloris deadline, second-instance &amp; live-doctor refusals.</p><a href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/docs/security_smoke_v350.txt">security_smoke_v350.txt</a></div>
       <div class="test"><div class="ok">8 / 8</div><h4><span class="ru">pgwire E2E (сырой клиент)</span><span class="en">pgwire E2E (raw client)</span></h4><p class="ru">Handshake, VERSION(), DDL/DML, SELECT, оконные функции через pgwire, NULL, ErrorResponse, BEGIN/ROLLBACK/COMMIT.</p><p class="en">Handshake, VERSION(), DDL/DML, SELECT, window functions over pgwire, NULL, ErrorResponse, BEGIN/ROLLBACK/COMMIT.</p><a href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/tests/test_pgwire_client.py">tests/test_pgwire_client.py</a></div>
+      <div class="test"><div class="ok">MATCH 33/33</div><h4><span class="ru">E2E с реальными CMS</span><span class="en">Real-CMS E2E</span></h4><p class="ru">WordPress 7.1.4 (wp-cli) 21/21 и WooCommerce 11.2.1 (HPOS) 12/12 артефактов через штатный mysqli на порт 3306 — идентично MariaDB.</p><p class="en">WordPress 7.1.4 (wp-cli) 21/21 and WooCommerce 11.2.1 (HPOS) 12/12 artifacts over stock mysqli on port 3306 — identical to MariaDB.</p><a href="https://github.com/nsmykh70-creator/dna-db-core/blob/cms-edition/docs/cms/E2E_WP_MYSQLWIRE_REPORT.md">E2E_WP_MYSQLWIRE_REPORT.md</a></div>
+      <div class="test"><div class="ok">24 / 24</div><h4><span class="ru">MySQL wire security</span><span class="en">MySQL wire security</span></h4><p class="ru">SQL-инъекции через параметры, brute force, malformed-пакеты, stacked queries, errno-проброс — сервер жив и данные целы.</p><p class="en">Parameterized SQL injection, brute force, malformed packets, stacked queries, errno propagation — server alive, data intact.</p><a href="https://github.com/nsmykh70-creator/dna-db-core/blob/cms-edition/docs/cms/MYSQLWIRE_SECURITY_REPORT.md">MYSQLWIRE_SECURITY_REPORT.md</a></div>
       <div class="test"><div class="ok">1,05 <small style="font-size:13px">c</small></div><h4><span class="ru">Raft failover</span><span class="en">Raft failover</span></h4><p class="ru">3 ноды: выборы, репликация 3/3, отказ лидера — новый лидер за 1,05 c (SLA &lt; 2 c), ноль потерь закоммиченных записей.</p><p class="en">3 nodes: elections, 3/3 replication, leader loss — new leader in 1.05 s (SLA &lt; 2 s), zero loss of committed writes.</p><a href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/tests/raft_cluster.rs">tests/raft_cluster.rs</a></div>
     </div>
   </div>
@@ -380,7 +427,20 @@ cd dna-db-core &amp;&amp; cargo build --release
 ./target/release/dna-db-core serve --data-dir ./dna_data --admin-port 8080 --pgwire-port 5432
 psql "host=127.0.0.1 port=5432 user=admin dbname=dna" -c "SELECT VERSION();"</pre>
 
-    <h3><span class="num">3.</span><span class="ru">SQL, который теперь поддерживается полностью</span><span class="en">SQL now fully supported</span></h3>
+
+    <h3><span class="num">3.</span><span class="ru">MySQL-режим: сайт на WordPress за 3 команды</span><span class="en">MySQL mode: a WordPress site in 3 commands</span></h3>
+<pre><span class="c"># 1) запустить DNA-DB как MySQL-сервер на :3306</span>
+./dna-db-core mysqld --data-dir /var/lib/dnadb --port 3306 --wordpress --user wp:секрет
+
+<span class="c"># 2) в wp-config.php указать DB_HOST 127.0.0.1:3306 (см. секцию MySQL-режима)</span>
+<span class="c"># 3) установить WordPress штатно — dbDelta, wp-cli и плагины работают как есть</span>
+wp core install --url=http://example.com --admin_user=admin --skip-email
+
+<span class="c"># любой MySQL-клиент тоже работает:</span>
+mysql -h 127.0.0.1 -P 3306 -u wp -p -e "SELECT CONCAT(UPPER('днк'), '-', LOWER('ТЕСТ'));"</pre>
+    <p class="note"><span class="ru">Пошаговое руководство: <a href="https://github.com/nsmykh70-creator/dna-db-core/blob/cms-edition/docs/CMS_MYSQLWIRE_GUIDE_RU.md">docs/CMS_MYSQLWIRE_GUIDE_RU.md</a></span><span class="en">Step-by-step guide: <a href="https://github.com/nsmykh70-creator/dna-db-core/blob/cms-edition/docs/CMS_MYSQLWIRE_GUIDE_RU.md">docs/CMS_MYSQLWIRE_GUIDE_RU.md</a></span></p>
+
+    <h3><span class="num">4.</span><span class="ru">SQL, который теперь поддерживается полностью</span><span class="en">SQL now fully supported</span></h3>
 <pre><span class="c">-- CTE + JOIN</span>
 WITH top AS (SELECT dept, COUNT(*) AS n FROM users GROUP BY dept)
 SELECT u.name, t.n FROM users u JOIN top t ON u.dept = t.dept;
@@ -400,7 +460,7 @@ UPDATE accounts SET bal = bal - 100 WHERE id = 1;
 UPDATE accounts SET bal = bal + 100 WHERE id = 2;
 COMMIT;</pre>
 
-    <h3><span class="num">4.</span><span class="ru">DnaQL — запросы к последовательностям</span><span class="en">DnaQL — sequence queries</span></h3>
+    <h3><span class="num">5.</span><span class="ru">DnaQL — запросы к последовательностям</span><span class="en">DnaQL — sequence queries</span></h3>
 <pre><span class="c">-- анализ и реверс-комплемент</span>
 ANALYZE SEQUENCE 'CGCGCGATCGATCGCGC' |> REV_COMP();
 
@@ -408,7 +468,7 @@ ANALYZE SEQUENCE 'CGCGCGATCGATCGCGC' |> REV_COMP();
 FROM chr_a |> LINK chr_b VIA COMPLEMENT(b_id) |> EMIT *;</pre>
     <p class="note"><span class="ru">Полная грамматика: <a href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/docs/DNAQL_SPEC.md">DNAQL_SPEC.md</a>, руководство: <a href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/docs/DNAQL_MANUAL_RU.md">DNAQL_MANUAL_RU.md</a></span><span class="en">Full grammar: <a href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/docs/DNAQL_SPEC.md">DNAQL_SPEC.md</a></span></p>
 
-    <h3><span class="num">5.</span><span class="ru">Raft-кластер из трёх нод</span><span class="en">A three-node Raft cluster</span></h3>
+    <h3><span class="num">6.</span><span class="ru">Raft-кластер из трёх нод</span><span class="en">A three-node Raft cluster</span></h3>
 <pre><span class="c"># три терминала (id уникален, каждый со своим data-dir):</span>
 ./target/release/dna-db-core cluster --id 0 --port 9500 --data-dir ./dna_node0 \
   --peers 0=127.0.0.1:9500,1=127.0.0.1:9501,2=127.0.0.1:9502
@@ -420,7 +480,7 @@ FROM chr_a |> LINK chr_b VIA COMPLEMENT(b_id) |> EMIT *;</pre>
 <span class="c"># запись принимается лидером; при его отказе новый лидер выбирается за &lt;2 c,</span>
 <span class="c"># не-лидер отвечает NOT_LEADER с адресом текущего.</span></pre>
 
-    <h3><span class="num">6.</span><span class="ru">Мониторинг, тиринг, PITR</span><span class="en">Monitoring, tiering, PITR</span></h3>
+    <h3><span class="num">7.</span><span class="ru">Мониторинг, тиринг, PITR</span><span class="en">Monitoring, tiering, PITR</span></h3>
 <pre><span class="c"># Prometheus-метрики (панель-порт):</span>
 curl -k https://127.0.0.1:8080/metrics | head
 
@@ -432,7 +492,7 @@ curl -k https://127.0.0.1:8080/metrics | head
 ./target/release/dna-db-core rotate-key --data-dir ./dna_data \
   --new-key-file /secure/dna-new.key --mirror-dir /mnt/dna_mirror</pre>
 
-    <h3><span class="num">7.</span><span class="ru">Проверка всего этого у себя</span><span class="en">Verify it yourself</span></h3>
+    <h3><span class="num">8.</span><span class="ru">Проверка всего этого у себя</span><span class="en">Verify it yourself</span></h3>
 <pre>cargo test --release          <span class="c"># 215 тестов</span>
 python3 scripts/smoke_test.py <span class="c"># живой smoke протокола</span>
 python3 scripts/chaos_test.py <span class="c"># хаос-тест самовосстановления</span>
@@ -448,6 +508,7 @@ python3 scripts/bench_compare.py <span class="c"># трёхсторонний б
     <div class="docs-grid">
       <a class="doc" href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/README.md"><b>README (EN)</b><span class="ru">Обзор, безопасность, запуск</span><span class="en">Overview, security, quick start</span></a>
       <a class="doc" href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/README_RU.md"><b>README (RU)</b><span class="ru">Обзор, безопасность, запуск</span><span class="en">Обзор, безопасность, запуск</span></a>
+      <a class="doc" href="https://github.com/nsmykh70-creator/dna-db-core/blob/cms-edition/docs/CMS_MYSQLWIRE_GUIDE_RU.md"><b>CMS_MYSQLWIRE_GUIDE (RU)</b><span class="ru">Пошаговое руководство: MySQL-режим, WP/Woo, systemd, безопасность</span><span class="en">Step-by-step: MySQL mode, WP/Woo, systemd, security</span></a>
       <a class="doc" href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/docs/DNAQL_SPEC.md"><b>DNAQL_SPEC.md</b><span class="ru">Грамматика и пайплайны DnaQL</span><span class="en">DnaQL grammar &amp; pipelines</span></a>
       <a class="doc" href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/docs/DNAQL_MANUAL_RU.md"><b>DNAQL_MANUAL (RU)</b><span class="ru">Руководство по DnaQL</span><span class="en">DnaQL manual</span></a>
       <a class="doc" href="https://github.com/nsmykh70-creator/dna-db-core/blob/main/docs/SQL_MANUAL.md"><b>SQL_MANUAL.md</b><span class="ru">SQL-подмножество движка</span><span class="en">Engine SQL subset</span></a>

@@ -111,6 +111,22 @@ COALESCE, IFNULL, NULLIF, IF, GREATEST/LEAST — с NULL-семантикой My
 одна команда поднимает сервер с готовой схемой WordPress и печатает блок
 `wp-config.php`. Скрипт `scripts/install.sh` ставит бинарь + systemd-юнит.
 
+### Прогон №7 + E2E через wire + бенчмарки + security (2026-11-02)
+
+* Маршрут C (mysqld) — **главный**: реальные WordPress 7.1.4 и WooCommerce
+  11.2.1 работают через штатный mysqli без единого файла адаптации.
+  WP: 21/21 артефактов идентичны MariaDB; Woo: 12/12, 0 SQL-ошибок.
+  Отчёты: `docs/cms/E2E_WP_MYSQLWIRE_REPORT.md`,
+  `docs/cms/E2E_WOO_MYSQLWIRE_REPORT.md`.
+* Диф-корпус №7 (86 запросов) против MariaDB 11.8.6: 81 MATCH, 4 BOTH-ERR
+  (одинаковый errno), 1 DIFF-VALUE (только строка VERSION()) —
+  `docs/cms/COMPARISON_RUN7.md`.
+* Бенчмарк wire (pymysql, 8 000 ops/фаза): single INSERT ×1,22 и WP-микс
+  ×1,20 к MariaDB 11.8.6, паритет чтений/UPDATE, RAM 188 против 195 MiB —
+  `docs/cms/wire_bench_results.json`.
+* Security wire-поверхности: 24/24 — `docs/cms/MYSQLWIRE_SECURITY_REPORT.md`.
+* Пошаговое руководство: `docs/CMS_MYSQLWIRE_GUIDE_RU.md`.
+
 ## 4. Пробелы движка (чек-лист из аудита)
 
 Состояние после фазы-1 каркаса и интеграции гейта (ветка `cms-edition`):

@@ -321,6 +321,14 @@ pub enum Stmt {
         /// v3.6: `ON CONFLICT (col) DO NOTHING | DO UPDATE SET ...` (UPSERT).
         on_conflict: Option<OnConflict>,
     },
+    /// CMS edition: `INSERT INTO t (cols) SELECT …` — the SELECT is executed
+    /// and its rows are inserted positionally (MySQL semantics). Used by
+    /// WooCommerce/ActionScheduler claim/migration paths.
+    InsertSelect {
+        table: String,
+        cols: Vec<String>,
+        select: Box<Stmt>,
+    },
     Update {
         table: String,
         /// v4.2-cms: SET rhs is a full expression evaluated against the OLD
@@ -675,6 +683,7 @@ impl SParser {
                     | "limit"
                     | "offset"
                     | "on"
+                    | "using"
                     | "group"
                     | "order"
                     | "union"
@@ -712,7 +721,12 @@ impl SParser {
         } else if self.kw("WITH") {
             self.parse_cte()
         } else if self.kw("INSERT") {
-            self.parse_insert()
+            self.parse_insert(false)
+        } else if self.kw("REPLACE") {
+            // CMS edition: MySQL REPLACE INTO t (cols) VALUES … = conflicting
+            // rows are deleted and the new row inserted; modelled as a
+            // full-row upsert (every listed column updated to EXCLUDED.x).
+            self.parse_insert(true)
         } else if self.kw("UPDATE") {
             self.parse_update()
         } else if self.kw("DELETE") {
@@ -930,8 +944,27 @@ impl SParser {
             self.next();
             projection.push(SelectItem::Star);
         } else {
+            // CMS edition: bare computed items with identical rendered names
+            // (two identical literals — `SELECT 'ts', 'ts'`) must survive:
+            // MySQL reports every occurrence, and INSERT..SELECT maps columns
+            // positionally. The BTreeMap row model needs unique names, so
+            // duplicates get a ` (N)` suffix (MariaDB-style disambiguation).
+            let mut seen_computed: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             loop {
-                projection.push(self.parse_select_item()?);
+                let mut item = self.parse_select_item()?;
+                if let SelectItem::Computed { expr, rendered } = &mut item {
+                    if !seen_computed.insert(rendered.clone()) {
+                        let mut n = 2usize;
+                        while seen_computed.contains(&format!("{rendered} ({n})")) {
+                            n += 1;
+                        }
+                        *rendered = format!("{rendered} ({n})");
+                        seen_computed.insert(rendered.clone());
+                        let _ = expr;
+                    }
+                }
+                projection.push(item);
                 if matches!(self.peek(), STok::Comma) {
                     self.next();
                 } else {
@@ -942,14 +975,36 @@ impl SParser {
         // v4.0: FROM-less SELECT (`SELECT (SELECT MAX(x) FROM t) AS mx`) —
         // the canonical way to evaluate scalar expressions / subqueries.
         // Everything else still requires FROM.
+        // CMS edition: derived tables — `FROM ( SELECT … ) AS x` and
+        // `JOIN ( SELECT … ) AS y` are materialised as statement-scoped
+        // CTEs (same execution semantics, zero executor changes).
+        let mut deriveds: Vec<(String, Stmt)> = Vec::new();
         let from = if matches!(self.peek(), STok::Ident(s) if s.eq_ignore_ascii_case("FROM")) {
             self.expect_kw("FROM")?;
-            self.ident()?
+            if matches!(self.peek(), STok::LParen) {
+                // derived table: `( SELECT … ) [AS] alias`
+                self.next();
+                if !self.kw("SELECT") {
+                    return Err("SQL: expected SELECT in derived table".into());
+                }
+                let sub = self.parse_select_tail()?;
+                self.expect(STok::RParen)?;
+                let alias = self
+                    .maybe_alias()
+                    .ok_or_else(|| "SQL: derived table requires an alias".to_string())?;
+                deriveds.push((alias.clone(), sub));
+                alias
+            } else {
+                self.ident()?
+            }
         } else {
             String::new()
         };
         let from_alias = self.maybe_alias();
         let mut joins = Vec::new();
+        // CMS edition: extra ON predicates of compound join conditions
+        // (`ON a = b AND c = d`) — folded into WHERE after the join loop.
+        let mut on_extra: Vec<Expr> = Vec::new();
         loop {
             let join_type = if self.kw("INNER") {
                 self.expect_kw("JOIN")?;
@@ -971,8 +1026,43 @@ impl SParser {
             } else {
                 break;
             };
-            let table = self.ident()?;
-            let jalias = self.maybe_alias();
+            let (jtable, jalias, jderived) = if matches!(self.peek(), STok::LParen) {
+                // derived join table: `JOIN ( SELECT … ) [AS] alias`
+                self.next();
+                if !self.kw("SELECT") {
+                    return Err("SQL: expected SELECT in derived join table".into());
+                }
+                let sub = self.parse_select_tail()?;
+                self.expect(STok::RParen)?;
+                let a = self
+                    .maybe_alias()
+                    .ok_or_else(|| "SQL: derived join table requires an alias".to_string())?;
+                (a.clone(), Some(a.clone()), Some((a, sub)))
+            } else {
+                let t = self.ident()?;
+                let a = self.maybe_alias();
+                (t.clone(), a, None)
+            };
+            if let Some(d) = jderived {
+                deriveds.push(d);
+            }
+            let table = jtable;
+            // CMS edition: `USING (col)` — natural join shorthand for
+            // ON a.col = b.col (WooCommerce term recount). Checked before
+            // the mandatory ON keyword.
+            if self.kw("USING") {
+                self.expect(STok::LParen)?;
+                let col = self.ident()?;
+                self.expect(STok::RParen)?;
+                joins.push(JoinSpec {
+                    join_type,
+                    table,
+                    alias: jalias,
+                    left_col: col.clone(),
+                    right_col: col,
+                });
+                continue;
+            }
             self.expect_kw("ON")?;
             // WordPress always sends parenthesized join conditions:
             // ON (a.id = b.id) — accept the optional parens.
@@ -1002,39 +1092,67 @@ impl SParser {
                 }
                 self.pos = save;
             }
-            let left_col = self.ident()?;
-            // optional qualified name a.col
-            let mut lc = left_col;
-            if matches!(self.peek(), STok::Dot) {
-                self.next();
-                lc = self.ident()?;
+            // CMS edition: the ON predicate is parsed as a full expression.
+            // A plain `col = col` equality keeps the hash join; every other
+            // shape (column = literal, compound AND chains — WooCommerce
+            // refund totals `ON ( t.type = 'refund' AND t.parent = 11 )`)
+            // becomes a filtered cross join (ON 1=1 + WHERE) — identical
+            // results for INNER joins, which is what WordPress/WooCommerce
+            // emit. Parens are handled by the expression grammar itself.
+            let cond = self.parse_expr()?;
+            let simple = match &cond {
+                Expr::Cmp {
+                    op: CmpOp::Eq,
+                    left,
+                    right,
+                } => match (&**left, &**right) {
+                    (Expr::Column(l), Expr::Column(r)) => Some((l.clone(), r.clone())),
+                    _ => None,
+                },
+                _ => None,
+            };
+            match simple {
+                Some((l, r)) => joins.push(JoinSpec {
+                    join_type,
+                    table,
+                    alias: jalias,
+                    left_col: l,
+                    right_col: r,
+                }),
+                None => {
+                    joins.push(JoinSpec {
+                        join_type,
+                        table,
+                        alias: jalias,
+                        left_col: "1".to_string(),
+                        right_col: "1".to_string(),
+                    });
+                    on_extra.push(cond);
+                }
             }
-            // = sign
-            match self.next() {
-                STok::Eq => {}
-                t => return Err(format!("SQL: expected = in JOIN ON, got {:?}", t)),
-            }
-            let mut right_col = self.ident()?;
-            if matches!(self.peek(), STok::Dot) {
-                self.next();
-                right_col = self.ident()?;
+            while self.kw("AND") {
+                on_extra.push(self.parse_expr()?);
             }
             if paren {
                 self.expect(STok::RParen)?;
             }
-            joins.push(JoinSpec {
-                join_type,
-                table,
-                alias: jalias,
-                left_col: lc,
-                right_col,
-            });
         }
-        let where_clause = if self.kw("WHERE") {
+        let mut where_clause = if self.kw("WHERE") {
             Some(self.parse_expr()?)
         } else {
             None
         };
+        // fold the extra ON predicates into the filter (see the join loop)
+        if !on_extra.is_empty() {
+            let extra = on_extra
+                .into_iter()
+                .reduce(|a, b| Expr::And(Box::new(a), Box::new(b)))
+                .expect("on_extra non-empty");
+            where_clause = Some(match where_clause {
+                Some(w) => Expr::And(Box::new(extra), Box::new(w)),
+                None => extra,
+            });
+        }
         let group_by = if self.kw("GROUP") {
             self.expect_kw("BY")?;
             let mut cols = Vec::new();
@@ -1191,7 +1309,7 @@ impl SParser {
         if matches!(self.peek(), STok::Semi) {
             self.next();
         }
-        Ok(Stmt::Select {
+        let stmt = Stmt::Select {
             projection,
             from,
             from_alias,
@@ -1202,7 +1320,15 @@ impl SParser {
             order_by,
             limit,
             offset,
-        })
+        };
+        if deriveds.is_empty() {
+            Ok(stmt)
+        } else {
+            Ok(Stmt::Cte {
+                ctes: deriveds,
+                body: Box::new(stmt),
+            })
+        }
     }
 
     /// One projection item: `*`, a plain column, an aggregate call, a window
@@ -1297,6 +1423,30 @@ impl SParser {
                 });
             }
         }
+        // CMS edition: `EXISTS (SELECT …)` as a projection item — boolean
+        // subquery (WooCommerce lookup_table_has_data: SELECT EXISTS (SELECT
+        // 1 FROM wp_wc_product_attributes_lookup)).
+        if let STok::Ident(s) = self.peek().clone() {
+            if s.eq_ignore_ascii_case("EXISTS") && matches!(self.peek_at(1), STok::LParen) {
+                self.next();
+                self.expect(STok::LParen)?;
+                if !self.kw("SELECT") {
+                    return Err("SQL: EXISTS requires a SELECT subquery".into());
+                }
+                let sub = self.parse_select_tail()?;
+                self.expect(STok::RParen)?;
+                let canonical = format!("EXISTS ({})", render_select_sql(&sub));
+                let alias = self.maybe_as_alias()?;
+                let rendered = alias.unwrap_or_else(|| canonical.clone());
+                return Ok(SelectItem::Computed {
+                    expr: Expr::Exists {
+                        stmt: Box::new(sub),
+                        negated: false,
+                    },
+                    rendered,
+                });
+            }
+        }
         // aggregate call: COUNT(*) / SUM(col) — recognised before the general
         // expression path so `COUNT(*)` never parses as multiplication.
         if let STok::Ident(s) = self.peek().clone() {
@@ -1312,7 +1462,15 @@ impl SParser {
                     self.next();
                     None
                 } else {
-                    Some(self.ident()?)
+                    // CMS edition: qualified aggregate arguments —
+                    // SUM(postmeta.meta_value) — the qualifier is stripped
+                    // (single-namespace row model, like GROUP BY t.col).
+                    let mut col = self.ident()?;
+                    if matches!(self.peek(), STok::Dot) {
+                        self.next();
+                        col = self.ident()?;
+                    }
+                    Some(col)
                 };
                 self.expect(STok::RParen)?;
                 if distinct && arg.is_none() {
@@ -1393,7 +1551,7 @@ impl SParser {
         Ok(None)
     }
 
-    fn parse_insert(&mut self) -> Result<Stmt, String> {
+    fn parse_insert(&mut self, replace: bool) -> Result<Stmt, String> {
         self.expect_kw("INTO")?;
         let table = self.ident()?;
         self.expect(STok::LParen)?;
@@ -1425,7 +1583,16 @@ impl SParser {
                 rows[0].push((col, v));
             }
             self.expect(STok::RParen)?;
-            let on_conflict = self.parse_on_conflict_tail()?;
+            let on_conflict = if replace {
+                Some(OnConflict::DoUpdate {
+                    assignments: rows[0]
+                        .iter()
+                        .map(|(c, _)| (c.clone(), UpsertValue::Excluded(c.clone())))
+                        .collect(),
+                })
+            } else {
+                self.parse_on_conflict_tail()?
+            };
             self.eat_semi();
             return Ok(Stmt::Insert {
                 table,
@@ -1445,6 +1612,17 @@ impl SParser {
             cols.push(self.ident()?);
         }
         self.expect(STok::RParen)?;
+        // CMS edition: INSERT … SELECT — the source rows come from a query
+        // (ActionScheduler claim/copy patterns).
+        if self.kw("SELECT") {
+            let select = self.parse_select_tail()?;
+            self.eat_semi();
+            return Ok(Stmt::InsertSelect {
+                table,
+                cols,
+                select: Box::new(select),
+            });
+        }
         self.expect_kw("VALUES")?;
         let mut rows = Vec::new();
         loop {
@@ -1473,7 +1651,17 @@ impl SParser {
                 break;
             }
         }
-        let on_conflict = self.parse_on_conflict_tail()?;
+        let on_conflict = if replace {
+            // REPLACE: the new values replace the conflicting row wholesale.
+            Some(OnConflict::DoUpdate {
+                assignments: cols
+                    .iter()
+                    .map(|c| (c.clone(), UpsertValue::Excluded(c.clone())))
+                    .collect(),
+            })
+        } else {
+            self.parse_on_conflict_tail()?
+        };
         self.eat_semi();
         Ok(Stmt::Insert {
             table,
@@ -2499,6 +2687,10 @@ fn collect_stmt_tables(stmt: &Stmt, out: &mut Vec<String>) -> Result<(), String>
                 }
             }
         }
+        Stmt::InsertSelect { table, select, .. } => {
+            out.push(table.clone());
+            collect_stmt_tables(select, out)?;
+        }
         Stmt::DropTable { table, .. } => out.push(table.clone()),
         Stmt::Update {
             table,
@@ -3052,6 +3244,37 @@ impl SqlEngine {
                         Ok(res)
                     }
                     _ => self.exec_insert_tx(&table, rows, on_conflict, None),
+                }
+            }
+            Stmt::InsertSelect { table, cols, select } => {
+                // Run the source SELECT (same tx view), map its columns
+                // positionally onto the target column list and reuse the
+                // regular insert path.
+                let (scols, srows, _, _) = self.exec_stmt(*select, tx)?;
+                if scols.len() != cols.len() {
+                    return Err(format!(
+                        "SQL: INSERT..SELECT: SELECT returns {} column(s), target list has {}",
+                        scols.len(),
+                        cols.len()
+                    ));
+                }
+                let mut rows = Vec::with_capacity(srows.len());
+                for r in &srows {
+                    let mut out_row = Vec::with_capacity(cols.len());
+                    for (name, col) in scols.iter().zip(cols.iter()) {
+                        let v = r.get(name).cloned().unwrap_or(Value::Null);
+                        out_row.push((col.clone(), v));
+                    }
+                    rows.push(out_row);
+                }
+                match tx {
+                    Some(buf) if buf.active => {
+                        let mut sink = SqlTxBuffer::default();
+                        let res = self.exec_insert_tx(&table, rows, None, Some(&mut sink))?;
+                        tx.as_mut().unwrap().ops.extend(sink.ops);
+                        Ok(res)
+                    }
+                    _ => self.exec_insert_tx(&table, rows, None, None),
                 }
             }
             Stmt::Update {
@@ -3846,6 +4069,9 @@ impl SqlEngine {
             }
             Stmt::Insert { table, rows, on_conflict: _ } => {
                 format!("Insert({}, {} row(s))", table, rows.len())
+            }
+            Stmt::InsertSelect { table, select, .. } => {
+                format!("InsertSelect({}, SELECT)", table)
             }
             Stmt::Update {
                 table,
@@ -5419,8 +5645,9 @@ impl SqlEngine {
         // v4.0: unknown FROM/JOIN tables are a hard error (SQL semantics:
         // PostgreSQL answers 42P01 undefined_table). CTE tables count as
         // existing while their WITH statement runs. FROM-less SELECTs
-        // evaluate a single empty row.
+        // evaluate a single empty row. MySQL DUAL is a virtual one-row table.
         if !from.is_empty()
+            && !from.eq_ignore_ascii_case("DUAL")
             && self.get_schema(from).is_none()
             && !self.cte_contains(from)
         {
@@ -5437,8 +5664,9 @@ impl SqlEngine {
         // Materialise IN-subqueries before any planning.
         let where_clause = self.materialize_subqueries(where_clause)?;
         // FROM — candidates via point lookup / secondary index / seq scan.
-        // A FROM-less SELECT sources exactly one (empty) row.
-        let (mut current, mut plan) = if from.is_empty() {
+        // A FROM-less SELECT sources exactly one (empty) row; MySQL DUAL is
+        // the same virtual one-row table (`SELECT 1 FROM DUAL`).
+        let (mut current, mut plan) = if from.is_empty() || from.eq_ignore_ascii_case("DUAL") {
             (vec![BTreeMap::new()], "ScalarEvaluate()".to_string())
         } else {
             let (rows, op) = self.fetch_candidates(from, where_clause.as_ref())?;

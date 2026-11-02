@@ -149,6 +149,11 @@ pub(crate) fn transpile(
             Ok(format!("TX {{ {} }};", stmts.join("; ")))
         }
 
+        Stmt::InsertSelect { .. } => {
+            Err("SQL→DnaQL: INSERT..SELECT is not expressible in DnaQL (CMS gate handles it before transpile)".into())
+        }
+
+
         Stmt::Update {
             table,
             assignments,

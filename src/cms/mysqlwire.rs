@@ -430,6 +430,10 @@ fn build_handshake(conn_id: u32, salt: &[u8; 20]) -> Vec<u8> {
 }
 
 /// OK packet (affected rows, LAST_INSERT_ID, status, info).
+/// The info part is written length-encoded when present. PHP mysqlnd parses
+/// the trailing OK bytes as a lenenc string (php_mysqlnd_rset_header_read in
+/// php-src); an EOF-terminated info made real wpdb fail with
+/// "RSET_HEADER packet additional data length is past N bytes the packet size".
 fn ok_packet(affected: u64, last_insert_id: u64, status: u16, info: &str) -> Vec<u8> {
     let mut p = Vec::with_capacity(16 + info.len());
     p.push(0x00);
@@ -437,7 +441,9 @@ fn ok_packet(affected: u64, last_insert_id: u64, status: u16, info: &str) -> Vec
     write_lenenc_int(&mut p, last_insert_id);
     p.extend_from_slice(&status.to_le_bytes());
     p.extend_from_slice(&0u16.to_le_bytes()); // warnings
-    p.extend_from_slice(info.as_bytes());
+    if !info.is_empty() {
+        write_lenenc_bytes(&mut p, info.as_bytes());
+    }
     p
 }
 
@@ -1758,6 +1764,11 @@ mod tests {
         assert_eq!(ok[1], 3);
         assert_eq!(ok[2], 7);
         assert_eq!(&ok[3..5], &SERVER_STATUS_AUTOCOMMIT.to_le_bytes());
+        // info is lenenc-prefixed (mysqlnd compatibility)
+        assert_eq!(ok[7], 10);
+        assert_eq!(&ok[8..18], b"Records: 3");
+        let bare = ok_packet(0, 0, SERVER_STATUS_AUTOCOMMIT, "");
+        assert_eq!(bare.len(), 7); // header + affected + insert + status + warnings
         let err = err_packet(1146, "42S02", "Table 'wp.x' doesn't exist");
         assert_eq!(err[0], 0xff);
         assert_eq!(u16::from_le_bytes([err[1], err[2]]), 1146);

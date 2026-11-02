@@ -1,0 +1,67 @@
+{
+  "rows": 8000,
+  "dna": {
+    "insert_single": {
+      "seconds": 0.443,
+      "ops_per_sec": 18043.4,
+      "rss_max_mb": 188.0
+    },
+    "insert_multirow": {
+      "seconds": 0.047,
+      "ops_per_sec": 172027.9,
+      "rss_max_mb": 0.0
+    },
+    "select_pk": {
+      "seconds": 0.848,
+      "ops_per_sec": 9428.6,
+      "rss_max_mb": 188.0
+    },
+    "select_index": {
+      "seconds": 0.797,
+      "ops_per_sec": 10031.4,
+      "rss_max_mb": 188.0
+    },
+    "update_pk": {
+      "seconds": 0.554,
+      "ops_per_sec": 14433.8,
+      "rss_max_mb": 188.0
+    },
+    "wp_mix": {
+      "seconds": 1.252,
+      "ops_per_sec": 6388.0,
+      "rss_max_mb": 188.0
+    }
+  },
+  "mysql": {
+    "insert_single": {
+      "seconds": 0.541,
+      "ops_per_sec": 14799.0,
+      "rss_max_mb": 190.9
+    },
+    "insert_multirow": {
+      "seconds": 0.034,
+      "ops_per_sec": 237882.3,
+      "rss_max_mb": 191.1
+    },
+    "select_pk": {
+      "seconds": 0.786,
+      "ops_per_sec": 10176.6,
+      "rss_max_mb": 191.9
+    },
+    "select_index": {
+      "seconds": 0.826,
+      "ops_per_sec": 9683.1,
+      "rss_max_mb": 191.9
+    },
+    "update_pk": {
+      "seconds": 0.539,
+      "ops_per_sec": 14852.8,
+      "rss_max_mb": 194.3
+    },
+    "wp_mix": {
+      "seconds": 1.508,
+      "ops_per_sec": 5305.7,
+      "rss_max_mb": 195.4
+    }
+  }
+}

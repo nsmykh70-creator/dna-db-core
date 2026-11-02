@@ -1223,12 +1223,62 @@ fn preprocess_mysql_dialect(sql: &str) -> String {
     } else {
         stripped
     };
-    let upper = out.to_ascii_uppercase();
+    // NB: the statement may carry leading whitespace/newlines (mysqli sends
+    // wpdb queries verbatim), so every starts_with check trims first.
+    let upper = out.trim_start().to_ascii_uppercase();
+    // CMS edition: WooCommerce / ActionScheduler insert pattern —
+    // INSERT INTO t (cols) SELECT <literals> FROM DUAL [WHERE (SELECT NULL
+    // FROM DUAL) IS NULL]. MySQL inserts one literal row; the guard (when
+    // present) is always true. See `rewrite_insert_select_dual`.
+    if upper.starts_with("INSERT") && top_level_find_ci(&out, "DUAL").is_some() {
+        if let Some(rewritten) = rewrite_insert_select_dual(&out) {
+            out = rewritten;
+        }
+    }
     if upper.starts_with("INSERT") || upper.starts_with("UPDATE") {
         // The literal must be quoted — the engine values are SQL literals.
         out = replace_fn_ci_outside_strings(&out, "NOW()", &format!("'{}'", now_mysql()));
     }
     out
+}
+
+/// CMS edition: rewrites the WooCommerce / ActionScheduler INSERT..SELECT
+/// pattern into INSERT..VALUES:
+///
+/// ```text
+/// INSERT INTO t (`c1`, `c2`, …) SELECT 'a', 1, NULL, … FROM DUAL
+/// [WHERE ( SELECT NULL FROM DUAL ) IS NULL]
+/// ```
+///
+/// MySQL inserts exactly one row of literals; the WHERE guard (when present)
+/// is always true. Only this canonical literal-only shape is rewritten;
+/// anything else returns None and produces the engine's own clear error.
+fn rewrite_insert_select_dual(sql: &str) -> Option<String> {
+    // The first top-level DUAL is the SELECT's own FROM; the guard's DUAL
+    // sits inside parentheses and is skipped by top_level_find_ci. The cut
+    // must remove `FROM DUAL` together — locate the FROM before the DUAL.
+    let dual = top_level_find_ci(sql, "DUAL")?;
+    let head_full = sql[..dual].trim_end();
+    if head_full.len() < 4 || !head_full[head_full.len() - 4..].eq_ignore_ascii_case("FROM") {
+        return None;
+    }
+    let before = head_full[..head_full.len() - 4].trim_end();
+    let after = sql[dual + 4..].trim_end_matches(';').trim();
+    // normalize whitespace of the optional guard before comparing
+    let norm = after.split_whitespace().collect::<Vec<_>>().join(" ");
+    let guard_ok = norm.is_empty()
+        || norm.eq_ignore_ascii_case("WHERE ( SELECT NULL FROM DUAL ) IS NULL")
+        || norm.eq_ignore_ascii_case("WHERE (SELECT NULL FROM DUAL) IS NULL");
+    if !guard_ok {
+        return None;
+    }
+    let sel = top_level_find_ci(before, "SELECT")?;
+    let head = before[..sel].trim_end();
+    let list = before[sel + "SELECT".len()..].trim();
+    if head.is_empty() || list.is_empty() {
+        return None;
+    }
+    Some(format!("{head} VALUES ({list})"))
 }
 
 /// Removes MySQL backtick quoting from identifiers. String literals are
@@ -2537,5 +2587,115 @@ mod tests {
         g.execute(s2, "ROLLBACK").unwrap();
         assert_eq!(g.row_locks.held_len(), 0);
     }
+    #[test]
+    fn replace_into_is_full_row_upsert() {
+        let g = gate("replace_into");
+        let s = g.open_session();
+        g.execute(
+            s,
+            "CREATE TABLE chr_cfg ( id bigint(20) unsigned NOT NULL AUTO_INCREMENT, k varchar(64) NOT NULL, v varchar(255) NOT NULL, PRIMARY KEY (id), UNIQUE KEY uq_k (k) )",
+        )
+        .unwrap();
+        g.execute(s, "INSERT INTO chr_cfg (k, v) VALUES ('a','1'), ('b','2')").unwrap();
+        // REPLACE with a conflicting unique key: the row is rewritten.
+        let r = g
+            .execute(s, "REPLACE INTO chr_cfg (k, v) VALUES ('a', '999')")
+            .unwrap();
+        assert!(r.affected_rows <= 2, "REPLACE reports insert or delete+insert");
+        let r = g.execute(s, "SELECT COUNT(*) AS n FROM chr_cfg").unwrap();
+        assert_eq!(v(&r.rows[0], "n"), "2", "REPLACE must not duplicate rows");
+        let r = g.execute(s, "SELECT v FROM chr_cfg WHERE k = 'a'").unwrap();
+        assert_eq!(v(&r.rows[0], "v"), "999");
+        // Non-conflicting REPLACE behaves like plain INSERT.
+        let r = g
+            .execute(s, "REPLACE INTO chr_cfg (k, v) VALUES ('c', '3')")
+            .unwrap();
+        assert_eq!(r.affected_rows, 1);
+        let r = g.execute(s, "SELECT COUNT(*) AS n FROM chr_cfg").unwrap();
+        assert_eq!(v(&r.rows[0], "n"), "3");
+    }
+
+    #[test]
+    fn insert_select_from_dual_action_scheduler_pattern() {
+        let g = gate("insert_dual");
+        let s = g.open_session();
+        g.execute(
+            s,
+            "CREATE TABLE chr_actions ( id bigint(20) unsigned NOT NULL AUTO_INCREMENT, hook varchar(191) NOT NULL, status varchar(20) NOT NULL, args text, PRIMARY KEY (id) )",
+        )
+        .unwrap();
+        // Exactly the shape WooCommerce/ActionScheduler sends.
+        let q = "INSERT INTO chr_actions ( `hook`, `status`, `args` )\nSELECT 'wc_admin_import_orders', 'pending', '[11]' FROM DUAL\nWHERE ( SELECT NULL FROM DUAL ) IS NULL";
+        let r = g.execute(s, q).unwrap();
+        assert_eq!(r.affected_rows, 1, "guard is always true → one row");
+        assert_eq!(r.last_insert_id, 1);
+        let r = g.execute(s, "SELECT hook, args FROM chr_actions").unwrap();
+        assert_eq!(v(&r.rows[0], "hook"), "wc_admin_import_orders");
+        assert_eq!(v(&r.rows[0], "args"), "[11]");
+        // Without the WHERE guard.
+        let r = g
+            .execute(s, "INSERT INTO chr_actions (hook, status, args) SELECT 'h2', 'pending', NULL FROM DUAL")
+            .unwrap();
+        assert_eq!(r.affected_rows, 1);
+        // A non-canonical guard goes through the real INSERT..SELECT path:
+        // `WHERE 1 = 0` selects no rows, so nothing is inserted (MySQL).
+        let r = g
+            .execute(s, "INSERT INTO chr_actions (hook, status) SELECT 'h3', 'x' FROM DUAL WHERE 1 = 0")
+            .unwrap();
+        assert_eq!(r.affected_rows, 0, "guard false → no rows");
+        let r = g.execute(s, "SELECT COUNT(*) AS n FROM chr_actions").unwrap();
+        assert_eq!(v(&r.rows[0], "n"), "2");
+    }
+
+    #[test]
+    fn compound_join_on_and_qualified_aggregates() {
+        let g = gate("join_on_and");
+        let s = g.open_session();
+        g.execute(
+            s,
+            "CREATE TABLE chr_posts ( id bigint(20) unsigned NOT NULL AUTO_INCREMENT, slug varchar(64), status varchar(20), PRIMARY KEY (id) )",
+        )
+        .unwrap();
+        g.execute(
+            s,
+            "CREATE TABLE chr_meta ( id bigint(20) unsigned NOT NULL AUTO_INCREMENT, post_id bigint(20) unsigned, k varchar(64), val int, PRIMARY KEY (id) )",
+        )
+        .unwrap();
+        g.execute(s, "INSERT INTO chr_posts (id, slug, status) VALUES (1, 'hello', 'publish'), (2, 'x', 'draft')").unwrap();
+        g.execute(
+            s,
+            "INSERT INTO chr_meta (post_id, k, val) VALUES (1, 'price', '250'), (1, 'price', '50'), (2, 'price', '10')",
+        )
+        .unwrap();
+        // Compound ON: first equality drives the join, AND adds the filter.
+        let q = "SELECT p.slug, m.val FROM chr_posts p INNER JOIN chr_meta m ON p.id = m.post_id AND p.slug = 'hello'";
+        let r = g.execute(s, q).unwrap();
+        assert_eq!(r.rows.len(), 2, "draft post filtered by the ON condition");
+        // Qualified aggregate argument SUM(m.val) — Woo refund query shape.
+        let q2 = "SELECT SUM(m.val) FROM chr_meta AS m INNER JOIN chr_posts AS p ON ( m.post_id = p.id ) WHERE p.slug = 'hello'";
+        let r2 = g.execute(s, q2).unwrap();
+        assert_eq!(r2.rows[0].values().next(), Some(&Value::Int(300)), "SUM over qualified column");
+    }
+
+    #[test]
+    fn preprocess_rewrites_insert_select_dual() {
+        let q = "INSERT INTO chr_actions ( `hook`, `status`, `args` )\nSELECT 'wc_admin_import_orders', 'pending', '[11]' FROM DUAL\nWHERE ( SELECT NULL FROM DUAL ) IS NULL";
+        let out = preprocess_mysql_dialect(q);
+        assert_eq!(
+            out,
+            "INSERT INTO chr_actions ( hook, status, args ) VALUES ('wc_admin_import_orders', 'pending', '[11]')",
+            "exact Woo shape must rewrite to INSERT..VALUES"
+        );
+        // without the WHERE guard
+        let out2 = preprocess_mysql_dialect("INSERT INTO t (a, b) SELECT 'x', 1 FROM DUAL");
+        assert_eq!(out2, "INSERT INTO t (a, b) VALUES ('x', 1)");
+        // non-canonical guard is not rewritten
+        let out3 = preprocess_mysql_dialect("INSERT INTO t (a) SELECT 'x' FROM DUAL WHERE 1 = 0");
+        assert!(out3.contains("FROM DUAL"), "unknown guard must be left untouched");
+        // INSERT..SELECT from a real table is not touched
+        let out4 = preprocess_mysql_dialect("INSERT INTO t (a) SELECT b FROM other");
+        assert_eq!(out4, "INSERT INTO t (a) SELECT b FROM other");
+    }
+
 }
 

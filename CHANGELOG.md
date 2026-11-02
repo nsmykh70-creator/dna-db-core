@@ -2,6 +2,62 @@
 
 ## Unreleased (CMS Edition — branch `cms-edition`)
 
+### MySQL wire adapter vs real CMS: full E2E + benchmarks + security (2026-11-02)
+
+The wire adapter was validated end-to-end against REAL applications, with
+no client-side changes at all (stock mysqli / wp-cli / PyMySQL / Connector/Py):
+
+- Real WordPress 7.1.4 over the wire (no drop-in): `wp core install`, dbDelta
+  creating all 12 core tables, posts/meta/users CRUD, `wp_authenticate`,
+  cron artifacts — **21/21 artifacts identical to MariaDB** through a byte-equal
+  artifact diff (`scripts/e2e_wp_mysqlwire.sh`,
+  `docs/cms/E2E_WP_MYSQLWIRE_REPORT.md`).
+- Real WooCommerce 11.2.1 (HPOS) over the wire: plugin install creates 36 Woo
+  tables via dbDelta (48 total), full order lifecycle (product → order → line
+  item → totals → stock reduction) — **12/12 artifacts identical, 0 SQL
+  errors** on the whole run (`scripts/e2e_woo_mysqlwire.sh`,
+  `docs/cms/E2E_WOO_MYSQLWIRE_REPORT.md`).
+- SQL-coverage fixes found by those real clients (found by mysqlnd and Woo,
+  fixed in engine/gate):
+  - OK-packet info is now lenenc-prefixed — mysqlnd failed with
+    "RSET_HEADER packet additional data length is past N bytes" on any OK
+    carrying an info string (wpdb broke at `SET NAMES` on connect);
+  - `REPLACE INTO` = full-row upsert (executor + parser);
+  - real `INSERT … SELECT … FROM <table>` (new `Stmt::InsertSelect`) plus the
+    Woo/ActionScheduler literal form `INSERT … SELECT … FROM DUAL [WHERE
+    (SELECT NULL FROM DUAL) IS NULL]`; `DUAL` is a virtual one-row table;
+  - derived tables `FROM (SELECT …) AS x` / `JOIN (SELECT …) AS y` desugar into
+    statement-scoped CTEs; `USING (col)` natural-join shorthand;
+  - compound JOIN conditions `ON a = b AND t.c = 'literal'` — the first
+    `col = col` equality keeps the hash join, the rest fold into WHERE;
+  - `SELECT EXISTS (SELECT …)` as a projection item;
+  - `SUM(qual.col)` — qualified aggregate arguments;
+  - duplicate bare computed projection items keep MySQL reporting semantics
+    (MariaDB-style ` (N)` suffix) so INSERT..SELECT maps columns positionally;
+  - `maybe_alias` reserved words extended (`on`, `using`).
+- Differential corpus vs MariaDB 11.8.6 (86 queries): 81 MATCH + 4 BOTH-ERR
+  with identical errno + 1 DIFF-VALUE that is only the `VERSION()` string
+  (`docs/cms/COMPARISON_RUN7.md`).
+- Real-client smoke PyMySQL + MySQL Connector/Py: 21/21 over the release
+  binary.
+- Benchmarks over the MySQL wire (pymysql text protocol, wp_posts/wp_options
+  schema, 8 000 ops/phase, MariaDB 11.8.6 as reference;
+  `scripts/cms_wire_bench.py`, `docs/cms/wire_bench_results.json`):
+  single-row INSERT 18 043 vs 14 799 ops/s (×1.22), WordPress-mix 6 388 vs
+  5 306 ops/s (×1.20), point SELECT 9 429 vs 10 177 (×0.93), secondary-index
+  SELECT 10 031 vs 9 683 (×1.04), UPDATE by PK 14 434 vs 14 853 (×0.97),
+  batched INSERT 172 028 vs 237 882 (×0.72); daemon max RSS 188 MiB vs
+  195 MiB.
+- Wire-surface security battery `scripts/mysqlwire_security_test.py` —
+  **24/24**: parameterized SQL injection (stacked/UNION/LIKE/escaped-quote),
+  mysql_native_password token forgery, brute force, stacked queries without
+  CLIENT_MULTI_STATEMENTS, malformed packets (empty/zero-length/garbage/
+  truncated/wrong-seq) with daemon liveness after the flood, errno
+  propagation, data intactness (`docs/cms/MYSQLWIRE_SECURITY_REPORT.md`).
+- Docs: `docs/CMS_MYSQLWIRE_GUIDE_RU.md` — step-by-step guide (install →
+  mysqld → wp-config → systemd → security → benchmarks → troubleshooting);
+  landing got a "MySQL mode" section with CMS/benchmark/security numbers.
+
 ### Universal MySQL wire adapter: `dna-db-core mysqld` (2026-11-02)
 
 Architecture decision: instead of adapting DNA-DB to each CMS, the CMS
