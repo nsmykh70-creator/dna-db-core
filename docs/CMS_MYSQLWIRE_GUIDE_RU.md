@@ -227,15 +227,17 @@ sudo systemctl status dna-db
 
 | Фаза | DNA-DB mysqld | MariaDB 11.8.6 | Отношение |
 |---|---|---|---|
-| INSERT по одной строке (autocommit) | 18 043 ops/s | 14 799 ops/s | ×1,22 |
-| Пакетный INSERT (100 строк) | 172 028 ops/s | 237 882 ops/s | ×0,72 |
-| SELECT по PK | 9 429 ops/s | 10 177 ops/s | ×0,93 |
-| SELECT по вторичному индексу | 10 031 ops/s | 9 683 ops/s | ×1,04 |
-| UPDATE по PK | 14 434 ops/s | 14 853 ops/s | ×0,97 |
-| WordPress-микс (опции SELECT+UPSERT) | 6 388 ops/s | 5 306 ops/s | ×1,20 |
-| Память демона (max RSS) | 188 MiB | 195 MiB | −4 % |
+| INSERT по одной строке (autocommit) | 15 682 ops/s | 13 092 ops/s | ×1,20 |
+| Пакетный INSERT (100 строк) | 125 083 ops/s | 216 268 ops/s | ×0,58 |
+| SELECT по PK | 8 046 ops/s | 8 889 ops/s | ×0,91 |
+| SELECT по вторичному индексу | 8 647 ops/s | 8 290 ops/s | ×1,04 |
+| UPDATE по PK | 11 731 ops/s | 12 611 ops/s | ×0,93 |
+| WordPress-микс (опции SELECT+UPSERT) | 5 385 ops/s | 4 701 ops/s | ×1,15 |
+| Память демона (пик RSS за фазу) | 8–13 MiB | 118–123 MiB | ~×9–10 меньше |
 
-Сырые данные: `docs/cms/wire_bench_results.json`. Повторить:
+Скорость — паритет или лучше (кроме пакетного INSERT, где MariaDB выигрывает
+на массовой загрузке); память демона — на порядок меньше. Сырые данные и
+полная методика: `docs/cms/wire_bench_results.json` / `.md`. Повторить:
 
 ```bash
 python3 scripts/cms_wire_bench.py --dna-port 13307 --mysql-port 13306 --rows 8000
@@ -274,6 +276,7 @@ python3 scripts/mysqlwire_client_smoke.py 13307   # smoke реальными к�
   500.00, склад 10−2, меты заказа побайтно, 0 SQL-ошибок на полном цикле.
 * `docs/cms/COMPARISON_RUN7.md` — дифференциальный корпус 86 запросов против
   MariaDB 11.8.6: 81 MATCH, 4 BOTH-ERR (одинаковый errno), 1 DIFF-VALUE
-  (строка `VERSION()`).
+  (строка `VERSION()`); воспроизведён позапросно на отдельной машине —
+  `docs/cms/COMPARISON_RUN8.md` (вердикты идентичны).
 * `docs/cms/MYSQLWIRE_SECURITY_REPORT.md` — 24/24 security-проверок.
 * `docs/cms/MYSQLWIRE_CLIENT_SMOKE.md` — PyMySQL + Connector/Py 21/21.

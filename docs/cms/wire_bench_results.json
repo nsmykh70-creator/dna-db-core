@@ -1,67 +1,77 @@
 {
+  "meta": {
+    "date": "2026-11-02 17:57:44",
+    "platform": "Linux-5.10.134-013.15.kangaroo.al8.x86_64-x86_64-with-glibc2.41",
+    "rows": 8000,
+    "method": "одинаковый SQL через pymysql (text protocol, как wpdb); ops/s = строк/сек по фазе; RSS = пик VmRSS демона за фазу (сэмплер 50 мс + синхронный baseline, замер строго своего процесса)",
+    "versions": {
+      "dna": "10.11.11-MariaDB",
+      "mysql": "11.8.6-MariaDB"
+    }
+  },
   "rows": 8000,
   "dna": {
     "insert_single": {
-      "seconds": 0.443,
-      "ops_per_sec": 18043.4,
-      "rss_max_mb": 188.0
+      "seconds": 0.51,
+      "ops_per_sec": 15682.0,
+      "rss_max_mb": 8.5
     },
     "insert_multirow": {
-      "seconds": 0.047,
-      "ops_per_sec": 172027.9,
-      "rss_max_mb": 0.0
+      "seconds": 0.064,
+      "ops_per_sec": 125083.3,
+      "rss_max_mb": 11.1
     },
     "select_pk": {
-      "seconds": 0.848,
-      "ops_per_sec": 9428.6,
-      "rss_max_mb": 188.0
+      "seconds": 0.994,
+      "ops_per_sec": 8045.8,
+      "rss_max_mb": 12.9
     },
     "select_index": {
-      "seconds": 0.797,
-      "ops_per_sec": 10031.4,
-      "rss_max_mb": 188.0
+      "seconds": 0.925,
+      "ops_per_sec": 8646.7,
+      "rss_max_mb": 12.9
     },
     "update_pk": {
-      "seconds": 0.554,
-      "ops_per_sec": 14433.8,
-      "rss_max_mb": 188.0
+      "seconds": 0.682,
+      "ops_per_sec": 11731.1,
+      "rss_max_mb": 12.9
     },
     "wp_mix": {
-      "seconds": 1.252,
-      "ops_per_sec": 6388.0,
-      "rss_max_mb": 188.0
+      "seconds": 1.486,
+      "ops_per_sec": 5384.8,
+      "rss_max_mb": 12.9
     }
   },
   "mysql": {
     "insert_single": {
-      "seconds": 0.541,
-      "ops_per_sec": 14799.0,
-      "rss_max_mb": 190.9
+      "seconds": 0.611,
+      "ops_per_sec": 13092.1,
+      "rss_max_mb": 118.3
     },
     "insert_multirow": {
-      "seconds": 0.034,
-      "ops_per_sec": 237882.3,
-      "rss_max_mb": 191.1
+      "seconds": 0.037,
+      "ops_per_sec": 216268.3,
+      "rss_max_mb": 118.3
     },
     "select_pk": {
-      "seconds": 0.786,
-      "ops_per_sec": 10176.6,
-      "rss_max_mb": 191.9
+      "seconds": 0.9,
+      "ops_per_sec": 8889.2,
+      "rss_max_mb": 119.3
     },
     "select_index": {
-      "seconds": 0.826,
-      "ops_per_sec": 9683.1,
-      "rss_max_mb": 191.9
+      "seconds": 0.965,
+      "ops_per_sec": 8289.7,
+      "rss_max_mb": 119.3
     },
     "update_pk": {
-      "seconds": 0.539,
-      "ops_per_sec": 14852.8,
-      "rss_max_mb": 194.3
+      "seconds": 0.634,
+      "ops_per_sec": 12610.8,
+      "rss_max_mb": 122.5
     },
     "wp_mix": {
-      "seconds": 1.508,
-      "ops_per_sec": 5305.7,
-      "rss_max_mb": 195.4
+      "seconds": 1.702,
+      "ops_per_sec": 4700.7,
+      "rss_max_mb": 123.1
     }
   }
 }

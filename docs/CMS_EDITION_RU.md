@@ -120,9 +120,11 @@ COALESCE, IFNULL, NULLIF, IF, GREATEST/LEAST — с NULL-семантикой My
   `docs/cms/E2E_WOO_MYSQLWIRE_REPORT.md`.
 * Диф-корпус №7 (86 запросов) против MariaDB 11.8.6: 81 MATCH, 4 BOTH-ERR
   (одинаковый errno), 1 DIFF-VALUE (только строка VERSION()) —
-  `docs/cms/COMPARISON_RUN7.md`.
-* Бенчмарк wire (pymysql, 8 000 ops/фаза): single INSERT ×1,22 и WP-микс
-  ×1,20 к MariaDB 11.8.6, паритет чтений/UPDATE, RAM 188 против 195 MiB —
+  `docs/cms/COMPARISON_RUN7.md`; воспроизведён позапросно на отдельной
+  машине — прогон №8, вердикты идентичны (`docs/cms/COMPARISON_RUN8.md`).
+* Бенчмарк wire (pymysql, 8 000 ops/фаза): single INSERT ×1,20 и WP-микс
+  ×1,15 к MariaDB 11.8.6, паритет чтений/UPDATE (×0,91–×1,04), RAM демона
+  8–13 против 118–123 MiB (примерно на порядок меньше) —
   `docs/cms/wire_bench_results.json`.
 * Security wire-поверхности: 24/24 — `docs/cms/MYSQLWIRE_SECURITY_REPORT.md`.
 * Пошаговое руководство: `docs/CMS_MYSQLWIRE_GUIDE_RU.md`.

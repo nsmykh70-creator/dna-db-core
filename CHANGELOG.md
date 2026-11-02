@@ -37,17 +37,24 @@ no client-side changes at all (stock mysqli / wp-cli / PyMySQL / Connector/Py):
   - `maybe_alias` reserved words extended (`on`, `using`).
 - Differential corpus vs MariaDB 11.8.6 (86 queries): 81 MATCH + 4 BOTH-ERR
   with identical errno + 1 DIFF-VALUE that is only the `VERSION()` string
-  (`docs/cms/COMPARISON_RUN7.md`).
+  (`docs/cms/COMPARISON_RUN7.md`). Reproduced query-for-query on a separate
+  machine (portable MariaDB 11.8.6, 2 vCPU) — RUN8 verdicts are diff-identical
+  to RUN7 (`docs/cms/COMPARISON_RUN8.md`).
 - Real-client smoke PyMySQL + MySQL Connector/Py: 21/21 over the release
   binary.
 - Benchmarks over the MySQL wire (pymysql text protocol, wp_posts/wp_options
   schema, 8 000 ops/phase, MariaDB 11.8.6 as reference;
   `scripts/cms_wire_bench.py`, `docs/cms/wire_bench_results.json`):
-  single-row INSERT 18 043 vs 14 799 ops/s (×1.22), WordPress-mix 6 388 vs
-  5 306 ops/s (×1.20), point SELECT 9 429 vs 10 177 (×0.93), secondary-index
-  SELECT 10 031 vs 9 683 (×1.04), UPDATE by PK 14 434 vs 14 853 (×0.97),
-  batched INSERT 172 028 vs 237 882 (×0.72); daemon max RSS 188 MiB vs
-  195 MiB.
+  single-row INSERT 15 682 vs 13 092 ops/s (×1.20), WordPress-mix 5 385 vs
+  4 701 ops/s (×1.15), point SELECT 8 046 vs 8 889 (×0.91), secondary-index
+  SELECT 8 647 vs 8 290 (×1.04), UPDATE by PK 11 731 vs 12 611 (×0.93),
+  batched INSERT 125 083 vs 216 268 (×0.58); daemon peak RSS 8–13 MiB vs
+  118–123 MiB (~an order of magnitude less).
+  Bench-metrics fix: the RSS sampler now (a) takes a synchronous baseline at
+  each phase start so fast phases no longer read 0 MiB, samples every 50 ms,
+  and (b) reports strictly the engine's own process — the previous
+  max-across-both-daemons calculation polluted both columns; the report now
+  also embeds date/platform/versions/method meta.
 - Wire-surface security battery `scripts/mysqlwire_security_test.py` —
   **24/24**: parameterized SQL injection (stacked/UNION/LIKE/escaped-quote),
   mysql_native_password token forgery, brute force, stacked queries without

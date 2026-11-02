@@ -10,6 +10,7 @@ pymysql (text protocol, как wpdb). Метрики: ops/sec по фазам + 
 
 import argparse
 import json
+import platform
 import time
 
 import pymysql
@@ -30,6 +31,19 @@ def connect(port, password):
     )
 
 
+def version_of(port):
+    """Строка VERSION() движка (для метаданных отчёта)."""
+    try:
+        conn = connect(port, "benchpass")
+        with conn.cursor() as cur:
+            cur.execute("SELECT VERSION()")
+            v = cur.fetchone()[0]
+        conn.close()
+        return str(v)
+    except Exception as e:  # движок мог быть остановлен к моменту записи отчёта
+        return "unknown (%s)" % e
+
+
 def rss_mb(pid):
     try:
         with open(f"/proc/{pid}/status") as f:
@@ -44,7 +58,7 @@ def rss_mb(pid):
 class RssSampler:
     """Фоновый сэмплер RSS: максимум за фазу."""
 
-    def __init__(self, pids, interval=0.3):
+    def __init__(self, pids, interval=0.05):
         import threading
 
         self.pids = pids
@@ -54,18 +68,23 @@ class RssSampler:
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
+    def _sample_once(self):
+        for name, pid in self.pids.items():
+            v = rss_mb(pid)
+            if v > self.max_rss[name]:
+                self.max_rss[name] = v
+
     def _run(self):
         while not self.stop.is_set():
-            for name, pid in self.pids.items():
-                v = rss_mb(pid)
-                if v > self.max_rss[name]:
-                    self.max_rss[name] = v
+            self._sample_once()
             time.sleep(self.interval)
 
     def phase(self):
-        """Сброс максимума перед новой фазой."""
+        """Сброс максимума перед новой фазой + синхронный замер baseline:
+        без него быстрая фаза (< интервала сэмплирования) осталась бы с 0."""
         for name in self.max_rss:
             self.max_rss[name] = 0.0
+        self._sample_once()
 
     def snapshot(self):
         return dict(self.max_rss)
@@ -201,12 +220,15 @@ def run_engine(name, port, password, rows, sampler):
         fn(conn, rows)
         dt = time.perf_counter() - t0
         rss = sampler.snapshot()
+        # RSS строго своего демона: max по всем процессам смешал бы колонки
+        # (во время фаз DNA-DB в максимум попадал бы простаивающий MariaDB).
+        own_rss = rss.get(name, 0.0)
         results[phase_name] = {
             "seconds": round(dt, 3),
             "ops_per_sec": round(rows / dt, 1),
-            "rss_max_mb": round(max(rss.values()), 1) if rss else 0.0,
+            "rss_max_mb": round(own_rss, 1),
         }
-        print(f"  [{name}] {phase_name}: {rows / dt:8.1f} ops/s  ({dt:5.2f}s)  rss={max(rss.values()):.0f}MB")
+        print(f"  [{name}] {phase_name}: {rows / dt:8.1f} ops/s  ({dt:5.2f}s)  rss={own_rss:.0f}MB")
     conn.close()
     return results
 
@@ -227,7 +249,9 @@ def main():
         pids["dna"] = args.dna_pid
     if args.mysql_pid:
         pids["mysql"] = args.mysql_pid
-    sampler = RssSampler(pids) if pids else RssSampler({"none": 0})
+    if not pids:
+        raise SystemExit("укажите --dna-pid и/или --mysql-pid: без pid демона RSS не измерить")
+    sampler = RssSampler(pids)
 
     print(f"rows={args.rows}")
     print("== DNA-DB (mysql wire :%d) ==" % args.dna_port)
@@ -236,12 +260,30 @@ def main():
     mysql = run_engine("mysql", args.mysql_port, "benchpass", args.rows, sampler)
     sampler.stop_now()
 
-    out = {"rows": args.rows, "dna": dna, "mysql": mysql}
+    meta = {
+        "date": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "platform": platform.platform(),
+        "rows": args.rows,
+        "method": ("одинаковый SQL через pymysql (text protocol, как wpdb); "
+                   "ops/s = строк/сек по фазе; RSS = пик VmRSS демона за фазу "
+                   "(сэмплер 50 мс + синхронный baseline, замер строго своего процесса)"),
+        "versions": {"dna": version_of(args.dna_port), "mysql": version_of(args.mysql_port)},
+    }
+    out = {"meta": meta, "rows": args.rows, "dna": dna, "mysql": mysql}
     with open(args.out_json, "w") as f:
         json.dump(out, f, ensure_ascii=False, indent=2)
 
     # Markdown-сводка
     lines = [
+        "# CMS wire-бенчмарк: DNA-DB mysqld vs MariaDB",
+        "",
+        "- Дата: %s, платформа: `%s`" % (meta["date"], meta["platform"]),
+        "- Объём: %s строк, одинаковый SQL через pymysql (text protocol, как wpdb)" %
+        "{:,}".format(args.rows).replace(",", " "),
+        "- Версии: DNA-DB CMS Edition (`%s` — wire-совместимая строка версии), "
+        "MariaDB `%s`" % (meta["versions"]["dna"], meta["versions"]["mysql"]),
+        "- Методика: %s" % meta["method"],
+        "",
         "| Фаза | DNA-DB ops/s | MariaDB ops/s | DNA × MariaDB |",
         "|---|---|---|---|",
     ]
