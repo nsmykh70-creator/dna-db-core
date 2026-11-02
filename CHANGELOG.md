@@ -2,6 +2,47 @@
 
 ## Unreleased (CMS Edition — branch `cms-edition`)
 
+### Universal MySQL wire adapter: `dna-db-core mysqld` (2026-11-02)
+
+Architecture decision: instead of adapting DNA-DB to each CMS, the CMS
+edition now ships a **MySQL wire protocol server** (`cms::mysqlwire`) that
+listens on port 3306 and translates on the wire — CMS SQL goes in through
+`CmsSqlGate`, results/errno come back in MySQL protocol. Any MySQL-based
+site or service (WordPress, WooCommerce, Joomla, phpMyAdmin, wp-cli,
+mysqldump, ORMs) connects unchanged; the `db.php` drop-in becomes an
+optional instrumentation, not a requirement.
+
+- Protocol 4.1: HandshakeV10, `mysql_native_password` SHA1 scramble with a
+  transparent AuthSwitchRequest for `caching_sha2_password` clients
+  (PyMySQL, Connector/Py), text resultsets, multi-statement packets with
+  SERVER_MORE_RESULTS_EXISTS, OK/ERR with real errno + SQLSTATE,
+  COM_PING/INIT_DB/QUIT/FIELD_LIST/STATISTICS/RESET_CONNECTION.
+- Server-side prepared statements: COM_STMT_PREPARE/EXECUTE/CLOSE/RESET/
+  SEND_LONG_DATA — binary params decoded and substituted, results returned
+  as binary rows; column metadata comes from a NULL-parameter probe at
+  prepare, so binding clients see real column counts; prepare-time errors
+  keep the real errno (missing table → 1146, MySQL parity).
+- New run mode: `dna-db-core mysqld [--wordpress] [--user u:p] [--trust]`
+  — minimal "easier than MySQL" startup: one command, ready for
+  `wp-config.php`, prints the config block; plus `--mysql-port/--mysql-user`
+  on the full `serve` mode. `scripts/install.sh` + systemd unit.
+- Engine gains a function layer (`expr::Expr::Fn` + `eval_scalar_fn`):
+  CONCAT, CONCAT_WS, UPPER/LOWER, LENGTH/CHAR_LENGTH, TRIM/LTRIM/RTRIM,
+  SUBSTRING, REPLACE, LEFT/RIGHT, REVERSE, LPAD/RPAD, REPEAT, ABS, ROUND,
+  FLOOR/CEIL/CEILING, SQRT, POW, SIGN, MOD, COALESCE, IFNULL, NULLIF, IF,
+  GREATEST/LEAST — with MySQL NULL semantics (CONCAT('a', NULL) → NULL),
+  usable in SELECT/WHERE/JOIN/HAVING/UPDATE; the SQL→DnaQL translator folds
+  constant-only calls.
+- Gate parity fixes found by real drivers: bare `COMMIT`/`ROLLBACK`
+  without an open transaction are now a silent OK (was errno 1064 —
+  autocommit=0 drivers broke), and COM_STATISTICS/COM_INIT_DB behave like
+  mysqld.
+- Tests: 19 unit (protocol framing/auth/scramble vectors cross-checked
+  against Python hashlib) + 2 wire integration tests speaking the raw
+  protocol + real-client smoke `scripts/mysqlwire_client_smoke.py`
+  (PyMySQL + Connector/Py): **21/21 PASS** (`docs/cms/MYSQLWIRE_CLIENT_SMOKE.md`).
+  Suite: 300 tests green with the `cms` feature.
+
 ### Row locks: `SELECT … FOR UPDATE` with InnoDB semantics (2026-11-02)
 
 Closed the last blocker for **concurrent** WooCommerce orders

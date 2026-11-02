@@ -2341,6 +2341,32 @@ impl SParser {
                         distinct,
                     )));
                 }
+                // CMS edition: MySQL scalar functions — CONCAT(a, b),
+                // UPPER(x), IFNULL(a, b), ROUND(x, d), IF(c, t, e), … Each
+                // argument is a full expression; evaluation lives in
+                // expr::eval_scalar_fn with MySQL NULL semantics.
+                if matches!(self.peek_at(1), STok::LParen)
+                    && crate::expr::is_scalar_fn(&s)
+                {
+                    self.next();
+                    self.next(); // (
+                    let mut args = Vec::new();
+                    if !matches!(self.peek(), STok::RParen) {
+                        loop {
+                            args.push(self.parse_or()?);
+                            if matches!(self.peek(), STok::Comma) {
+                                self.next();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    self.expect(STok::RParen)?;
+                    return Ok(Expr::Fn {
+                        name: s.to_ascii_uppercase(),
+                        args,
+                    });
+                }
                 self.next();
                 if s.eq_ignore_ascii_case("NULL") {
                     Ok(Expr::Literal(Value::Null))
@@ -2639,6 +2665,11 @@ fn collect_expr_tables(expr: &Expr, out: &mut Vec<String>) -> Result<(), String>
         }
         Expr::Cast { inner, .. } => collect_expr_tables(inner, out)?,
         Expr::Literal(_) | Expr::Column(_) | Expr::InList { .. } => {}
+        Expr::Fn { args, .. } => {
+            for a in args {
+                collect_expr_tables(a, out)?;
+            }
+        }
     }
     Ok(())
 }
@@ -3569,6 +3600,13 @@ impl SqlEngine {
                 operand: Box::new(self.resolve_expr_for_row(operand, row)?),
                 pattern: pattern.clone(),
                 negated: *negated,
+            },
+            Expr::Fn { name, args } => Expr::Fn {
+                name: name.clone(),
+                args: args
+                    .iter()
+                    .map(|a| self.resolve_expr_for_row(a, row))
+                    .collect::<Result<Vec<_>, _>>()?,
             },
             Expr::ScalarSubquery { stmt } => {
                 match self.eval_scalar_sub_for_row(stmt, row)? {
@@ -5989,6 +6027,13 @@ impl SqlEngine {
                     pattern: pattern.clone(),
                     negated: *negated,
                 }),
+                Expr::Fn { name, args } => Ok(Expr::Fn {
+                    name: name.clone(),
+                    args: args
+                        .iter()
+                        .map(|a| walk(sql, a))
+                        .collect::<Result<Vec<_>, _>>()?,
+                }),
                 Expr::InSubquery { column, query } => {
                     // Correlated? Render and re-parse the subquery, then ask
                     // for outer references. Correlated nodes resolve per row.
@@ -6661,6 +6706,14 @@ fn expr_to_sql(e: &Expr) -> String {
             if *negated { "NOT " } else { "" },
             pattern
         ),
+        Expr::Fn { name, args } => format!(
+            "{}({})",
+            name,
+            args.iter()
+                .map(|a| expr_to_sql(a))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         Expr::Literal(Value::Text(s)) | Expr::Literal(Value::Dna(s)) => quote(s),
         Expr::Literal(v) => v.to_string(),
         Expr::Column(c) => c.clone(),
@@ -6997,6 +7050,7 @@ fn expr_has_subquery(e: &Expr) -> bool {
         }
         Expr::Like { operand, .. } => expr_has_subquery(operand),
         Expr::Cast { inner, .. } => expr_has_subquery(inner),
+        Expr::Fn { args, .. } => args.iter().any(expr_has_subquery),
         Expr::Literal(_) | Expr::Column(_) | Expr::InList { .. } => false,
     }
 }

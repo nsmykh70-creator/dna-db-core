@@ -225,6 +225,26 @@ impl CmsSqlGate {
             return Ok(empty_ok(format!("database changed to '{}'", db)));
         }
 
+        // MySQL: COMMIT / ROLLBACK without an open transaction are silent
+        // no-ops. PHP drivers that run with autocommit=0 (pymysql, mysqli
+        // defaults, wpdb in transactional plugins) send bare COMMITs after
+        // every write, so rejecting them here breaks real clients with
+        // errno 1064 where real MySQL answers OK.
+        if upper == "COMMIT" || upper == "ROLLBACK" {
+            let has_tx = self
+                .txs
+                .lock()
+                .expect("tx map poisoned")
+                .contains_key(&session);
+            if !has_tx {
+                self.row_locks.release_session(session);
+                return Ok(empty_ok(format!(
+                    "{}, no active transaction",
+                    upper.to_ascii_lowercase()
+                )));
+            }
+        }
+
         // ---------- SELECT function shims ----------
         if upper.starts_with("SELECT ") || upper.starts_with("SELECT") {
             if let Some(res) = self.try_select_shims(session, sql, &upper)? {

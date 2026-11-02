@@ -46,10 +46,70 @@ statements — с рекомендацией отключать), для Joomla 
 `postgresql` в `configuration.php`. Нужны: `SHOW TABLES`-подмножество
 каталожных запросов установщика, миграции `ALTER TABLE`, `#__`-префикс.
 
-**C. MySQL wire protocol (фаза 4, универсальный вход).** Handshake, auth
-(`mysql_native_password`), text protocol, OK/ERR с errno из `cms::errno`,
-COM_STMT_*. После него работают mysqli, PDO_mysql, phpMyAdmin, mysqldump
-без всяких drop-in'ов.
+**C. MySQL wire protocol — ГЛАВНЫЙ маршрут (универсальный вход).**
+Решение по архитектуре (2026-11): не адаптировать каждую CMS по
+отдельности, а сделать DNA-DB универсальной заменой MySQL для любых
+сайтов и сервисов. Реализовано: `src/cms/mysqlwire.rs` — полноценный
+сервер клиент/серверного протокола MySQL 4.1, который слушает порт 3306,
+принимает запросы CMS, прогоняет их через MySQL-диалектный гейт
+(`CmsSqlGate`: SQL → движок → DNAQL-хранилище) и возвращает ответы в
+формате MySQL. После него работают mysqli, PDO_mysql, wp-cli, phpMyAdmin,
+mysqldump, Connector/Py, ORM — без всяких drop-in'ов и правок кода CMS.
+Подробности и упрощённая установка — §3.1.
+
+### 3.1. Универсальный MySQL-шлюз `dna-db-mysqld` и установка «проще, чем MySQL»
+
+Слой адаптации теперь полный: CMS говорит по MySQL-проводу, шлюз переводит
+запросы в SQL-подмножество движка (а то, что CMS ожидает от сервера — сессии,
+`LAST_INSERT_ID()`, errno, SHOW-каталог, блокировки — обеспечивает гейт),
+ответы возвращаются в MySQL-протоколе. Двусторонний конвертер:
+
+```
+WordPress/Woo/Joomla/… ──(mysqli/PDO, порт 3306)──▶ mysqlwire
+                                                     │ SQL
+                                                     ▼
+                                               CmsSqlGate (диалект MySQL)
+                                                     │ SQL-подмножество
+                                                     ▼
+                                            SqlEngine → DNA-хранилище
+CMS ◀──результаты/errno в MySQL-протоколе──── mysqlwire
+```
+
+Минимальный запуск (режим `mysqld`):
+
+```bash
+cargo build --release --features cms
+./target/release/dna-db-core mysqld --data-dir ./dna_data --wordpress
+# готово: MySQL-совместимый сервер на 0.0.0.0:3306, schema WP создана,
+# логин root без пароля (trust) или --user wp:secret;
+# сервер печатает готовый блок wp-config.php.
+```
+
+Что покрывает протокол (проверено реальными клиентами, см.
+`docs/cms/MYSQLWIRE_CLIENT_SMOKE.md` — 21/21):
+
+- HandshakeV10, `mysql_native_password` (SHA1-scramble) + прозрачный
+  AuthSwitchRequest для клиентов с `caching_sha2_password`;
+- COM_QUERY: text-протокол резалтсетов, multi-statement, OK/ERR с настоящими
+  errno (1045/1062/1146/1213/1205/…), COM_PING/INIT_DB/QUIT/FIELD_LIST/
+  STATISTICS/RESET_CONNECTION;
+- COM_STMT_PREPARE/EXECUTE/CLOSE/RESET/SEND_LONG_DATA: бинарные параметры,
+  бинарные резалтсеты; метаданные колонок — пробой с NULL-параметрами на
+  prepare (mysqli и Connector/Py видят реальные колонки);
+- `SET NAMES`, `USE`, autocommit, bare `COMMIT`/`ROLLBACK` вне транзакции =
+  тихий no-op (паритет с MySQL — на этом ломались реальные драйверы).
+
+Функции SQL, которых не хватало движку, добавлены в ядро (требование
+«допиши недостающее»): `Expr::Fn` — CONCAT, CONCAT_WS, UPPER/LOWER,
+LENGTH/CHAR_LENGTH, TRIM/LTRIM/RTRIM, SUBSTRING, REPLACE, LEFT/RIGHT,
+REVERSE, LPAD/RPAD, REPEAT, ABS/ROUND/FLOOR/CEIL, SQRT/POW, SIGN, MOD,
+COALESCE, IFNULL, NULLIF, IF, GREATEST/LEAST — с NULL-семантикой MySQL.
+Гейт дополнительно подставляет `NOW()` в DML.
+
+Установка проще, чем MySQL: не нужен `mysql_install_db`, интерактивный
+`mysql_secure_installation`, выбор root-пароля и создание БД/пользователя —
+одна команда поднимает сервер с готовой схемой WordPress и печатает блок
+`wp-config.php`. Скрипт `scripts/install.sh` ставит бинарь + systemd-юнит.
 
 ## 4. Пробелы движка (чек-лист из аудита)
 
@@ -245,5 +305,6 @@ cargo build --release --features cms   # бинарь CMS-редакции
 cargo test --features cms              # полный набор + cms-тесты
 ```
 
-Планируемое имя бинаря при фазе 1: `dna-db-cmsd` (обёртка над main.rs с
-пресетами WP/Joomla-схем и autocommit-профилем PHP-FPM).
+Реализовано (2026-11): режим `mysqld` того же бинаря —
+`dna-db-core mysqld` (универсальный MySQL-шлюз, см. §3.1). Отдельный
+бинарь `dna-db-cmsd` больше не планируется: не нужен.

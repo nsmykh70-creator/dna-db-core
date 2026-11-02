@@ -478,6 +478,20 @@ fn expr(e: &Expr) -> Result<String, String> {
             expr(inner)?,
             ty.as_str()
         )),
+        Expr::Fn { name, args } => {
+            // DnaQL has no function grammar: constant-only calls are folded
+            // to their value; anything referencing columns is refused with
+            // the standard "not expressible in DnaQL" guidance.
+            let vals: Vec<Option<Value>> = args.iter().map(|a| a.eval(&Default::default())).collect();
+            if !vals.iter().any(|v| v.is_none()) {
+                if let Some(v) = crate::expr::eval_for_translator(name, &vals) {
+                    return literal(&v);
+                }
+            }
+            Err(format!(
+                "SQL→DnaQL: function {name}() over columns is not expressible in DnaQL;                  compute it in SQL or fold constant arguments"
+            ))
+        }
     }
 }
 

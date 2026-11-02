@@ -132,6 +132,15 @@ enum Command {
         /// (psql, DBeaver, pgAdmin, psycopg2, JDBC, Prisma, Drizzle). 0 = off.
         #[arg(long, default_value_t = 5432)]
         pgwire_port: u16,
+        /// CMS edition: MySQL wire protocol listener (mysqli, PDO, wp-cli,
+        /// mysql client, mysqldump — everything that speaks MySQL). 0 = off.
+        #[arg(long, default_value_t = 3306)]
+        mysql_port: u16,
+        /// CMS edition: MySQL listener auth. Repeatable user[:pass] pairs;
+        /// when absent the listener trusts any login (like
+        /// --skip-grant-tables) and prints a warning.
+        #[arg(long = "mysql-user", value_name = "USER[:PASS]")]
+        mysql_users: Vec<String>,
     },
     /// Run real throughput/latency benchmarks and print results
     Bench {
@@ -262,6 +271,33 @@ enum Command {
         #[arg(long, default_value_t = false)]
         restore: bool,
     },
+    /// CMS edition: MySQL-compatible server mode. Listens on 3306 like
+    /// mysqld and speaks the MySQL wire protocol (mysqli, PDO, wp-cli,
+    /// mysqldump, any CMS). The simplest way to serve MySQL-based sites on
+    /// DNA-DB — no drop-in files, no driver changes, just point DB_HOST at
+    /// this host.
+    #[cfg(feature = "cms")]
+    Mysqld {
+        #[arg(long, default_value = "./dna_data")]
+        data_dir: String,
+        #[arg(long, default_value = "0.0.0.0")]
+        bind: String,
+        #[arg(long, default_value_t = 3306)]
+        port: u16,
+        /// Login accepted by the wire listener. Repeatable user[:pass];
+        /// default is root with no password (trust mode with a warning).
+        #[arg(long = "user", value_name = "USER[:PASS]", default_value = "root")]
+        users: Vec<String>,
+        /// Accept ANY user/password (like --skip-grant-tables). Explicit opt-in.
+        #[arg(long, default_value_t = false)]
+        trust: bool,
+        /// Bootstrap the WordPress core schema (12 tables) on startup.
+        #[arg(long, default_value_t = false)]
+        wordpress: bool,
+        /// Batched WAL sync (fast dev mode). Default keeps fsync-per-write.
+        #[arg(long, default_value = "strict")]
+        sync: SyncArg,
+    },
 }
 
 fn sync_arg_to_mode(mode: &SyncArg) -> SyncMode {
@@ -299,7 +335,11 @@ fn main() {
             proxy_auth_secret_header,
             proxy_auth_secret,
             pgwire_port,
+            mysql_port,
+            mysql_users,
         } => {
+            #[cfg(not(feature = "cms"))]
+            let _ = (mysql_port, mysql_users);
             let admin_pass_supplied = admin_pass
                 .clone()
                 .or_else(|| std::env::var("DNA_DB_ADMIN_PASS").ok())
@@ -385,9 +425,29 @@ fn main() {
                 encryption_key_file.as_deref(),
                 proxy,
                 *pgwire_port,
+                *mysql_port,
+                mysql_users,
             )
         }
         Command::Bench { data_dir, ops } => run_bench(data_dir, *ops),
+        #[cfg(feature = "cms")]
+        Command::Mysqld {
+            data_dir,
+            bind,
+            port,
+            users,
+            trust,
+            wordpress,
+            sync,
+        } => run_mysqld(
+            data_dir,
+            bind,
+            *port,
+            users,
+            *trust,
+            *wordpress,
+            sync_arg_to_mode(sync),
+        ),
         Command::Shell {
             host,
             port,
@@ -903,6 +963,10 @@ fn run_server(
     encryption_key_file: Option<&str>,
     proxy_auth: Option<dna_db_core::admin::ProxyAuthConfig>,
     pgwire_port: u16,
+    #[allow(unused_variables)]
+    mysql_port: u16,
+    #[allow(unused_variables)]
+    mysql_users: &[String],
 ) -> i32 {
     let data_path = std::path::Path::new(data_dir);
     if let Err(e) = std::fs::create_dir_all(data_path) {
@@ -1064,6 +1128,61 @@ fn run_server(
             .spawn(move || {
                 if let Err(e) = pg.serve(&pg_bind, pgwire_port, pg_sql) {
                     eprintln!("[PGWIRE] listener stopped: {e}");
+                }
+            })
+            .ok();
+    }
+
+    // CMS edition: MySQL wire listener on 3306 — the universal adapter for
+    // every MySQL-based CMS (mysqli / PDO / wp-cli / mysqldump). Everything
+    // is served by the shared MySQL-dialect gate.
+    #[cfg(feature = "cms")]
+    if mysql_port != 0 {
+        let auth = if mysql_users.is_empty() {
+            eprintln!(
+                "[MYSQLWIRE] WARNING: no --mysql-user configured; the listener accepts ANY login (--skip-grant-tables mode)"
+            );
+            dna_db_core::cms::MySqlAuth::Trust
+        } else {
+            let mut map = std::collections::HashMap::new();
+            for spec in mysql_users {
+                match spec.split_once(':') {
+                    Some((u, p)) => {
+                        map.insert(u.to_string(), p.to_string());
+                    }
+                    None => {
+                        map.insert(spec.clone(), String::new());
+                    }
+                }
+            }
+            dna_db_core::cms::MySqlAuth::Users(map)
+        };
+        let mysqld = dna_db_core::cms::MySqlWireServer::new(auth);
+        let mysql_gate = match cms_gate.clone() {
+            Some(g) => g,
+            None => {
+                eprintln!("[FATAL] MySQL listener requires the cms feature gate");
+                return 2;
+            }
+        };
+        let mysql_bind = bind_address.to_string();
+        std::thread::Builder::new()
+            .name("mysqlwire-accept".into())
+            .spawn(move || {
+                let listener = match std::net::TcpListener::bind((mysql_bind.as_str(), mysql_port))
+                {
+                    Ok(l) => l,
+                    Err(e) => {
+                        eprintln!("[MYSQLWIRE] cannot bind {mysql_bind}:{mysql_port}: {e}");
+                        return;
+                    }
+                };
+                eprintln!(
+                    "[MYSQLWIRE] MySQL wire protocol listening on {mysql_bind}:{mysql_port} (mysqli / PDO / wp-cli ready, reports as {})",
+                    dna_db_core::cms::compat::MYSQL_COMPAT_VERSION
+                );
+                if let Err(e) = mysqld.serve(listener, mysql_gate) {
+                    eprintln!("[MYSQLWIRE] listener stopped: {e}");
                 }
             })
             .ok();
@@ -1261,6 +1380,132 @@ fn seed_demo_data(engine: &Arc<Engine>) {
     }
     let _ = engine.write_batch(&batch);
     eprintln!("[DEMO] seeded chr_users (3), chr_orders (3), chr_patients (2), chr_variants (3)");
+}
+
+/// CMS edition `mysqld` mode: the minimal MySQL-compatible server.
+///
+/// Deliberately has NONE of the full server's ceremony (no bootstrap admin
+/// password, no admin panel, no TLS material): one flag set, one listener on
+/// 3306, ready for WordPress/WooCommerce/Joomla `DB_HOST`. Storage keeps the
+/// production defaults (Strict fsync, Reed–Solomon RS(4+2), scrubber on);
+/// encryption at rest is inherited from the data directory key if present.
+#[cfg(feature = "cms")]
+fn run_mysqld(
+    data_dir: &str,
+    bind: &str,
+    port: u16,
+    users: &[String],
+    trust: bool,
+    wordpress: bool,
+    sync_mode: dna_db_core::wal::SyncMode,
+) -> i32 {
+    use dna_db_core::cms::compat::{CmsSqlGate, MYSQL_COMPAT_VERSION};
+    use dna_db_core::cms::{MySqlAuth, MySqlWireServer};
+    use dna_db_core::sql_engine::SqlEngine;
+
+    let data_path = std::path::Path::new(data_dir);
+    if let Err(e) = std::fs::create_dir_all(data_path) {
+        eprintln!("[FATAL] cannot create data dir {data_dir:?}: {e}");
+        return 2;
+    }
+    let _dir_lock = match acquire_dir_lock(data_path, "mysqld") {
+        Ok(lock) => lock,
+        Err(message) => {
+            eprintln!("[FATAL] {message}");
+            return 2;
+        }
+    };
+
+    let engine = match dna_db_core::Engine::open(dna_db_core::EngineConfig {
+        dir_path: data_path.to_path_buf(),
+        sync_mode,
+        ..dna_db_core::EngineConfig::default()
+    }) {
+        Ok(engine) => engine,
+        Err(e) => {
+            eprintln!("[FATAL] cannot open data dir {data_dir:?}: {e}");
+            return 2;
+        }
+    };
+    let sql = Arc::new(SqlEngine::new(engine));
+    let gate = Arc::new(CmsSqlGate::new(sql));
+
+    eprintln!("[MYSQLD] {}", dna_db_core::cms::edition_banner());
+    eprintln!("[MYSQLD] server version {MYSQL_COMPAT_VERSION} (MySQL wire protocol 4.1)");
+    eprintln!("[MYSQLD] data directory {data_dir:?}");
+
+    if wordpress {
+        let total = dna_db_core::cms::wordpress::WP_CORE_TABLES.len();
+        match gate.bootstrap_wordpress() {
+            Ok(created) => {
+                eprintln!("[MYSQLD] WordPress core schema ready ({created} table(s) created, {total} core tables registered)");
+            }
+            Err(e) => {
+                eprintln!("[FATAL] WordPress bootstrap failed: {e}");
+                return 2;
+            }
+        }
+    }
+
+    let auth = if trust || users.is_empty() {
+        eprintln!(
+            "[MYSQLD] WARNING: accepting ANY login (--skip-grant-tables). \
+             Set --user root:secret (repeatable) to require a password."
+        );
+        MySqlAuth::Trust
+    } else {
+        let mut map = std::collections::HashMap::new();
+        for spec in users {
+            match spec.split_once(':') {
+                Some((u, p)) => {
+                    map.insert(u.to_string(), p.to_string());
+                }
+                None => {
+                    map.insert(spec.clone(), String::new());
+                }
+            }
+        }
+        let names: Vec<String> = map.keys().cloned().collect();
+        eprintln!("[MYSQLD] auth: users {names:?} (mysql_native_password)");
+        MySqlAuth::Users(map)
+    };
+
+    let listener = match std::net::TcpListener::bind((bind, port)) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("[FATAL] cannot bind {bind}:{port}: {e}");
+            return 2;
+        }
+    };
+    let user_hint = if trust || users.is_empty() {
+        "anything".to_string()
+    } else {
+        users
+            .first()
+            .and_then(|u| u.split(':').next())
+            .unwrap_or("root")
+            .to_string()
+    };
+    eprintln!("[MYSQLD] ready for connections on {bind}:{port}");
+    eprintln!("[MYSQLD] ---- wp-config.php ----");
+    eprintln!("define( 'DB_NAME', 'wordpress' );");
+    eprintln!("define( 'DB_USER', '{user_hint}' );");
+    eprintln!(
+        "define( 'DB_PASSWORD', '{}' );",
+        if trust || users.is_empty() { "anything" } else { "***" }
+    );
+    eprintln!(
+        "define( 'DB_HOST', '{}:{port}' );",
+        if bind == "0.0.0.0" { "127.0.0.1" } else { bind }
+    );
+    eprintln!("[MYSQLD] -----------------------");
+
+    let server = Arc::new(MySqlWireServer::new(auth));
+    if let Err(e) = server.serve(listener, gate) {
+        eprintln!("[FATAL] MySQL listener stopped: {e}");
+        return 2;
+    }
+    0
 }
 
 fn run_bench(data_dir: &str, ops: usize) -> i32 {

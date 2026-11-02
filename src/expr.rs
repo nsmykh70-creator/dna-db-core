@@ -76,6 +76,13 @@ pub enum Expr {
         inner: Box<Expr>,
         ty: CastTy,
     },
+    /// CMS edition: MySQL scalar function call — `CONCAT(a, b)`, `UPPER(x)`,
+    /// `IFNULL(a, b)`, `ROUND(x, d)`, … evaluated row-by-row with MySQL NULL
+    /// semantics (see `eval_scalar_fn`). The name is stored uppercase.
+    Fn {
+        name: String,
+        args: Vec<Expr>,
+    },
 }
 
 /// Target type of a `CAST(expr AS type)` conversion.
@@ -94,6 +101,40 @@ impl CastTy {
             CastTy::Char => "CHAR",
         }
     }
+}
+
+/// The scalar functions the engine evaluates natively (CMS edition). The
+/// set covers what WordPress / WooCommerce / Joomla / generic MySQL apps
+/// call most: string building, case folding, length, trimming, substring
+/// extraction, padding, numeric rounding and NULL handling.
+pub fn is_scalar_fn(name: &str) -> bool {
+    matches!(
+        name.to_ascii_uppercase().as_str(),
+        "CONCAT"
+            | "CONCAT_WS"
+            | "UPPER" | "UCASE"
+            | "LOWER" | "LCASE"
+            | "LENGTH"
+            | "CHAR_LENGTH" | "CHARACTER_LENGTH"
+            | "TRIM" | "LTRIM" | "RTRIM"
+            | "SUBSTRING" | "SUBSTR" | "MID"
+            | "REPLACE"
+            | "LEFT" | "RIGHT"
+            | "REVERSE"
+            | "LPAD" | "RPAD"
+            | "REPEAT"
+            | "ABS"
+            | "ROUND"
+            | "FLOOR" | "CEIL" | "CEILING"
+            | "SQRT" | "POW" | "POWER"
+            | "SIGN"
+            | "MOD"
+            | "COALESCE"
+            | "IFNULL" | "NVL"
+            | "NULLIF"
+            | "IF"
+            | "GREATEST" | "LEAST"
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,6 +276,13 @@ impl Expr {
                 };
                 Some(Value::Int(res as i64))
             }
+            Expr::Fn { name, args } => {
+                let vals: Vec<Option<Value>> = args.iter().map(|a| a.eval(row)).collect();
+                // MySQL functions surface SQL NULL as a value (never as the
+                // engine's internal "no value" None): CONCAT('a', NULL) is
+                // NULL, not an absent cell.
+                Some(eval_scalar_fn(name, &vals).unwrap_or(Value::Null))
+            }
         }
     }
 
@@ -290,6 +338,14 @@ impl Expr {
             Expr::Cast { inner, ty } => {
                 format!("CAST({} AS {})", inner.describe(), ty.as_str())
             }
+            Expr::Fn { name, args } => format!(
+                "{}({})",
+                name,
+                args.iter()
+                    .map(|a| a.describe())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         }
     }
 
@@ -325,6 +381,11 @@ impl Expr {
             }
             Expr::Like { operand, .. } => operand.collect_columns(out),
             Expr::Cast { inner, .. } => inner.collect_columns(out),
+            Expr::Fn { args, .. } => {
+                for a in args {
+                    a.collect_columns(out);
+                }
+            }
         }
     }
 }
@@ -461,8 +522,412 @@ fn is_truthy(v: &Value) -> bool {
     }
 }
 
+/// Textual rendering used by the string functions (MySQL converts numbers
+/// to their shortest text form inside CONCAT/UPPER/…).
+fn fn_to_text(v: &Value) -> String {
+    match v {
+        Value::Int(i) => i.to_string(),
+        Value::Float(f) => format!("{f}"),
+        Value::Text(s) | Value::Dna(s) => s.clone(),
+        Value::Null => String::new(),
+    }
+}
+
+fn fn_as_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::Int(i) => Some(*i as f64),
+        Value::Float(f) => Some(*f),
+        // MySQL coerces numeric-looking text in numeric contexts.
+        Value::Text(s) | Value::Dna(s) => s.trim().parse::<f64>().ok(),
+        Value::Null => None,
+    }
+}
+
+/// Public wrapper for the SQL→DnaQL translator: evaluate a function over
+/// already-computed argument values (constant folding path).
+pub fn eval_for_translator(name: &str, vals: &[Option<Value>]) -> Option<Value> {
+    eval_scalar_fn(name, vals)
+}
+
+/// MySQL scalar function evaluation (CMS edition). NULL semantics follow
+/// the server: most functions return NULL on any NULL input; COALESCE /
+/// IFNULL / CONCAT_WS / IF have their documented exceptions.
+#[allow(clippy::too_many_lines)]
+fn eval_scalar_fn(name: &str, vals: &[Option<Value>]) -> Option<Value> {
+    // eval() yields Option<Value> where BOTH None (no value) and
+    // Some(Value::Null) mean SQL NULL here — function NULL semantics must
+    // treat them identically (CONCAT('a', NULL) → NULL etc.).
+    let any_null = vals
+        .iter()
+        .any(|v| matches!(v, None | Some(Value::Null)));
+    let sql_non_null = |v: &Option<Value>| !matches!(v, None | Some(Value::Null));
+    let txt = |i: usize| vals.get(i).cloned().flatten().map(|v| fn_to_text(&v));
+    let num = |i: usize| vals.get(i).cloned().flatten().and_then(|v| fn_as_f64(&v));
+    let int = |i: usize| match vals.get(i).cloned().flatten() {
+        Some(Value::Int(i)) => Some(i),
+        Some(v) => fn_as_f64(&v).map(|f| f as i64),
+        None => None,
+    };
+    match name {
+        "CONCAT" => {
+            if any_null {
+                return Some(Value::Null);
+            }
+            Some(Value::Text(
+                (0..vals.len()).filter_map(txt).collect::<Vec<_>>().join(""),
+            ))
+        }
+        "CONCAT_WS" => {
+            // CONCAT_WS(NULL, ...) → NULL; NULL arguments are skipped.
+            let sep = txt(0)?;
+            let parts: Vec<String> = (1..vals.len())
+                .filter_map(|i| vals.get(i).cloned().flatten())
+                .filter(|v| !matches!(v, Value::Null))
+                .map(|v| fn_to_text(&v))
+                .collect();
+            Some(Value::Text(parts.join(&sep)))
+        }
+        "UPPER" | "UCASE" => txt(0).map(|s| Value::Text(s.to_uppercase())),
+        "LOWER" | "LCASE" => txt(0).map(|s| Value::Text(s.to_lowercase())),
+        "LENGTH" => txt(0).map(|s| Value::Int(s.len() as i64)),
+        "CHAR_LENGTH" | "CHARACTER_LENGTH" => {
+            txt(0).map(|s| Value::Int(s.chars().count() as i64))
+        }
+        "TRIM" => txt(0).map(|s| Value::Text(s.trim().to_string())),
+        "LTRIM" => txt(0).map(|s| Value::Text(s.trim_start().to_string())),
+        "RTRIM" => txt(0).map(|s| Value::Text(s.trim_end().to_string())),
+        "SUBSTRING" | "SUBSTR" | "MID" => {
+            let s = txt(0)?;
+            let chars: Vec<char> = s.chars().collect();
+            let pos = int(1)?;
+            // MySQL 1-based; negative pos counts from the end; 0 → ''.
+            let start = if pos > 0 {
+                (pos - 1) as usize
+            } else if pos < 0 {
+                let back = (-pos) as usize;
+                if back >= chars.len() {
+                    return Some(Value::Text(String::new()));
+                }
+                chars.len() - back
+            } else {
+                return Some(Value::Text(String::new()));
+            };
+            let end = match int(2) {
+                Some(len) if len <= 0 => start,
+                Some(len) => (start + len as usize).min(chars.len()),
+                None => chars.len(),
+            };
+            if start >= chars.len() || start >= end {
+                return Some(Value::Text(String::new()));
+            }
+            Some(Value::Text(chars[start..end].iter().collect()))
+        }
+        "REPLACE" => {
+            let (s, from, to) = (txt(0)?, txt(1)?, txt(2)?);
+            if from.is_empty() {
+                return Some(Value::Text(s));
+            }
+            Some(Value::Text(s.replace(&from, &to)))
+        }
+        "LEFT" => {
+            let s = txt(0)?;
+            let n = int(1)?;
+            if n <= 0 {
+                return Some(Value::Text(String::new()));
+            }
+            Some(Value::Text(
+                s.chars().take(n as usize).collect::<String>(),
+            ))
+        }
+        "RIGHT" => {
+            let s = txt(0)?;
+            let n = int(1)?;
+            if n <= 0 {
+                return Some(Value::Text(String::new()));
+            }
+            let chars: Vec<char> = s.chars().collect();
+            let take = (n as usize).min(chars.len());
+            Some(Value::Text(
+                chars[chars.len() - take..].iter().collect::<String>(),
+            ))
+        }
+        "REVERSE" => txt(0).map(|s| Value::Text(s.chars().rev().collect::<String>())),
+        "LPAD" | "RPAD" => {
+            let s = txt(0)?;
+            let target = int(1)? as usize;
+            let pad = txt(2)?;
+            if pad.is_empty() {
+                return Some(Value::Text(s));
+            }
+            let cur = s.chars().count();
+            if target <= cur {
+                let out: String = s.chars().take(target).collect();
+                return Some(Value::Text(out));
+            }
+            let fill: String = pad.chars().cycle().take(target - cur).collect();
+            Some(Value::Text(if name == "LPAD" {
+                format!("{fill}{s}")
+            } else {
+                format!("{s}{fill}")
+            }))
+        }
+        "REPEAT" => {
+            let s = txt(0)?;
+            let n = int(1)?;
+            if n <= 0 {
+                return Some(Value::Text(String::new()));
+            }
+            Some(Value::Text(s.repeat(n as usize)))
+        }
+        "ABS" => match vals.first().cloned().flatten() {
+            Some(Value::Int(i)) => Some(Value::Int(i.abs())),
+            Some(Value::Float(f)) => Some(Value::Float(f.abs())),
+            Some(v) => fn_as_f64(&v).map(|f| Value::Float(f.abs())),
+            None => None,
+        },
+        "ROUND" => {
+            let x = num(0)?;
+            let d = int(1).unwrap_or(0);
+            // MySQL rounds half away from zero.
+            let factor = 10f64.powi(d as i32);
+            let r = (x * factor).round() / factor;
+            if vals.first().cloned().flatten().is_some_and(|v| matches!(v, Value::Int(_))) && d <= 0 {
+                Some(Value::Int(r as i64))
+            } else {
+                Some(Value::Float(r))
+            }
+        }
+        "FLOOR" => num(0).map(|f| Value::Int(f.floor() as i64)),
+        "CEIL" | "CEILING" => num(0).map(|f| Value::Int(f.ceil() as i64)),
+        "SQRT" => num(0).and_then(|f| {
+            if f < 0.0 {
+                None // MySQL: negative input → NULL
+            } else {
+                Some(Value::Float(f.sqrt()))
+            }
+        }),
+        "POW" | "POWER" => num(0)?
+            .powf(num(1)?)
+            .try_into()
+            .ok()
+            .map(Value::Float),
+        "SIGN" => num(0).map(|f| Value::Int(f.signum() as i64)),
+        "MOD" => {
+            let (a, b) = (num(0)?, num(1)?);
+            if b == 0.0 {
+                return None;
+            }
+            if matches!(vals.first(), Some(Some(Value::Int(_))))
+                && matches!(vals.get(1), Some(Some(Value::Int(_))))
+            {
+                Some(Value::Int(a as i64 % b as i64))
+            } else {
+                Some(Value::Float(a % b))
+            }
+        }
+        "COALESCE" => vals
+            .iter()
+            .find(|v| sql_non_null(v))
+            .cloned()
+            .flatten()
+            .or(Some(Value::Null)),
+        "IFNULL" | "NVL" => {
+            let a = vals.first().cloned().flatten();
+            match a {
+                Some(v) if !matches!(v, Value::Null) => Some(v),
+                _ => Some(vals.get(1).cloned().flatten().unwrap_or(Value::Null)),
+            }
+        }
+        "NULLIF" => {
+            let (a, b) = (vals.first().cloned().flatten()?, vals.get(1).cloned().flatten()?);
+            if !a.is_null() && !b.is_null() && a.compare(&b) == std::cmp::Ordering::Equal {
+                Some(Value::Null)
+            } else {
+                Some(a)
+            }
+        }
+        "IF" => {
+            let cond = vals.first().cloned().flatten()?;
+            let branch = if is_truthy(&cond) { 1 } else { 2 };
+            vals.get(branch).cloned().flatten()
+        }
+        "GREATEST" | "LEAST" => {
+            if any_null {
+                return None;
+            }
+            let mut best = vals.first().cloned().flatten()?;
+            for v in &vals[1..] {
+                let v = v.clone()?;
+                let ord = v.compare(&best);
+                let take = match name {
+                    "GREATEST" => ord == std::cmp::Ordering::Greater,
+                    _ => ord == std::cmp::Ordering::Less,
+                };
+                if take {
+                    best = v;
+                }
+            }
+            Some(best)
+        }
+        _ => None, // is_scalar_fn gate keeps this unreachable
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn concat_null_semantics() {
+        let f = |args: Vec<Option<Value>>| {
+            eval_scalar_fn("CONCAT", &args).map(|v| match v {
+                Value::Text(s) => s,
+                Value::Null => "NULL".into(),
+                other => other.to_string(),
+            })
+        };
+        assert_eq!(
+            f(vec![Some(Value::Text("a".into())), None, Some(Value::Text("b".into()))]),
+            Some("NULL".into()),
+            "None arg → NULL"
+        );
+        assert_eq!(
+            f(vec![
+                Some(Value::Text("a".into())),
+                Some(Value::Null),
+                Some(Value::Text("b".into()))
+            ]),
+            Some("NULL".into()),
+            "Some(Null) arg → NULL (MySQL parity)"
+        );
+        assert_eq!(
+            f(vec![
+                Some(Value::Text("a".into())),
+                Some(Value::Int(1)),
+                Some(Value::Float(2.5))
+            ]),
+            Some("a12.5".into())
+        );
+    }
+
+    #[test]
+    fn fn_eval_through_expr() {
+        use std::collections::BTreeMap;
+        let r: BTreeMap<String, Value> = BTreeMap::new();
+        // CONCAT('днк', '-', 'тест')
+        let e = Expr::Fn {
+            name: "CONCAT".into(),
+            args: vec![
+                Expr::Literal(Value::Text("днк".into())),
+                Expr::Literal(Value::Text("-".into())),
+                Expr::Literal(Value::Text("тест".into())),
+            ],
+        };
+        assert_eq!(e.eval(&r), Some(Value::Text("днк-тест".into())));
+        // CONCAT with a NULL literal → NULL
+        let e = Expr::Fn {
+            name: "CONCAT".into(),
+            args: vec![
+                Expr::Literal(Value::Text("a".into())),
+                Expr::Literal(Value::Null),
+            ],
+        };
+        assert_eq!(e.eval(&r), Some(Value::Null));
+        // IFNULL(NULL, 'x') → 'x'; COALESCE(NULL, 'x', 'y') → 'x';
+        // IF(1>0, 'yes', 'no') → 'yes'
+        let e = Expr::Fn {
+            name: "IFNULL".into(),
+            args: vec![
+                Expr::Literal(Value::Null),
+                Expr::Literal(Value::Text("x".into())),
+            ],
+        };
+        assert_eq!(e.eval(&r), Some(Value::Text("x".into())));
+        let e = Expr::Fn {
+            name: "COALESCE".into(),
+            args: vec![
+                Expr::Literal(Value::Null),
+                Expr::Literal(Value::Text("x".into())),
+                Expr::Literal(Value::Text("y".into())),
+            ],
+        };
+        assert_eq!(e.eval(&r), Some(Value::Text("x".into())));
+        let e = Expr::Fn {
+            name: "IF".into(),
+            args: vec![
+                Expr::Cmp {
+                    op: CmpOp::Gt,
+                    left: Box::new(Expr::Literal(Value::Int(1))),
+                    right: Box::new(Expr::Literal(Value::Int(0))),
+                },
+                Expr::Literal(Value::Text("yes".into())),
+                Expr::Literal(Value::Text("no".into())),
+            ],
+        };
+        assert_eq!(e.eval(&r), Some(Value::Text("yes".into())));
+    }
+
+    #[test]
+    fn fn_string_numeric_basics() {
+        use std::collections::BTreeMap;
+        let r: BTreeMap<String, Value> = BTreeMap::new();
+        let ev = |name: &str, args: Vec<Expr>| -> Option<Value> {
+            Expr::Fn {
+                name: name.into(),
+                args,
+            }
+            .eval(&r)
+        };
+        let t = |s: &str| Expr::Literal(Value::Text(s.into()));
+        let i = |n: i64| Expr::Literal(Value::Int(n));
+        assert_eq!(ev("UPPER", vec![t("abc")]), Some(Value::Text("ABC".into())));
+        assert_eq!(ev("LOWER", vec![t("ABC")]), Some(Value::Text("abc".into())));
+        assert_eq!(ev("CHAR_LENGTH", vec![t("днк")]), Some(Value::Int(3)));
+        assert_eq!(ev("LENGTH", vec![t("днк")]), Some(Value::Int(6)));
+        assert_eq!(ev("TRIM", vec![t("  x  ")]), Some(Value::Text("x".into())));
+        assert_eq!(
+            ev("SUBSTRING", vec![t("wordpress"), i(1), i(3)]),
+            Some(Value::Text("wor".into()))
+        );
+        assert_eq!(
+            ev("SUBSTRING", vec![t("wordpress"), i(-5)]),
+            Some(Value::Text("press".into()))
+        );
+        assert_eq!(
+            ev("REPLACE", vec![t("a-b-c"), t("-"), t("+")]),
+            Some(Value::Text("a+b+c".into()))
+        );
+        assert_eq!(ev("LEFT", vec![t("hello"), i(2)]), Some(Value::Text("he".into())));
+        assert_eq!(ev("RIGHT", vec![t("hello"), i(2)]), Some(Value::Text("lo".into())));
+        assert_eq!(ev("ABS", vec![i(-5)]), Some(Value::Int(5)));
+        assert_eq!(ev("ROUND", vec![Expr::Literal(Value::Float(2.5))]), Some(Value::Float(3.0)));
+        assert_eq!(ev("FLOOR", vec![Expr::Literal(Value::Float(2.9))]), Some(Value::Int(2)));
+        assert_eq!(ev("CEIL", vec![Expr::Literal(Value::Float(2.1))]), Some(Value::Int(3)));
+        assert_eq!(ev("SQRT", vec![i(-1)]), Some(Value::Null));
+        assert_eq!(
+            ev("CONCAT_WS", vec![t(","), t("a"), Value::Null.into_lit(), t("b")]),
+            Some(Value::Text("a,b".into()))
+        );
+        assert_eq!(
+            ev("GREATEST", vec![i(3), i(9), i(1)]),
+            Some(Value::Int(9))
+        );
+        assert_eq!(ev("LEAST", vec![i(3), i(9), i(1)]), Some(Value::Int(1)));
+        // NULLIF('a', 'a') → NULL; NULLIF('a', 'b') → 'a'
+        assert_eq!(ev("NULLIF", vec![t("a"), t("a")]), Some(Value::Null));
+        assert_eq!(ev("NULLIF", vec![t("a"), t("b")]), Some(Value::Text("a".into())));
+        assert_eq!(eval_scalar_fn("NOPE", &[]), None);
+    }
+
+    trait IntoLit {
+        fn into_lit(self) -> Expr;
+    }
+    impl IntoLit for Value {
+        fn into_lit(self) -> Expr {
+            Expr::Literal(self)
+        }
+    }
+
     use super::*;
     use std::collections::BTreeMap;
 
