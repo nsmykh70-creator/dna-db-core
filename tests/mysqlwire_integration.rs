@@ -571,6 +571,35 @@ fn mysqlwire_full_flow() {
         other => panic!("dup entry → {other:?}"),
     }
 
+    // ---- inline key forms (Joomla/OpenCart style DDL):
+    // `AUTO_INCREMENT PRIMARY KEY`, inline UNIQUE KEY, bare inline KEY ----
+    match c.query(
+        "CREATE TABLE wp_inline (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, slug VARCHAR(64) UNIQUE KEY, tag VARCHAR(32) KEY)",
+    ) {
+        QueryResponse::Ok { .. } => {}
+        other => panic!("CREATE inline keys → {other:?}"),
+    }
+    match c.query("INSERT INTO wp_inline (slug, tag) VALUES ('a', 'x')") {
+        QueryResponse::Ok {
+            affected_rows,
+            last_insert_id,
+        } => {
+            assert_eq!(affected_rows, 1);
+            assert_eq!(last_insert_id, 1);
+        }
+        other => panic!("INSERT inline → {other:?}"),
+    }
+    // inline PRIMARY KEY is a real PK: explicit duplicate id must 1062
+    match c.query("INSERT INTO wp_inline (id, slug, tag) VALUES (1, 'b', 'y')") {
+        QueryResponse::Err { errno, .. } => assert_eq!(errno, 1062),
+        other => panic!("inline PK dup → {other:?}"),
+    }
+    // inline UNIQUE KEY is enforced
+    match c.query("INSERT INTO wp_inline (slug, tag) VALUES ('a', 'z')") {
+        QueryResponse::Err { errno, .. } => assert_eq!(errno, 1062),
+        other => panic!("inline UNIQUE dup → {other:?}"),
+    }
+
     // ---- COMMIT without a transaction is a silent no-op (MySQL parity) ----
     match c.query("COMMIT") {
         QueryResponse::Ok { .. } => {}

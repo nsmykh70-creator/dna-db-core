@@ -1922,6 +1922,37 @@ impl SParser {
                             t.auto_increment_column = Some(col.clone());
                             continue;
                         }
+                        // MySQL inline key forms after the type: `id BIGINT
+                        // AUTO_INCREMENT PRIMARY KEY`, `slug VARCHAR(64)
+                        // UNIQUE KEY`, `uid INT KEY`. Inline PRIMARY KEY
+                        // promotes the column to the table PK; inline
+                        // KEY/UNIQUE KEY go through the secondary-index path
+                        // (same as table-level constraints).
+                        if self.kw("PRIMARY") {
+                            self.expect_kw("KEY")?;
+                            t.primary_locus_column = col.clone();
+                            continue;
+                        }
+                        if self.kw("UNIQUE") {
+                            let _ = self.kw("KEY") || self.kw("INDEX");
+                            let idx_name = format!("{}_{}_uniq", t.name, col);
+                            t.secondary_indexes.push(SecondaryIndexMeta {
+                                name: idx_name,
+                                column: col.clone(),
+                                unique: true,
+                            });
+                            continue;
+                        }
+                        if self.kw("KEY") || self.kw("FULLTEXT") || self.kw("SPATIAL") {
+                            let _ = self.kw("KEY") || self.kw("INDEX");
+                            let idx_name = format!("{}_{}_idx", t.name, col);
+                            t.secondary_indexes.push(SecondaryIndexMeta {
+                                name: idx_name,
+                                column: col.clone(),
+                                unique: false,
+                            });
+                            continue;
+                        }
                         if self.kw("DEFAULT") {
                             default = Some(match self.peek().clone() {
                                 STok::Str(s) => {
