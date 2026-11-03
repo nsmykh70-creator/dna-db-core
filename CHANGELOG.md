@@ -2,6 +2,25 @@
 
 ## Unreleased (CMS Edition — branch `cms-edition`)
 
+### Installer: prebuilt fast path + uninstall + containers (2026-11-03)
+
+- `scripts/install.sh` no longer requires Rust: it downloads the
+  sha256-verified prebuilt x86_64 binary (`prebuilt/linux-x86_64/dna-db-core`
+  + `SHA256SUMS`, rebuilt at v4.0.0 with the cms feature — the old artifact
+  was stale v2.1.0 without `mysqld`) and falls back to a cargo build only
+  when the prebuilt is unavailable (non-x86_64, blocked mirror).
+  `PREBUILT_URL_BASE` env overrides the mirror (air-gapped hosts, forks).
+- `--uninstall` flag (stop + remove unit/binary, data dir kept); Docker/WSL
+  without a running systemd: automatic nohup+pidfile mode instead of the
+  unit (`kill $(cat <data-dir>/dna-db.pid)` stops it); robust active-wait
+  loop; shell-quoted ExecStart (password-safe); fixed the `DB_HOST` hint
+  that echoed a constant.
+- Wire dialect gap found by the installer probe and fixed: inline key
+  forms in CREATE TABLE — `id BIGINT AUTO_INCREMENT PRIMARY KEY`,
+  inline `UNIQUE KEY` and bare inline `KEY` now parse and are enforced
+  (PRIMARY KEY promotes the column; UNIQUE duplicates → errno 1062)
+  (`tests/mysqlwire_integration.rs`, `wp_inline` block).
+
 ### MySQL wire adapter vs real CMS: full E2E + benchmarks + security (2026-11-02)
 
 The wire adapter was validated end-to-end against REAL applications, with

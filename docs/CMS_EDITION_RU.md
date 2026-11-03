@@ -109,7 +109,10 @@ COALESCE, IFNULL, NULLIF, IF, GREATEST/LEAST — с NULL-семантикой My
 Установка проще, чем MySQL: не нужен `mysql_install_db`, интерактивный
 `mysql_secure_installation`, выбор root-пароля и создание БД/пользователя —
 одна команда поднимает сервер с готовой схемой WordPress и печатает блок
-`wp-config.php`. Скрипт `scripts/install.sh` ставит бинарь + systemd-юнит.
+`wp-config.php`. Скрипт `scripts/install.sh` ставит бинарь + systemd-юнит:
+пребилд x86_64 скачивается с проверкой SHA256 (Rust не нужен, фолбэк —
+cargo-сборка); в Docker/WSL без systemd — режим `nohup`+pidfile; есть
+`--uninstall`.
 
 ### Прогон №7 + E2E через wire + бенчмарки + security (2026-11-02)
 

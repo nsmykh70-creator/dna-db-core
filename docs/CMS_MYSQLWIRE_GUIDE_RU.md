@@ -60,15 +60,22 @@ DNA-движок (LSM + WAL + RS(4+2)) — то же хранилище, что 
 ### Вариант А — скрипт (Ubuntu/Debian, systemd)
 
 ```bash
-sudo apt install -y cargo git
 curl -fsSL https://raw.githubusercontent.com/nsmykh70-creator/dna-db-core/cms-edition/scripts/install.sh \
   | sudo bash -s -- --wordpress --user wp:сильный_пароль
 ```
 
-Скрипт сам: соберёт бинарник, положит его в `/usr/local/bin/dna-db-core`,
-создаст каталог данных `/var/lib/dna-db`, systemd-юнит на порту 3306 и
-запустит сервис. Ни `mysql_install_db`, ни `mysql_secure_installation`, ни
+Rust не нужен: скрипт скачивает пребилд-бинарник
+(`prebuilt/linux-x86_64`, проверка по `SHA256SUMS`) и кладёт его в
+`/usr/local/bin/dna-db-core`; если пребилд недоступен (не x86_64,
+зеркало закрыто) — соберёт из исходников через cargo. Дальше сам создаёт
+каталог данных `/var/lib/dna-db`, systemd-юнит на порту 3306 и запускает
+сервис. Ни `mysql_install_db`, ни `mysql_secure_installation`, ни
 `CREATE DATABASE`/`GRANT` — не нужны.
+
+Docker/WSL без работающего systemd: скрипт детектирует это и запускает
+сервер через `nohup` + pidfile (стоп: `kill $(cat /var/lib/dna-db/dna-db.pid)`,
+логи: `/var/lib/dna-db/dna-db.log`). Снос: тот же скрипт с флагом
+`--uninstall` (юнит и бинарь удаляются, данные остаются).
 
 ### Вариант Б — руками из исходников
 
