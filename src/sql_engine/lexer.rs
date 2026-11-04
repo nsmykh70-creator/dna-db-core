@@ -63,8 +63,22 @@ pub(super) fn stokenize(input: &str) -> Result<Vec<STok>, String> {
                 i += 1;
             }
             '/' => {
-                toks.push(STok::Slash);
-                i += 1;
+                // Block comments (`/* … */`, incl. `/*_*/` and
+                // `/*$wgDBTableOptions*/` hints in MediaWiki/Drupal dumps)
+                // are whitespace for the SQL grammar — skip them entirely.
+                // A bare `/` stays the division operator.
+                if input[i..].len() > 1 && input.as_bytes()[i + 1] == b'*' {
+                    i += 2;
+                    while i + 1 < input.len()
+                        && !(input.as_bytes()[i] == b'*' && input.as_bytes()[i + 1] == b'/')
+                    {
+                        i += 1;
+                    }
+                    i = (i + 2).min(input.len());
+                } else {
+                    toks.push(STok::Slash);
+                    i += 1;
+                }
             }
             '.' => {
                 toks.push(STok::Dot);

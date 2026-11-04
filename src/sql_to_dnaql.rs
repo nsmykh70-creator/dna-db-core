@@ -105,6 +105,7 @@ pub(crate) fn transpile(
             table,
             rows,
             on_conflict: _,
+            ignore: _,
         } => {
             let schema = schema_of(table)
                 .ok_or_else(|| format!("SQL→DnaQL: table '{}' does not exist", table))?;

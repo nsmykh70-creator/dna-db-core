@@ -60,8 +60,7 @@ impl SqlEngine {
             let rows = self.read_table_rows(&table.name)?;
             let mut index = self.complement_index.write();
             for row in rows {
-                let pk = Self::pk_of(table, &row)?;
-                let key = Self::row_key(&table.name, &pk);
+                let key = Self::row_key_from_row(&table.name, table, &row)?;
                 for fk in &table.foreign_keys {
                     if let Some(value) = row.get(&fk.column) {
                         if !value.is_null() {
@@ -384,15 +383,16 @@ impl SqlEngine {
             Stmt::ShowTables => self.exec_show_tables(),
             Stmt::ShowStorage { table, pk } => self.exec_show_storage(&table, pk.as_ref()),
             Stmt::Tx { action } => self.exec_tx(action, tx),
-            Stmt::Insert { table, rows, on_conflict } => {
+            Stmt::Insert { table, rows, on_conflict, ignore } => {
                 match tx {
                     Some(buf) if buf.active => {
                         let mut sink = SqlTxBuffer::default();
-                        let res = self.exec_insert_tx(&table, rows, on_conflict, Some(&mut sink))?;
+                        let res =
+                            self.exec_insert_tx(&table, rows, on_conflict, ignore, Some(&mut sink))?;
                         tx.as_mut().unwrap().ops.extend(sink.ops);
                         Ok(res)
                     }
-                    _ => self.exec_insert_tx(&table, rows, on_conflict, None),
+                    _ => self.exec_insert_tx(&table, rows, on_conflict, ignore, None),
                 }
             }
             Stmt::InsertSelect { table, cols, select } => {
@@ -419,11 +419,11 @@ impl SqlEngine {
                 match tx {
                     Some(buf) if buf.active => {
                         let mut sink = SqlTxBuffer::default();
-                        let res = self.exec_insert_tx(&table, rows, None, Some(&mut sink))?;
+                        let res = self.exec_insert_tx(&table, rows, None, false, Some(&mut sink))?;
                         tx.as_mut().unwrap().ops.extend(sink.ops);
                         Ok(res)
                     }
-                    _ => self.exec_insert_tx(&table, rows, None, None),
+                    _ => self.exec_insert_tx(&table, rows, None, false, None),
                 }
             }
             Stmt::Update {
@@ -1215,7 +1215,7 @@ impl SqlEngine {
             Stmt::DropColumn { table, column } => {
                 format!("AlterTable({} DROP COLUMN {})", table, column)
             }
-            Stmt::Insert { table, rows, on_conflict: _ } => {
+            Stmt::Insert { table, rows, on_conflict: _, ignore: _ } => {
                 format!("Insert({}, {} row(s))", table, rows.len())
             }
             Stmt::InsertSelect { table, select, .. } => {
@@ -1316,6 +1316,42 @@ impl SqlEngine {
     fn row_key(table: &str, pk: &Value) -> String {
         format!("{}:{}", table, pk)
     }
+    /// CMS edition: full PK column list of a table (composite-aware).
+    fn pk_cols(schema: &ChromosomeTable) -> Vec<String> {
+        if schema.primary_key_cols.is_empty() {
+            vec![schema.primary_locus_column.clone()]
+        } else {
+            schema.primary_key_cols.clone()
+        }
+    }
+    /// Storage key of a row: single-column PKs keep the historical
+    /// `<table>:<pk>` shape; composite PKs encode every key part
+    /// (`mw_l10n_cache:en:fallback`), so each key part pair is distinct.
+    fn row_key_from_row(
+        table: &str,
+        schema: &ChromosomeTable,
+        row: &BTreeMap<String, Value>,
+    ) -> Result<String, String> {
+        let cols = Self::pk_cols(schema);
+        if cols.len() == 1 {
+            let pk = row
+                .get(&cols[0])
+                .cloned()
+                .ok_or_else(|| format!("row missing PK column '{}'", cols[0]))?;
+            Ok(Self::row_key(table, &pk))
+        } else {
+            let mut parts = Vec::with_capacity(cols.len());
+            for c in &cols {
+                parts.push(
+                    row.get(c)
+                        .cloned()
+                        .ok_or_else(|| format!("row missing PK column '{}'", c))?
+                        .to_string(),
+                );
+            }
+            Ok(format!("{}:{}", table, parts.join(":")))
+        }
+    }
 
     fn read_table_rows(&self, table: &str) -> Result<Vec<BTreeMap<String, Value>>, String> {
         // v3.6: statement-scoped CTE tables take precedence over disk.
@@ -1375,33 +1411,46 @@ impl SqlEngine {
     // containing '<pk> = <literal>'. The full WHERE is still evaluated on the
     // fetched row(s) afterwards, so results are identical to SeqScan; only the
     // candidate set shrinks.
-    fn pk_eq_literals(expr: &Expr, pk_col: &str) -> Option<Vec<Value>> {
+    fn pk_eq_literals(expr: &Expr, pk_cols: &[String]) -> Option<Vec<Vec<Value>>> {
         match expr {
             Expr::Or(a, b) => {
-                let mut out = Self::pk_eq_literals(a, pk_col)?;
-                out.extend(Self::pk_eq_literals(b, pk_col)?);
+                let mut out = Self::pk_eq_literals(a, pk_cols)?;
+                out.extend(Self::pk_eq_literals(b, pk_cols)?);
                 Some(out)
             }
             _ => {
-                fn find(e: &Expr, pk_col: &str) -> Option<Value> {
+                fn find(e: &Expr, pk_cols: &[String], acc: &mut Vec<Value>) -> bool {
                     match e {
-                        Expr::And(a, b) => find(a, pk_col).or_else(|| find(b, pk_col)),
+                        Expr::And(a, b) => find(a, pk_cols, acc) | find(b, pk_cols, acc),
                         Expr::Cmp {
                             op: CmpOp::Eq,
                             left,
                             right,
                         } => {
-                            let lit = match (left.as_ref(), right.as_ref()) {
-                                (Expr::Column(c), Expr::Literal(v)) if c == pk_col => Some(v),
-                                (Expr::Literal(v), Expr::Column(c)) if c == pk_col => Some(v),
-                                _ => None,
-                            }?;
-                            (!lit.is_null()).then(|| lit.clone())
+                            for c in pk_cols {
+                                let lit = match (left.as_ref(), right.as_ref()) {
+                                    (Expr::Column(col), Expr::Literal(v)) if col == c => Some(v),
+                                    (Expr::Literal(v), Expr::Column(col)) if col == c => Some(v),
+                                    _ => None,
+                                };
+                                if let Some(lit) = lit {
+                                    if !lit.is_null() {
+                                        acc.push(lit.clone());
+                                        return true;
+                                    }
+                                }
+                            }
+                            false
                         }
-                        _ => None,
+                        _ => false,
                     }
                 }
-                find(expr, pk_col).map(|lit| vec![lit])
+                let mut acc = Vec::new();
+                if find(expr, pk_cols, &mut acc) && acc.len() == pk_cols.len() {
+                    Some(vec![acc])
+                } else {
+                    None
+                }
             }
         }
     }
@@ -1413,6 +1462,35 @@ impl SqlEngine {
         pk: &Value,
     ) -> Result<Option<BTreeMap<String, Value>>, String> {
         let key = Self::row_key(table, pk);
+        self.read_row_by_storage_key(table, &key)
+    }
+
+    /// Point lookup by a full PK tuple (composite-aware).
+    fn read_row_point_pk(
+        &self,
+        table: &str,
+        pks: &[Value],
+    ) -> Result<Option<BTreeMap<String, Value>>, String> {
+        let key = if pks.len() == 1 {
+            Self::row_key(table, &pks[0])
+        } else {
+            format!(
+                "{}:{}",
+                table,
+                pks.iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(":")
+            )
+        };
+        self.read_row_by_storage_key(table, &key)
+    }
+
+    fn read_row_by_storage_key(
+        &self,
+        table: &str,
+        key: &str,
+    ) -> Result<Option<BTreeMap<String, Value>>, String> {
         // Same visibility rule as read_table_rows: '<table>:schema' is meta.
         if key.ends_with(":schema") {
             return Ok(None);
@@ -1858,7 +1936,7 @@ impl SqlEngine {
             let col = &idx.column;
             let old_entry = old.and_then(|(table, row)| {
                 row.get(col).filter(|v| !v.is_null()).and_then(|v| {
-                    let row_key = Self::row_key(table, &Self::pk_of(schema, row).ok()?);
+                    let row_key = Self::row_key_from_row(table, schema, row).ok()?;
                     let mut key = index_prefix(table, col);
                     key.extend_from_slice(&escape_index_part(&encode_ordered_value(v)));
                     key.extend_from_slice(row_key.as_bytes());
@@ -1867,7 +1945,7 @@ impl SqlEngine {
             });
             let new_entry = new.and_then(|(table, row)| {
                 row.get(col).filter(|v| !v.is_null()).and_then(|v| {
-                    let row_key = Self::row_key(table, &Self::pk_of(schema, row).ok()?);
+                    let row_key = Self::row_key_from_row(table, schema, row).ok()?;
                     let mut key = index_prefix(table, col);
                     key.extend_from_slice(&escape_index_part(&encode_ordered_value(v)));
                     key.extend_from_slice(row_key.as_bytes());
@@ -1928,9 +2006,7 @@ impl SqlEngine {
             let mut batch: Vec<_> = rows
                 .iter()
                 .filter_map(|row| {
-                    Self::pk_of(&schema, row)
-                        .ok()
-                        .map(|pk| Self::row_key(table, &pk))
+                    Self::row_key_from_row(table, &schema, row).ok()
                 })
                 .map(|key| (crate::wal::WalOp::Delete, key.into_bytes(), None))
                 .collect();
@@ -1970,6 +2046,7 @@ impl SqlEngine {
         table: &str,
         rows: Vec<Vec<(String, Value)>>,
         on_conflict: Option<OnConflict>,
+        ignore: bool,
         mut sink: Option<&mut SqlTxBuffer>,
     ) -> Result<
         (
@@ -2099,12 +2176,16 @@ impl SqlEngine {
                 }
                 map
             };
-            let pk = Self::pk_of(&schema, &map)?;
-            let key = Self::row_key(table, &pk);
+            let key = Self::row_key_from_row(table, &schema, &map)?;
             if !seen_keys.insert(key.clone()) {
                 // v3.6: same statement hit the same PK — ON CONFLICT applies.
                 match on_conflict {
                     Some(OnConflict::DoNothing) => {
+                        skipped_conflicts += 1;
+                        continue;
+                    }
+                    None if ignore => {
+                        // INSERT IGNORE: uniqueness conflicts are skipped.
                         skipped_conflicts += 1;
                         continue;
                     }
@@ -2146,12 +2227,28 @@ impl SqlEngine {
                                             source
                                         )
                                     })?,
+                                UpsertValue::Column(source) => existing
+                                    .get(source)
+                                    .cloned()
+                                    .ok_or_else(|| {
+                                        format!(
+                                            "SQL: column '{}' not present in the conflicting row",
+                                            source
+                                        )
+                                    })?,
+                                UpsertValue::ColumnAdd { column, delta } => value_add(
+                                    existing
+                                        .get(column)
+                                        .cloned()
+                                        .unwrap_or(Value::Int(0)),
+                                    delta.clone(),
+                                )?,
                             };
                             existing.insert(col.clone(), v);
                         }
                         // PK must not change via DO UPDATE SET.
-                        let new_pk = Self::pk_of(&schema, &existing)?;
-                        if Self::row_key(table, &new_pk) != key {
+                        let new_table_key = Self::row_key_from_row(table, &schema, &existing)?;
+                        if new_table_key != key {
                             return Err(
                                 "SQL: ON CONFLICT DO UPDATE SET cannot change the primary key".into()
                             );
@@ -2175,6 +2272,11 @@ impl SqlEngine {
                         upserted += 1;
                         continue;
                     }
+                    None if ignore => {
+                        // INSERT IGNORE: existing row + no ON CONFLICT → skip.
+                        skipped_conflicts += 1;
+                        continue;
+                    }
                     None => return Err(format!("duplicate primary key in INSERT: {}", key)),
                 }
             }
@@ -2182,6 +2284,7 @@ impl SqlEngine {
             // of this same statement (via stmt_unique) and against rows that
             // already exist in the engine (via index scan).
             let mut handled_by_unique_upsert = false;
+            let mut ignore_skip = false;
             for idx in schema.secondary_indexes.iter().filter(|i| i.unique) {
                 let Some(v) = map.get(&idx.column) else {
                     continue;
@@ -2192,6 +2295,10 @@ impl SqlEngine {
                 let enc = encode_ordered_value(v);
                 if let Some(earlier) = stmt_unique.get(&(idx.column.clone(), enc.clone())) {
                     if earlier != &key {
+                        if ignore {
+                            ignore_skip = true;
+                            break;
+                        }
                         return Err(format!(
                             "UNIQUE constraint failed: {}.{} = {} (index '{}')",
                             table, idx.column, v, idx.name
@@ -2235,11 +2342,26 @@ impl SqlEngine {
                                             source
                                         )
                                     })?,
+                                UpsertValue::Column(source) => existing
+                                    .get(source)
+                                    .cloned()
+                                    .ok_or_else(|| {
+                                        format!(
+                                            "SQL: column '{}' not present in the conflicting row",
+                                            source
+                                        )
+                                    })?,
+                                UpsertValue::ColumnAdd { column, delta } => value_add(
+                                    existing
+                                        .get(column)
+                                        .cloned()
+                                        .unwrap_or(Value::Int(0)),
+                                    delta.clone(),
+                                )?,
                             };
                             existing.insert(col.clone(), nv);
                         }
-                        let new_pk = Self::pk_of(&schema, &existing)?;
-                        let new_key = Self::row_key(table, &new_pk);
+                        let new_key = Self::row_key_from_row(table, &schema, &existing)?;
                         if new_key.as_bytes() != row_key_bytes.as_slice() {
                             return Err(
                                 "SQL: ON DUPLICATE KEY UPDATE cannot change the primary key".into(),
@@ -2265,12 +2387,22 @@ impl SqlEngine {
                         handled_by_unique_upsert = true;
                         break;
                     }
+                    if ignore {
+                        // INSERT IGNORE: unique value already taken → skip.
+                        ignore_skip = true;
+                        break;
+                    }
                     return Err(format!(
                         "UNIQUE constraint failed: {}.{} = {} (index '{}')",
                         table, idx.column, v, idx.name
                     ));
                 }
                 stmt_unique.insert((idx.column.clone(), enc), key.clone());
+            }
+            if ignore_skip {
+                // INSERT IGNORE hit an existing unique value → skip the row.
+                skipped_conflicts += 1;
+                continue;
             }
             if handled_by_unique_upsert {
                 continue;
@@ -2288,6 +2420,7 @@ impl SqlEngine {
                 key.clone().into_bytes(),
                 Some(payload),
             ));
+            let pk = map.get(&schema.primary_locus_column).cloned().unwrap_or(Value::Int(0));
             inserted_keys.push((key, map, pk));
         }
 
@@ -2362,12 +2495,12 @@ impl SqlEngine {
         let where_clause = self.materialize_subqueries(where_clause)?;
         let pk_lits = where_clause
             .as_ref()
-            .and_then(|e| Self::pk_eq_literals(e, &schema.primary_locus_column));
+            .and_then(|e| Self::pk_eq_literals(e, &Self::pk_cols(&schema)));
         let rows: Vec<BTreeMap<String, Value>> = match &pk_lits {
             Some(lits) => {
                 let mut out = Vec::with_capacity(lits.len());
                 for lit in lits {
-                    if let Some(row) = self.read_row_point(table, lit)? {
+                    if let Some(row) = self.read_row_point_pk(table, &lit)? {
                         out.push(row);
                     }
                 }
@@ -2392,8 +2525,7 @@ impl SqlEngine {
             if !matches {
                 continue;
             }
-            let old_pk = Self::pk_of(&schema, &row)?;
-            let old_key = Self::row_key(table, &old_pk);
+            let old_key = Self::row_key_from_row(table, &schema, &row)?;
             let mut new_row = row.clone();
             for (col, e) in assignments {
                 // MySQL semantics: every SET rhs sees the row's OLD values
@@ -2408,8 +2540,7 @@ impl SqlEngine {
                 }
                 new_row.insert(col.clone(), v);
             }
-            let pk = Self::pk_of(&schema, &new_row)?;
-            let key = Self::row_key(table, &pk);
+            let key = Self::row_key_from_row(table, &schema, &new_row)?;
             affected_old_keys.insert(old_key.clone());
             changes.push((old_key, row, key, new_row));
         }
@@ -2471,10 +2602,8 @@ impl SqlEngine {
         for (old_key, old_row, new_key, new_row) in &changes {
             // Index delta: old value entry removed / new one added in the
             // same atomic batch as the row rewrite.
-            let old_pk = Self::pk_of(&schema, old_row)?;
-            let old_table_key = Self::row_key(&schema.name, &old_pk);
-            let new_pk = Self::pk_of(&schema, new_row)?;
-            let new_table_key = Self::row_key(&schema.name, &new_pk);
+            let old_table_key = Self::row_key_from_row(&schema.name, &schema, old_row)?;
+            let new_table_key = Self::row_key_from_row(&schema.name, &schema, new_row)?;
             let _ = (old_key, new_key);
             batch.extend(Self::index_delta_batch(
                 &schema,
@@ -2535,12 +2664,14 @@ impl SqlEngine {
                 .count();
         }
         let scan_op = match &pk_lits {
-            Some(lits) if lits.len() == 1 => format!("PointGet({} = {})", table, lits[0]),
+            Some(lits) if lits.len() == 1 && lits[0].len() == 1 => {
+                    format!("PointGet({} = {})", table, lits[0][0])
+                }
             Some(lits) => format!(
                 "PointGet({} IN ({}))",
                 table,
                 lits.iter()
-                    .map(|v| v.to_string())
+                    .map(|t| t.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(":"))
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
@@ -2579,12 +2710,12 @@ impl SqlEngine {
         let where_clause = self.materialize_subqueries(where_clause)?;
         let pk_lits = where_clause
             .as_ref()
-            .and_then(|e| Self::pk_eq_literals(e, &schema.primary_locus_column));
+            .and_then(|e| Self::pk_eq_literals(e, &Self::pk_cols(&schema)));
         let rows: Vec<BTreeMap<String, Value>> = match &pk_lits {
             Some(lits) => {
                 let mut out = Vec::with_capacity(lits.len());
                 for lit in lits {
-                    if let Some(row) = self.read_row_point(table, lit)? {
+                    if let Some(row) = self.read_row_point_pk(table, &lit)? {
                         out.push(row);
                     }
                 }
@@ -2657,12 +2788,14 @@ impl SqlEngine {
         let deleted = selected.len();
         let cascaded = deletions.len().saturating_sub(deleted);
         let scan_op = match &pk_lits {
-            Some(lits) if lits.len() == 1 => format!("PointGet({} = {})", table, lits[0]),
+            Some(lits) if lits.len() == 1 && lits[0].len() == 1 => {
+                    format!("PointGet({} = {})", table, lits[0][0])
+                }
             Some(lits) => format!(
                 "PointGet({} IN ({}))",
                 table,
                 lits.iter()
-                    .map(|v| v.to_string())
+                    .map(|t| t.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(":"))
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
@@ -2830,18 +2963,46 @@ impl SqlEngine {
             let next = if is_cross {
                 cross_join(&current, &right)
             } else {
+                // MySQL allows either orientation in ON (`a.x = b.y` or
+                // `b.y = a.x`); orient the pair by where the columns actually
+                // live. MediaWiki joins write the joined table first:
+                // `JOIN mw_actor user_actor ON user_actor.actor_user = user_id`
+                // — the reversed order used to produce an empty result.
+                let left_keys: std::collections::HashSet<String> = current
+                    .first()
+                    .map(|r| r.keys().cloned().collect())
+                    .unwrap_or_default();
+                let right_keys: std::collections::HashSet<String> = right
+                    .first()
+                    .map(|r| r.keys().cloned().collect())
+                    .unwrap_or_default();
+                let (lc, rc) = if left_keys.is_empty() || right_keys.is_empty() {
+                    (j.left_col.clone(), j.right_col.clone())
+                } else {
+                    fn bare(c: &str) -> &str {
+                        c.rsplit('.').next().unwrap_or(c)
+                    }
+                    let (lc, rc) = (bare(&j.left_col), bare(&j.right_col));
+                    let l_ok = left_keys.contains(lc) && right_keys.contains(rc);
+                    let r_ok = left_keys.contains(rc) && right_keys.contains(lc);
+                    if !l_ok && r_ok {
+                        (rc.to_string(), lc.to_string())
+                    } else {
+                        (lc.to_string(), rc.to_string())
+                    }
+                };
                 match j.join_type {
-                    JoinType::Inner => hash_join(&current, &right, &j.left_col, &j.right_col),
-                    JoinType::Left => hash_join_left(&current, &right, &j.left_col, &j.right_col),
+                    JoinType::Inner => hash_join(&current, &right, &lc, &rc),
+                    JoinType::Left => hash_join_left(&current, &right, &lc, &rc),
                     // RIGHT JOIN == LEFT JOIN with the sides swapped (the row
                     // model is single-namespace, so column naming is unchanged).
                     JoinType::Right => {
-                        hash_join_left(&right, &current, &j.right_col, &j.left_col)
+                        hash_join_left(&right, &current, &rc, &lc)
                     }
                     // FULL OUTER JOIN: left join + every right row that never
                     // matched, padded with NULLs on the left columns.
                     JoinType::Full => {
-                        hash_join_full(&current, &right, &j.left_col, &j.right_col)
+                        hash_join_full(&current, &right, &lc, &rc)
                     }
                 }
             };
@@ -3267,31 +3428,31 @@ impl SqlEngine {
         let schema = self.get_schema(from);
         if let Some(schema) = &schema {
             if let Some(lits) =
-                where_clause.and_then(|e| Self::pk_eq_literals(e, &schema.primary_locus_column))
+                where_clause.and_then(|e| Self::pk_eq_literals(e, &Self::pk_cols(&schema)))
             {
                 let mut lits = lits;
                 // CMS edition: PointGet keys must be encoded with the stored
                 // PK representation (read-side coercion mirrors write-side).
                 #[cfg(feature = "cms")]
-                if let Some(ct) = schema.columns.get(schema.primary_locus_column.as_str()) {
-                    for lit in lits.iter_mut() {
-                        *lit = Value::coerce_for_column(ct, lit.clone());
+                for lit in lits.iter_mut() {
+                    if let Some(ct) = schema.columns.get(schema.primary_locus_column.as_str()) {
+                        lit[0] = Value::coerce_for_column(ct, lit[0].clone());
                     }
                 }
                 let mut out = Vec::with_capacity(lits.len());
                 for lit in &lits {
-                    if let Some(row) = self.read_row_point(from, lit)? {
+                    if let Some(row) = self.read_row_point_pk(from, &lit)? {
                         out.push(row);
                     }
                 }
-                let plan = if lits.len() == 1 {
-                    format!("PointGet({} = {})", from, lits[0])
+                let plan = if lits.len() == 1 && lits[0].len() == 1 {
+                    format!("PointGet({} = {})", from, lits[0][0])
                 } else {
                     format!(
                         "PointGet({} IN ({}))",
                         from,
                         lits.iter()
-                            .map(|v| v.to_string())
+                            .map(|t| t.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(":"))
                             .collect::<Vec<_>>()
                             .join(", ")
                     )
@@ -3685,3 +3846,27 @@ impl SqlEngine {
 // Secondary-index planning helpers
 // ---------------------------------------------------------------------------
 
+
+/// Arithmetic for `ON DUPLICATE KEY UPDATE col = col + delta` counters
+/// (MediaWiki SiteStatsUpdate, WooCommerce stock/counter upserts).
+/// Int+Int stays Int; any Float operand promotes the result to Float.
+fn value_add(base: Value, delta: Value) -> Result<Value, String> {
+    match (base, delta) {
+        (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a.wrapping_add(b))),
+        (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a + b)),
+        (Value::Int(a), Value::Float(b)) => Ok(Value::Float(a as f64 + b)),
+        (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a + b as f64)),
+        (Value::Text(a), b) => {
+            // MySQL coerces numeric strings: '5'+1 -> 6.
+            let a = a.trim().parse::<i64>().ok();
+            match (a, b) {
+                (Some(a), Value::Int(d)) => Ok(Value::Int(a.wrapping_add(d))),
+                (Some(a), Value::Float(d)) => Ok(Value::Float(a as f64 + d)),
+                _ => Err("SQL: cannot add non-numeric values in upsert".into()),
+            }
+        }
+        (Value::Null, b) => Ok(b),
+        (a, Value::Null) => Ok(a),
+        _ => Err("SQL: cannot add non-numeric values in upsert".into()),
+    }
+}

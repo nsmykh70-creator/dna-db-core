@@ -332,6 +332,13 @@ pub struct ChromosomeTable {
     pub column_order: Vec<String>,
     pub foreign_keys: Vec<ForeignKeyConstraint>,
     pub primary_locus_column: String,
+    /// CMS edition: full PRIMARY KEY column list (composite-aware).
+    /// `primary_locus_column` stays the FIRST key part for native paths and
+    /// row keys of single-column tables are unchanged. Older persisted
+    /// schemas decode with an empty Vec — consumers fall back to
+    /// `[primary_locus_column]`.
+    #[serde(default)]
+    pub primary_key_cols: Vec<String>,
     /// Secondary indexes on non-PK columns (CREATE INDEX).
     /// Older persisted schemas decode with an empty list.
     #[serde(default)]
@@ -361,6 +368,7 @@ impl ChromosomeTable {
             column_order: Vec::new(),
             foreign_keys: Vec::new(),
             primary_locus_column: pk_col.into(),
+            primary_key_cols: Vec::new(),
             secondary_indexes: Vec::new(),
             auto_increment_column: None,
             column_defaults: BTreeMap::new(),

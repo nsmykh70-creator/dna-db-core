@@ -993,6 +993,8 @@ impl SParser {
     }
 
     fn parse_insert(&mut self, replace: bool) -> Result<Stmt, String> {
+        // `INSERT IGNORE INTO …` — MySQL skips uniqueness-conflicting rows.
+        let ignore = self.kw("IGNORE");
         self.expect_kw("INTO")?;
         let table = self.ident()?;
         self.expect(STok::LParen)?;
@@ -1039,6 +1041,7 @@ impl SParser {
                 table,
                 rows,
                 on_conflict,
+                ignore,
             });
         }
 
@@ -1108,6 +1111,7 @@ impl SParser {
             table,
             rows,
             on_conflict,
+            ignore,
         })
     }
 
@@ -1152,6 +1156,30 @@ impl SParser {
                         }
                         break;
                     }
+                }
+                // CMS edition: bare column ref with optional arithmetic —
+                // `c = c` or `c = c+1` (the existing row's value; MediaWiki
+                // SiteStatsUpdate upserts counters this way).
+                if let STok::Ident(src) = self.peek().clone() {
+                    self.next();
+                    if matches!(self.peek(), STok::Plus) {
+                        self.next();
+                        let delta = self.value()?;
+                        assignments.push((
+                            col,
+                            UpsertValue::ColumnAdd {
+                                column: src,
+                                delta,
+                            },
+                        ));
+                    } else {
+                        assignments.push((col, UpsertValue::Column(src)));
+                    }
+                    if matches!(self.peek(), STok::Comma) {
+                        self.next();
+                        continue;
+                    }
+                    break;
                 }
                 assignments.push((col, UpsertValue::Literal(self.value()?)));
                 if matches!(self.peek(), STok::Comma) {
@@ -1298,8 +1326,20 @@ impl SParser {
                 self.expect(STok::LParen)?;
                 let pk = self.ident()?;
                 // CMS edition: composite PRIMARY KEY (a, b) — the engine keys
-                // on the first column; extra key parts are consumed.
+                // on the first column for native paths; the full list is
+                // retained so row keys encode every key part (MediaWiki
+                // l10n_cache, Joomla session tables).
                 #[cfg(feature = "cms")]
+                {
+                    t.primary_key_cols = vec![pk.clone()];
+                    while matches!(self.peek(), STok::Comma) {
+                        self.next();
+                        let part = self.ident()?;
+                        self.consume_type_len()?;
+                        t.primary_key_cols.push(part);
+                    }
+                }
+                #[cfg(not(feature = "cms"))]
                 while matches!(self.peek(), STok::Comma) {
                     self.next();
                     let _ = self.ident()?;
@@ -1372,6 +1412,10 @@ impl SParser {
                         if self.kw("PRIMARY") {
                             self.expect_kw("KEY")?;
                             t.primary_locus_column = col.clone();
+                            #[cfg(feature = "cms")]
+                            {
+                                t.primary_key_cols = vec![col.clone()];
+                            }
                             continue;
                         }
                         if self.kw("UNIQUE") {
@@ -1468,6 +1512,13 @@ impl SParser {
         #[cfg(feature = "cms")]
         {
             loop {
+                // MySQL separates table options with commas too:
+                // `) ENGINE=InnoDB, DEFAULT CHARSET=binary` (MediaWiki's
+                // $wgDBTableOptions). Accept both spellings.
+                if matches!(self.peek(), STok::Comma) {
+                    self.next();
+                    continue;
+                }
                 // `=` is STok::Eq — kw() only matches Ident tokens, so Eq is
                 // consumed explicitly everywhere below.
                 if self.kw("ENGINE") {
@@ -1521,6 +1572,8 @@ impl SParser {
             self.consume_type_len()?;
             Ok(ColumnType::Int64)
         } else if self.kw("FLOAT") || self.kw("FLOAT64") || self.kw("DOUBLE") {
+            // MySQL synonym: `DOUBLE PRECISION` (MediaWiki page_random).
+            self.kw("PRECISION");
             Ok(ColumnType::Float64)
         } else if self.kw("TEXT") || self.kw("VARCHAR") || self.kw("STRING") {
             #[cfg(feature = "cms")]
@@ -1545,11 +1598,40 @@ impl SParser {
                 if self.kw("DATETIME") || self.kw("DATE") || self.kw("TIME") {
                     return Ok(ColumnType::Timestamp);
                 }
+                if self.kw("ENUM") || self.kw("SET") {
+                    // ENUM('a','b') / SET('x','y') — consume the balanced
+                    // value-list parens wholesale (they contain strings).
+                    if matches!(self.peek(), STok::LParen) {
+                        let mut depth = 0usize;
+                        loop {
+                            match self.next() {
+                                STok::LParen => depth += 1,
+                                STok::RParen => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        break;
+                                    }
+                                }
+                                STok::Eof => break,
+                                _ => {}
+                            }
+                        }
+                    }
+                    return Ok(ColumnType::Text);
+                }
                 if self.kw("LONGTEXT")
                     || self.kw("MEDIUMTEXT")
                     || self.kw("TINYTEXT")
                     || self.kw("CHAR")
                     || self.kw("BLOB")
+                    // MediaWiki 1.43 schema is BINARY-first: VARBINARY(32)
+                    // keys, BINARY(14) timestamps and *_blob fields all
+                    // round-trip as engine text/blob.
+                    || self.kw("VARBINARY")
+                    || self.kw("BINARY")
+                    || self.kw("TINYBLOB")
+                    || self.kw("MEDIUMBLOB")
+                    || self.kw("LONGBLOB")
                 {
                     self.consume_type_len()?;
                     return Ok(ColumnType::Text);
@@ -1796,6 +1878,10 @@ impl SParser {
             } else {
                 self.expect_kw("LIKE")?;
                 let pattern = self.like_pattern()?;
+                // `ESCAPE 'c'` tail — same treatment as the plain LIKE above.
+                if self.kw("ESCAPE") {
+                    let _ = self.like_pattern()?;
+                }
                 return Ok(Expr::Like {
                     operand: Box::new(left),
                     pattern,
@@ -1854,9 +1940,15 @@ impl SParser {
         }
         // MySQL `expr LIKE 'pattern'` (the `NOT` variant is handled in the
         // IN/NOT-IN block above). WordPress core uses LIKE for transient
-        // cleanup, slug lookups and meta searches.
+        // cleanup, slug lookups and meta searches. The optional
+        // `ESCAPE 'c'` tail (MediaWiki MessageCache title probes) is
+        // consumed and ignored — our matcher always treats backslash as
+        // the escape character.
         if self.kw("LIKE") {
             let pattern = self.like_pattern()?;
+            if self.kw("ESCAPE") {
+                let _ = self.like_pattern()?;
+            }
             return Ok(Expr::Like {
                 operand: Box::new(left),
                 pattern,

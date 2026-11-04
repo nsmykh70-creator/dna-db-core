@@ -60,7 +60,7 @@ pub struct CmsTableMeta {
 
 /// Split a string into "top-level" comma segments, honouring parentheses
 /// depth and single-quoted strings (with backslash and '' escapes).
-fn split_top_level(s: &str) -> Vec<String> {
+pub(crate) fn split_top_level(s: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut cur = String::new();
     let mut depth = 0usize;

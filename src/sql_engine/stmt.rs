@@ -29,6 +29,11 @@ pub enum Stmt {
         rows: Vec<Vec<(String, Value)>>,
         /// v3.6: `ON CONFLICT (col) DO NOTHING | DO UPDATE SET ...` (UPSERT).
         on_conflict: Option<OnConflict>,
+        /// CMS edition: `INSERT IGNORE` — rows that hit ANY uniqueness
+        /// constraint (primary key or unique index) are skipped instead of
+        /// failing the statement (MediaWiki `INSERT IGNORE INTO`, Joomla
+        /// session writes).
+        ignore: bool,
     },
     /// CMS edition: `INSERT INTO t (cols) SELECT …` — the SELECT is executed
     /// and its rows are inserted positionally (MySQL semantics). Used by
@@ -141,6 +146,13 @@ pub(crate) enum OnConflict {
 pub(crate) enum UpsertValue {
     Literal(Value),
     Excluded(String),
+    /// CMS edition: bare column ref — the EXISTING (conflicting) row's value,
+    /// `ON DUPLICATE KEY UPDATE c = c`.
+    Column(String),
+    /// CMS edition: existing value plus a literal delta,
+    /// `ON DUPLICATE KEY UPDATE ss_users = ss_users+1` (MediaWiki
+    /// SiteStatsUpdate, WooCommerce counters).
+    ColumnAdd { column: String, delta: Value },
 }
 
 /// v3.6 session transaction control statements.
