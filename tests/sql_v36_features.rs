@@ -305,7 +305,7 @@ fn show_tables_and_version_and_explain() {
     assert!(
         ver.rows[0]["version"]
             .to_string()
-            .contains("DNA-DB v4.0.1"),
+            .contains("DNA-DB v4."),
         "version: {}",
         ver.rows[0]["version"]
     );

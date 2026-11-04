@@ -15,6 +15,49 @@ impl CmsSqlGate {
         sql: &str,
         upper: &str,
     ) -> Result<Option<CmsQueryResult>, CmsError> {
+        // SHOW DATABASES [LIKE 'pat'] — generic MySQL clients (phpMyAdmin,
+        // mysqldump, GUI tools) list catalogs this way before connecting.
+        // DNA-DB is a single-catalog engine: the session database plus the
+        // always-present information_schema pseudo-catalog.
+        if upper.starts_with("SHOW DATABASES") {
+            let like = find_like_pattern(sql).map(|p| decode_mysql_string(&p));
+            let current = self
+                .with_session(session, |s| s.database.clone())
+                .unwrap_or(None)
+                .unwrap_or_else(|| "wordpress".to_string());
+            let mut names: std::collections::BTreeSet<String> = self
+                .databases
+                .lock()
+                .expect("database set poisoned")
+                .iter()
+                .cloned()
+                .collect();
+            names.insert("information_schema".into());
+            names.insert(current);
+            let mut rows = Vec::new();
+            for name in names {
+                if let Some(pat) = &like {
+                    if !like_match(pat, &name) {
+                        continue;
+                    }
+                }
+                let mut r = BTreeMap::new();
+                r.insert("Database".into(), Value::Text(name));
+                rows.push(r);
+            }
+            let found = rows.len() as u64;
+            return Ok(Some(CmsQueryResult {
+                columns: vec!["Database".into()],
+                rows,
+                message: Some(format!("{} database(s)", found)),
+                plan: "cms: SHOW DATABASES shim".into(),
+                affected_rows: 0,
+                last_insert_id: 0,
+                found_rows: found,
+                is_select: true,
+            }));
+        }
+
         // SHOW ENGINES — Drupal's requirements page probes engine support.
         if upper.starts_with("SHOW ENGINES") {
             let mut rows = Vec::new();

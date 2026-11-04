@@ -62,6 +62,16 @@ impl CmsSqlGate {
                 Value::Int(0),
             )));
         }
+        // NOTE: @@VERSION_COMMENT must be checked BEFORE @@VERSION — the
+        // longer name contains the shorter one as a substring, and
+        // `SELECT @@version_comment` (mysqldump, PHPMyAdmin) would
+        // otherwise be answered with the version number.
+        if compact.contains("@@VERSION_COMMENT") {
+            return Ok(Some(one_value_reply(
+                "@@version_comment",
+                Value::Text("DNA-DB CMS Edition (MySQL 8.0 compatible)".into()),
+            )));
+        }
         if compact.contains("@@VERSION") {
             return Ok(Some(one_value_reply(
                 "@@version",

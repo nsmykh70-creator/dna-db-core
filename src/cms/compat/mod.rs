@@ -17,7 +17,7 @@
 //! server error code ([`crate::cms::errno`]) — wpdb and WooCommerce branch
 //! on errno (retry on 1213, dedupe on 1062), not on message text.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -102,6 +102,11 @@ pub struct CmsSqlGate {
     /// Active BEGIN..COMMIT buffers per session (taken out for each
     /// statement, put back after — the engine mutates it in place).
     txs: Mutex<HashMap<u64, crate::sql_engine::SqlTxBuffer>>,
+    /// Databases created through the gate (`CREATE DATABASE`). The engine
+    /// itself is single-catalog; the gate pretends catalogs exist so
+    /// generic MySQL clients (phpMyAdmin, mysqldump --databases, CMS
+    /// installers that pre-create the DB) keep working.
+    databases: Mutex<BTreeSet<String>>,
 }
 
 impl CmsSqlGate {
@@ -114,6 +119,7 @@ impl CmsSqlGate {
             next_session: AtomicU64::new(1),
             meta: RwLock::new(HashMap::new()),
             txs: Mutex::new(HashMap::new()),
+            databases: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -201,6 +207,55 @@ impl CmsSqlGate {
                 .to_string();
             self.with_session(session, |s| s.database = Some(db.clone()));
             return Ok(empty_ok(format!("database changed to '{}'", db)));
+        }
+
+        // CREATE DATABASE [IF NOT EXISTS] name — the engine is
+        // single-catalog, so this records the name in the gate's catalog
+        // set (SHOW DATABASES lists it) and switches the session over,
+        // mirroring MySQL's implicit USE. CMS installers (Drupal's
+        // "Create new database" path, phpMyAdmin) send this first.
+        if upper.starts_with("CREATE DATABASE") {
+            let tail = sql["CREATE DATABASE".len()..].trim();
+            let tail = tail
+                .strip_prefix("IF NOT EXISTS")
+                .unwrap_or(tail)
+                .trim();
+            let db = tail
+                .trim_matches('`')
+                .trim_matches('"')
+                .trim_matches('\'')
+                .trim()
+                .to_string();
+            if db.is_empty() {
+                return Err(CmsError {
+                    errno: errno::ER_PARSE_ERROR,
+                    message: "CREATE DATABASE: missing name".into(),
+                });
+            }
+            self.databases
+                .lock()
+                .expect("database set poisoned")
+                .insert(db.clone());
+            self.with_session(session, |s| s.database = Some(db.clone()));
+            return Ok(empty_ok(format!("database created: '{}'", db)));
+        }
+
+        // DROP DATABASE [IF EXISTS] name — removes the gate's record; the
+        // engine's single catalog is untouched (tables live under it).
+        if upper.starts_with("DROP DATABASE") {
+            let tail = sql["DROP DATABASE".len()..].trim();
+            let tail = tail.strip_prefix("IF EXISTS").unwrap_or(tail).trim();
+            let db = tail
+                .trim_matches('`')
+                .trim_matches('"')
+                .trim_matches('\'')
+                .trim()
+                .to_string();
+            self.databases
+                .lock()
+                .expect("database set poisoned")
+                .remove(&db);
+            return Ok(empty_ok(format!("database dropped: '{}'", db)));
         }
 
         // MySQL: COMMIT / ROLLBACK without an open transaction are silent
