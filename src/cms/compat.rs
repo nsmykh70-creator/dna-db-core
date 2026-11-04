@@ -669,19 +669,28 @@ impl CmsSqlGate {
 
         if compact.contains("LAST_INSERT_ID()") {
             let id = self.with_session(session, |s| s.last_insert_id).unwrap_or(0);
-            return Ok(Some(one_value_reply("LAST_INSERT_ID()", Value::Int(id as i64))));
+            return Ok(Some(one_value_reply(
+                shim_column(sql, "LAST_INSERT_ID()").as_str(),
+                Value::Int(id as i64),
+            )));
         }
         if compact.contains("FOUND_ROWS()") {
             let n = self.with_session(session, |s| s.found_rows).unwrap_or(0);
-            return Ok(Some(one_value_reply("FOUND_ROWS()", Value::Int(n as i64))));
+            return Ok(Some(one_value_reply(
+                shim_column(sql, "FOUND_ROWS()").as_str(),
+                Value::Int(n as i64),
+            )));
         }
         if compact.contains("ROW_COUNT()") {
             let n = self.with_session(session, |s| s.affected_rows).unwrap_or(0);
-            return Ok(Some(one_value_reply("ROW_COUNT()", Value::Int(n as i64))));
+            return Ok(Some(one_value_reply(
+                shim_column(sql, "ROW_COUNT()").as_str(),
+                Value::Int(n as i64),
+            )));
         }
         if compact == "SELECT VERSION()" || compact.starts_with("SELECT VERSION() AS") {
             return Ok(Some(one_value_reply(
-                "VERSION()",
+                shim_column(sql, "VERSION()").as_str(),
                 Value::Text(MYSQL_COMPAT_VERSION.to_string()),
             )));
         }
@@ -978,6 +987,31 @@ fn one_value_reply(column: &str, value: Value) -> CmsQueryResult {
         found_rows: 1,
         is_select: true,
     }
+}
+
+/// Column name for a single-value shim reply. Real MySQL names the result
+/// column after the expression (`SELECT VERSION()` → `VERSION()`) or after
+/// the client-provided alias (`SELECT VERSION() AS v` → `v`). Shims used to
+/// always report the expression, which made aliased metadata probes return
+/// the wrong column name.
+fn shim_column(sql: &str, expr: &str) -> String {
+    // ASCII uppercase keeps byte offsets aligned with `sql`.
+    let up = sql.to_ascii_uppercase();
+    if let Some(epos) = up.find(expr) {
+        let rest = &up[epos + expr.len()..];
+        if let Some(apos) = rest.find(" AS ") {
+            let tail = sql[epos + expr.len() + apos + 4..].trim();
+            let alias = tail
+                .split(|c: char| c.is_whitespace() || c == ',')
+                .next()
+                .unwrap_or("")
+                .trim_matches(|c| c == '`' || c == '\'' || c == '"');
+            if !alias.is_empty() {
+                return alias.to_string();
+            }
+        }
+    }
+    expr.to_string()
 }
 
 /// Value after '=' (for SET sql_mode = '…', autocommit=0).

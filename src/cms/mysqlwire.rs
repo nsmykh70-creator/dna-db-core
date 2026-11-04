@@ -967,6 +967,12 @@ struct Prepared {
     params: usize,
     /// COM_STMT_SEND_LONG_DATA buffers keyed by param index.
     long_data: HashMap<u16, Vec<u8>>,
+    /// Binary parameter types `(type, unsigned)` from the first
+    /// COM_STMT_EXECUTE. Real drivers (mysqli, Connector/C, Connector/Py)
+    /// send the type block only once (`new_params_bound = 1`) and rely on
+    /// the server to remember it on every later execute of the same
+    /// statement — multi-row prepared INSERT loops depend on this.
+    param_types: Vec<(u8, u8)>,
 }
 
 /// A decoded COM_STMT_EXECUTE parameter.
@@ -1045,6 +1051,7 @@ fn stmt_prepare(
             sql: sql.to_string(),
             params,
             long_data: HashMap::new(),
+            param_types: Vec::new(),
         },
     );
 
@@ -1130,17 +1137,27 @@ fn stmt_execute(
     }
     let new_bound = body.get(pos).copied().unwrap_or(0);
     pos += 1;
-    let mut param_types: Vec<(u8, u8)> = vec![(MYSQL_TYPE_VAR_STRING, 0); n.max(1)];
-    param_types.truncate(n);
-    if n > 0 && new_bound == 1 {
-        param_types = Vec::with_capacity(n);
-        for _ in 0..n {
-            let t = body.get(pos).copied().unwrap_or(MYSQL_TYPE_VAR_STRING);
-            let u = body.get(pos + 1).copied().unwrap_or(0);
-            pos += 2;
-            param_types.push((t, u));
+    // `new_params_bound = 1` only on the driver's first bind; afterwards the
+    // type block is ABSENT from the payload and the stored types must be
+    // reused (falling back to VAR_STRING here misparses INT/DOUBLE params
+    // as lenenc strings and breaks every second execute — found by the
+    // mysqli smoke test). Types are parsed into a local vector first and
+    // written back into the statement map after the immutable borrow ends.
+    let mut param_types: Vec<(u8, u8)> = match (n, new_bound) {
+        (0, _) => Vec::new(),
+        (_, 1) => {
+            let mut types = Vec::with_capacity(n);
+            for _ in 0..n {
+                let t = body.get(pos).copied().unwrap_or(MYSQL_TYPE_VAR_STRING);
+                let u = body.get(pos + 1).copied().unwrap_or(0);
+                pos += 2;
+                types.push((t, u));
+            }
+            types
         }
-    }
+        (_, _) if st.param_types.len() == n => st.param_types.clone(),
+        (_, _) => vec![(MYSQL_TYPE_VAR_STRING, 0); n],
+    };
     let mut values: Vec<ParamValue> = Vec::with_capacity(n);
     for i in 0..n {
         if nulls[i] {
@@ -1165,6 +1182,13 @@ fn stmt_execute(
         }
     }
     let sql = substitute_params(&st.sql, &values);
+    // The immutable borrow of `st` ends with `substitute_params`; persist the
+    // freshly bound types so later executes without a type block decode right.
+    if n > 0 && new_bound == 1 {
+        if let Some(stm) = stmts.get_mut(&id) {
+            stm.param_types = param_types.clone();
+        }
+    }
     match gate.execute(sid, &sql) {
         Ok(res) => {
             if res.is_select && !res.columns.is_empty() {
