@@ -1122,7 +1122,26 @@ mod tests {
         assert!(map.contains("balance [FLOAT] = 100"), "{}", map);
         assert!(map.contains("RowCodec tag 2"), "{}", map);
     }
+
+#[test]
+fn derived_table_zero_rows_still_reports_columns() {
+    // MediaWiki RevisionStore::findIdenticalRevision: a zero-row derived
+    // table (LIMIT offset skips everything) must still produce a
+    // RowDescription — mysqli dies with "numRows() on true" otherwise.
+    let (_engine, sql) = setup();
+    let _ = sql.execute("CREATE TABLE dtz (id INT PRIMARY KEY, v INT)");
+    let _ = sql.execute("INSERT INTO dtz VALUES (1, 10)");
+    let r = sql
+        .execute(
+            "SELECT * FROM (SELECT id, v FROM dtz ORDER BY id DESC LIMIT 1,15) recent \
+             WHERE id = 1 LIMIT 1",
+        )
+        .unwrap();
+    assert_eq!(r.columns, vec!["id".to_string(), "v".to_string()]);
+    assert!(r.rows.is_empty());
 }
+}
+
 #[cfg(test)]
 mod acl_parse_tests {
     use super::referenced_tables;
@@ -1278,4 +1297,3 @@ mod security_regression_tests {
         assert_eq!(left_joined.len(), 4);
     }
 }
-

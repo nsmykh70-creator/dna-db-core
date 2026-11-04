@@ -47,7 +47,11 @@ pub struct SqlEngine {
     pub complement_index: RwLock<ComplementIndex>,
     /// v3.6: statement-scoped CTE materialisation store. Populated while a
     /// `WITH ... SELECT` runs, always emptied before the statement returns.
-    cte_store: std::sync::Mutex<std::collections::HashMap<String, Vec<BTreeMap<String, Value>>>>,
+    /// CTE/derived tables: name -> (output columns, rows). The column list
+    /// is kept even for zero-row bodies so `SELECT *` over an empty
+    /// derived table still reports a RowDescription (MySQL always sends
+    /// column definitions; MediaWiki keys on them).
+    cte_store: std::sync::Mutex<std::collections::HashMap<String, (Vec<String>, Vec<BTreeMap<String, Value>>)>>,
     /// CMS edition (branch cms-edition): per-table AUTO_INCREMENT sequences.
     /// Shared Arc so the compat gate (`cms::compat::CmsSqlGate`) and the
     /// engine observe one counter per table. Seeded lazily from MAX(pk).

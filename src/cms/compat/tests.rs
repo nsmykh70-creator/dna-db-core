@@ -1297,3 +1297,33 @@ fn preprocess_rewrites_insert_select_dual() {
     let out4 = preprocess_mysql_dialect("INSERT INTO t (a) SELECT b FROM other");
     assert_eq!(out4, "INSERT INTO t (a) SELECT b FROM other");
 }
+
+#[test]
+fn strip_index_hints_forms() {
+    use super::dialect::strip_index_hints;
+    // MediaWiki RevisionStore::findIdenticalRevision derived table
+    let q = "SELECT * FROM (SELECT rev_id FROM revision FORCE INDEX (rev_page_timestamp) \
+             JOIN actor ON (1)) `recent_revs` WHERE rev_sha1 = 'x' LIMIT 1";
+    assert_eq!(
+        strip_index_hints(q),
+        "SELECT * FROM (SELECT rev_id FROM revision JOIN actor ON (1)) `recent_revs` WHERE rev_sha1 = 'x' LIMIT 1"
+    );
+    assert_eq!(
+        strip_index_hints("SELECT a FROM t USE INDEX (i1) WHERE a = 1"),
+        "SELECT a FROM t WHERE a = 1"
+    );
+    assert_eq!(
+        strip_index_hints("SELECT a FROM t IGNORE INDEX FOR ORDER BY (i2) GROUP BY a"),
+        "SELECT a FROM t GROUP BY a"
+    );
+    // word-boundary safety: identifiers containing the words are untouched
+    assert_eq!(
+        strip_index_hints("SELECT force_indexed FROM use_indexes"),
+        "SELECT force_indexed FROM use_indexes"
+    );
+    // inside string literals untouched
+    assert_eq!(
+        strip_index_hints("SELECT 'FORCE INDEX (x)' AS a"),
+        "SELECT 'FORCE INDEX (x)' AS a"
+    );
+}

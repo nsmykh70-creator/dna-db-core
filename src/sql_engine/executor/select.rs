@@ -47,13 +47,13 @@ impl SqlEngine {
                     name
                 ));
             }
-            let (_, rows, _cplan, _) = self.exec_stmt(def.clone(), &mut None)?;
+            let (cols, rows, _cplan, _) = self.exec_stmt(def.clone(), &mut None)?;
             let mut store = self.cte_store.lock().unwrap();
             if store.contains_key(name) {
                 return Err(format!("SQL: duplicate CTE name '{}'", name));
             }
             plan.push_str(&format!("{}[{} rows] ", name, rows.len()));
-            store.insert(name.clone(), rows);
+            store.insert(name.clone(), (cols, rows));
         }
         plan.push_str(")");
         let result = self.exec_stmt(body, tx);
@@ -984,6 +984,14 @@ impl SqlEngine {
                     SelectItem::OrderKeyOnly { .. }
                     | SelectItem::Star
                     | SelectItem::AliasStar(_) => {}
+                }
+            }
+            if cols.is_empty() {
+                // `SELECT *` over a derived table / CTE: the materialised
+                // body's output columns (declaration order) — works even for
+                // zero-row bodies, where the row-key fallback is empty.
+                if let Some((cte_cols, _)) = self.cte_store.lock().unwrap().get(from) {
+                    cols.extend(cte_cols.iter().cloned());
                 }
             }
             if cols.is_empty() {

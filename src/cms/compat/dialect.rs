@@ -14,7 +14,7 @@ use super::*;
 /// 3) `NOW()` inside INSERT/UPDATE → the current timestamp as a literal
 ///    (engine INSERT values are literals; Woo order timestamps use NOW()).
 pub(crate) fn preprocess_mysql_dialect(sql: &str) -> String {
-    let stripped = strip_backticks(sql);
+    let stripped = strip_index_hints(&strip_backticks(sql));
     let upper = stripped.trim_start().to_ascii_uppercase();
     let mut out = if upper.starts_with("DESCRIBE ") || upper.starts_with("DESC ") {
         let off = if upper.starts_with("DESCRIBE ") { 9 } else { 5 };
@@ -47,6 +47,137 @@ pub(crate) fn preprocess_mysql_dialect(sql: &str) -> String {
     out
 }
 
+/// Removes MySQL index hints - `FORCE INDEX (..)`, `USE INDEX (..)`,
+/// `IGNORE INDEX (..)` - including the optional `FOR {JOIN|ORDER BY|GROUP BY}`
+/// tail. Hints are advisory: DNA-DB plans from its own complement index
+/// metadata, so dropping them never changes results. MediaWiki emits
+/// FROM revision FORCE INDEX (rev_page_timestamp) inside derived tables
+/// (RevisionStore::findIdenticalRevision), which the core parser rejects.
+pub(crate) fn strip_index_hints(s: &str) -> String {
+    const WORDS: [&str; 3] = ["FORCE INDEX", "USE INDEX", "IGNORE INDEX"];
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    let mut in_string: Option<char> = None;
+    while i < chars.len() {
+        let c = chars[i];
+        if let Some(q) = in_string {
+            out.push(c);
+            if c == '\\' && i + 1 < chars.len() {
+                out.push(chars[i + 1]);
+                i += 2;
+                continue;
+            }
+            if c == q {
+                if i + 1 < chars.len() && chars[i + 1] == q {
+                    out.push(q);
+                    i += 2;
+                    continue;
+                }
+                in_string = None;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '\'' || c == '"' {
+            in_string = Some(c);
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        let mut hit = false;
+        for w in WORDS {
+            let wc: Vec<char> = w.chars().collect();
+            if i + wc.len() <= chars.len()
+                && chars[i..i + wc.len()].iter().zip(wc.iter())
+                    .all(|(a, b)| a.to_ascii_lowercase() == b.to_ascii_lowercase())
+                && (i == 0 || !chars[i - 1].is_ascii_alphanumeric()
+                    && chars[i - 1] != '_')
+            {
+                let mut j = i + wc.len();
+                while j < chars.len() && chars[j].is_whitespace() {
+                    j += 1;
+                }
+                let rest: String = chars[j..].iter().collect();
+                let upper_rest: String =
+                    rest.chars().take(20).collect::<String>().to_ascii_uppercase();
+                for tail in ["FOR JOIN", "FOR ORDER BY", "FOR GROUP BY"] {
+                    if upper_rest.starts_with(tail)
+                        && j + tail.len() <= chars.len()
+                        && (j + tail.len() == chars.len()
+                            || chars[j + tail.len()].is_whitespace()
+                            || chars[j + tail.len()] == '(')
+                    {
+                        j += tail.len();
+                        break;
+                    }
+                }
+                if j < chars.len() && !chars[j].is_whitespace()
+                    && chars[j] != '('
+                {
+                    continue; // e.g. USE INDEXES... - not a hint
+                }
+                while j < chars.len() && chars[j].is_whitespace() {
+                    j += 1;
+                }
+                if j >= chars.len() || chars[j] != '(' {
+                    continue; // no parenthesised list - leave untouched
+                }
+                let mut depth = 0usize;
+                let mut m = j;
+                while m < chars.len() {
+                    let ch = chars[m];
+                    if ch == '\'' || ch == '"' {
+                        let q = ch;
+                        out.push(ch);
+                        m += 1;
+                        while m < chars.len() {
+                            out.push(chars[m]);
+                            if chars[m] == '\\' && m + 1 < chars.len() {
+                                out.push(chars[m + 1]);
+                                m += 2;
+                                continue;
+                            }
+                            if chars[m] == q {
+                                m += 1;
+                                break;
+                            }
+                            m += 1;
+                        }
+                        continue;
+                    }
+                    if ch == '(' {
+                        depth += 1;
+                    } else if ch == ')' {
+                        depth -= 1;
+                        if depth == 0 {
+                            m += 1;
+                            break;
+                        }
+                    }
+                    m += 1;
+                }
+                if depth != 0 {
+                    continue;
+                }
+                i = m;
+                while i < chars.len() && chars[i].is_whitespace() {
+                    i += 1;
+                }
+                if !out.ends_with(' ') {
+                    out.push(' ');
+                }
+                hit = true;
+                break;
+            }
+        }
+        if !hit {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
+}
 /// CMS edition: rewrites the WooCommerce / ActionScheduler INSERT..SELECT
 /// pattern into INSERT..VALUES:
 ///

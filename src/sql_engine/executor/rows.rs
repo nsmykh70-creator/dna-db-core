@@ -62,7 +62,7 @@ impl SqlEngine {
         table: &str,
     ) -> Result<Vec<BTreeMap<String, Value>>, String> {
         // v3.6: statement-scoped CTE tables take precedence over disk.
-        if let Some(rows) = self.cte_store.lock().unwrap().get(table) {
+        if let Some((_, rows)) = self.cte_store.lock().unwrap().get(table) {
             return Ok(rows.clone());
         }
         let prefix = format!("{}:", table);
