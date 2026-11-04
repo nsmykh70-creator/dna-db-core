@@ -193,6 +193,13 @@ else
         (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null && break
         sleep 0.5
     done
+    # The daemon can die right after fork (port already taken, bad flags,
+    # unwritable dir) — report that instead of printing a bogus DONE.
+    if ! kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+        echo "[install] server did not start — last log lines:" >&2
+        tail -5 "$DATA_DIR/dna-db.log" >&2
+        exit 1
+    fi
     log "  pid $(cat "$PIDFILE"), logs: $DATA_DIR/dna-db.log"
 fi
 

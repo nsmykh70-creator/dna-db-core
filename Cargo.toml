@@ -1,6 +1,6 @@
 [package]
 name = "dna-db-core"
-version = "4.0.0"
+version = "4.0.1"
 edition = "2021"
 authors = ["DNA-DB Engineering Team"]
 description = "High-performance LSM storage engine with 2-bit DNA packing, dual-strand hot-swap, DnaQL/SQL, TLS, Argon2id auth and encryption at rest"
