@@ -1143,7 +1143,7 @@ fn stmt_execute(
     // as lenenc strings and breaks every second execute — found by the
     // mysqli smoke test). Types are parsed into a local vector first and
     // written back into the statement map after the immutable borrow ends.
-    let mut param_types: Vec<(u8, u8)> = match (n, new_bound) {
+    let param_types: Vec<(u8, u8)> = match (n, new_bound) {
         (0, _) => Vec::new(),
         (_, 1) => {
             let mut types = Vec::with_capacity(n);
