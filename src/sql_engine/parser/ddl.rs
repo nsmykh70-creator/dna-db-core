@@ -351,6 +351,11 @@ impl SParser {
         } else if self.kw("FLOAT") || self.kw("FLOAT64") || self.kw("DOUBLE") {
             // MySQL synonym: `DOUBLE PRECISION` (MediaWiki page_random).
             self.kw("PRECISION");
+            // MySQL length/precision spec: `double(15,8)`, `float(10,2)`
+            // (OpenCart's currency.value) — precision is advisory, the
+            // engine stores IEEE doubles.
+            #[cfg(feature = "cms")]
+            self.consume_type_len()?;
             Ok(ColumnType::Float64)
         } else if self.kw("TEXT") || self.kw("VARCHAR") || self.kw("STRING") {
             #[cfg(feature = "cms")]

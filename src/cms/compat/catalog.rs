@@ -60,10 +60,21 @@ impl CmsSqlGate {
             vec![info_schema_schemata_row(&name)]
         } else if table == "tables" {
             let wanted = get("table_name");
+            // `TABLE_NAME LIKE 'oc\_%'` — prefix filters (OpenCart
+            // verification queries) match with MySQL wildcards.
+            let like = where_like_pairs(sql)
+                .into_iter()
+                .find(|(c, _)| c.eq_ignore_ascii_case("table_name"))
+                .map(|(_, p)| p);
             let mut rows = Vec::new();
             for t in self.engine.list_tables() {
                 if let Some(w) = &wanted {
                     if w != &t {
+                        continue;
+                    }
+                }
+                if let Some(p) = &like {
+                    if !crate::expr::like_match(p, &t) {
                         continue;
                     }
                 }
@@ -182,6 +193,45 @@ pub(crate) fn split_on_and(s: &str) -> Vec<String> {
 
 /// Top-level `col = 'literal'` / `col = 123` pairs from the statement's WHERE
 /// clause — the shape every catalog probe uses.
+/// `WHERE <col> LIKE 'pat'` pairs from a catalog probe (the equality
+/// counterpart is [`where_eq_pairs`]). Only top-level LIKEs inside the
+/// WHERE clause are recognised; patterns keep MySQL `%` / `_` wildcards.
+pub(crate) fn where_like_pairs(sql: &str) -> Vec<(String, String)> {
+    let lower = sql.to_ascii_lowercase();
+    let Some(wpos) = lower.find(" where ") else {
+        return Vec::new();
+    };
+    let mut tail = &sql[wpos + 7..];
+    let lower_tail = tail.to_ascii_lowercase();
+    for stop in [" group by", " order by", " limit", " having"] {
+        if let Some(p) = lower_tail.find(stop) {
+            tail = &tail[..p];
+        }
+    }
+    let mut out = Vec::new();
+    for cond in split_on_and(tail) {
+        let cond = strip_balanced_parens(&cond);
+        let lower_cond = cond.to_ascii_lowercase();
+        let Some(lpos) = lower_cond.find(" like ") else {
+            continue;
+        };
+        let col = cond[..lpos]
+            .trim()
+            .trim_matches(|c| c == '`' || c == '"')
+            .to_ascii_lowercase();
+        let val = cond[lpos + 6..].trim();
+        let decoded = if (val.starts_with('\'') && val.ends_with('\'') && val.len() >= 2)
+            || (val.starts_with('"') && val.ends_with('"') && val.len() >= 2)
+        {
+            decode_mysql_string(&val[1..val.len() - 1]).to_string()
+        } else {
+            val.to_string()
+        };
+        out.push((col, decoded));
+    }
+    out
+}
+
 pub(crate) fn where_eq_pairs(sql: &str) -> Vec<(String, String)> {
     let lower = sql.to_ascii_lowercase();
     let Some(wpos) = lower.find(" where ") else {
@@ -558,8 +608,103 @@ pub(crate) fn info_schema_statistics_rows(
 /// Empty catalog result for a table the overlay does not know (MySQL answers
 /// an empty set, which is how drivers detect "table missing").
 pub(crate) fn empty_catalog_result(table: &str) -> CmsQueryResult {
+    // An empty set still carries the catalog's standard COLUMN NAMES — the
+    // wire frames it as a real (zero-row) resultset. With empty `columns`
+    // the wire would answer a bare OK packet and drivers like mysqli would
+    // see `true` instead of a result object (OpenCart's installer probes
+    // information_schema.COLUMNS for tables that do not exist yet).
+    let columns: Vec<String> = match table {
+        "columns" => vec![
+            "TABLE_CATALOG",
+            "TABLE_SCHEMA",
+            "TABLE_NAME",
+            "COLUMN_NAME",
+            "ORDINAL_POSITION",
+            "COLUMN_DEFAULT",
+            "IS_NULLABLE",
+            "DATA_TYPE",
+            "CHARACTER_MAXIMUM_LENGTH",
+            "CHARACTER_OCTET_LENGTH",
+            "NUMERIC_PRECISION",
+            "NUMERIC_SCALE",
+            "DATETIME_PRECISION",
+            "CHARACTER_SET_NAME",
+            "COLLATION_NAME",
+            "COLUMN_TYPE",
+            "COLUMN_KEY",
+            "EXTRA",
+            "PRIVILEGES",
+            "COLUMN_COMMENT",
+            "GENERATION_EXPRESSION",
+            "SRS_ID",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect(),
+        "tables" => vec![
+            "TABLE_CATALOG",
+            "TABLE_SCHEMA",
+            "TABLE_NAME",
+            "TABLE_TYPE",
+            "ENGINE",
+            "VERSION",
+            "ROW_FORMAT",
+            "TABLE_ROWS",
+            "AVG_ROW_LENGTH",
+            "DATA_LENGTH",
+            "MAX_DATA_LENGTH",
+            "INDEX_LENGTH",
+            "DATA_FREE",
+            "AUTO_INCREMENT",
+            "CREATE_TIME",
+            "UPDATE_TIME",
+            "CHECK_TIME",
+            "TABLE_COLLATION",
+            "CHECKSUM",
+            "CREATE_OPTIONS",
+            "TABLE_COMMENT",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect(),
+        "statistics" => vec![
+            "TABLE_CATALOG",
+            "TABLE_SCHEMA",
+            "TABLE_NAME",
+            "NON_UNIQUE",
+            "INDEX_SCHEMA",
+            "INDEX_NAME",
+            "SEQ_IN_INDEX",
+            "COLUMN_NAME",
+            "COLLATION",
+            "CARDINALITY",
+            "SUB_PART",
+            "PACKED",
+            "NULLABLE",
+            "INDEX_TYPE",
+            "COMMENT",
+            "INDEX_COMMENT",
+            "IS_VISIBLE",
+            "EXPRESSION",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect(),
+        // schemata
+        _ => vec![
+            "CATALOG_NAME",
+            "SCHEMA_NAME",
+            "DEFAULT_CHARACTER_SET_NAME",
+            "DEFAULT_COLLATION_NAME",
+            "SQL_PATH",
+            "DEFAULT_ENCRYPTION",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect(),
+    };
     CmsQueryResult {
-        columns: Vec::new(),
+        columns,
         rows: Vec::new(),
         message: Some(format!("information_schema.{}: empty", table)),
         plan: "cms: information_schema shim (empty)".into(),

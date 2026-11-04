@@ -300,7 +300,9 @@ WooCommerce ✅ (11.2.1, HPOS, артефакты = MariaDB, см. E2E_WOO_REPOR
 см. «Строчные блокировки»)**; остаётся: deadlock-retry в живом заказе
 (обвязка поверх 1213 в e2e), DECIMAL по scale, установка Joomla 5 ✅
 (5.4.10 через штатный mysqli → wire-адаптер: установщик, фронтенд и
-админка — см. E2E_JOOMLA_MYSQLWIRE_REPORT). Приёмка: e2e-заказ ✅,
+админка — см. E2E_JOOMLA_MYSQLWIRE_REPORT), **установка OpenCart ✅
+(4.1.0.4 официальным CLI-установщиком, storefront/admin 200, 159 таблиц —
+см. E2E_OPENCART_MYSQLWIRE_REPORT)**. Приёмка: e2e-заказ ✅,
 установка Joomla ✅ (wire; pgwire для Joomla больше не нужен).
 
 **Фаза 3 — эксплуатация (2–4 нед).** mysqldump-совместимый импорт/экспорт,

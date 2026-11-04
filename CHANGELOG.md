@@ -2,6 +2,21 @@
 
 ## Unreleased (CMS Edition — branch `cms-edition`)
 
+### OpenCart 4.1.0.4 installs via the official CLI installer (2026-11-04)
+
+`install/cli_install.php install --db_port …` builds all 159 tables from its
+PHP schema against DNA-DB over stock mysqli, seeds the demo catalogue
+(220 settings / 19 products) and creates the admin user; storefront and
+admin render HTTP 200. Report: `docs/cms/E2E_OPENCART_MYSQLWIRE_REPORT.md`.
+
+Engine fixes: an EMPTY information_schema result now carries the catalog's
+standard column names (a zero-row resultset on the wire instead of a bare
+OK packet — mysqli drivers saw `true` before); `FLOAT/DOUBLE (M,D)` length
+specs; the `YEAR/MONTH/DAY/…/DAYNAME/MONTHNAME` datetime function family in
+VALUES; MySQL `INSERT INTO t SET col = v, …`; `LIKE` filters on
+information_schema catalog probes (`TABLE_NAME LIKE 'oc_%'`).
+
+
 ### Joomla 5.4.10 installs and renders on DNA-DB (2026-11-04)
 
 Driven end-to-end by the real Joomla 5.4.10 web installer (stock mysqli →

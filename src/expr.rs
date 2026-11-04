@@ -139,6 +139,9 @@ pub fn is_scalar_fn(name: &str) -> bool {
             // TIME_FORMAT inside INSERT VALUES).
             | "NOW" | "CURDATE" | "CURTIME" | "UNIX_TIMESTAMP"
             | "DATE_FORMAT" | "TIME_FORMAT"
+            | "YEAR" | "MONTH" | "DAY" | "DAYOFMONTH" | "QUARTER"
+            | "HOUR" | "MINUTE" | "SECOND" | "DAYOFWEEK" | "DAYOFYEAR"
+            | "WEEK" | "DAYNAME" | "MONTHNAME"
     )
 }
 
@@ -802,6 +805,48 @@ pub(crate) fn eval_scalar_fn(name: &str, vals: &[Option<Value>]) -> Option<Value
             let fmt = txt(1)?;
             Some(Value::Text(format_datetime(&parse_datetime(&dt), &fmt)))
         }
+        "YEAR" => Some(Value::Int(parse_datetime(&txt(0)?).0)),
+        "MONTH" => Some(Value::Int(parse_datetime(&txt(0)?).1)),
+        "DAY" | "DAYOFMONTH" => Some(Value::Int(parse_datetime(&txt(0)?).2)),
+        "HOUR" => Some(Value::Int(parse_datetime(&txt(0)?).3)),
+        "MINUTE" => Some(Value::Int(parse_datetime(&txt(0)?).4)),
+        "SECOND" => Some(Value::Int(parse_datetime(&txt(0)?).5)),
+        "QUARTER" => {
+            let m = parse_datetime(&txt(0)?).1;
+            Some(Value::Int((m - 1) / 3 + 1))
+        }
+        "DAYOFWEEK" => {
+            // MySQL: 1 = Sunday … 7 = Saturday
+            let (y, mo, d, _, _, _) = parse_datetime(&txt(0)?);
+            let wd = (days_from_civil(y, mo as u32, d as u32).rem_euclid(7) + 4) % 7;
+            Some(Value::Int(wd + 1))
+        }
+        "DAYOFYEAR" => {
+            let (y, mo, d, _, _, _) = parse_datetime(&txt(0)?);
+            Some(Value::Int(
+                days_from_civil(y, mo as u32, d as u32)
+                    - days_from_civil(y, 1, 1)
+                    + 1,
+            ))
+        }
+        "WEEK" => {
+            let (y, mo, d, _, _, _) = parse_datetime(&txt(0)?);
+            let doy = days_from_civil(y, mo as u32, d as u32)
+                - days_from_civil(y, 1, 1)
+                + 1;
+            Some(Value::Int((doy - 1) / 7 + 1))
+        }
+        "DAYNAME" => {
+            let (y, mo, d, _, _, _) = parse_datetime(&txt(0)?);
+            let wd = (days_from_civil(y, mo as u32, d as u32).rem_euclid(7) + 4) % 7;
+            Some(Value::Text(DAY_NAMES[wd as usize].to_string()))
+        }
+        "MONTHNAME" => {
+            let m = parse_datetime(&txt(0)?).1;
+            Some(Value::Text(
+                MONTH_NAMES[(m as usize - 1).clamp(0, 11)].to_string(),
+            ))
+        }
         _ => None, // is_scalar_fn gate keeps this unreachable
     }
 }
@@ -952,17 +997,21 @@ fn days_in_month(y: i64, m: u32) -> i64 {
     }
 }
 
+const MONTH_NAMES: [&str; 12] = [
+    "January", "February", "March", "April", "May", "June", "July",
+    "August", "September", "October", "November", "December",
+];
+
+const DAY_NAMES: [&str; 7] = [
+    "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
+];
+
 /// MySQL DATE_FORMAT subset: the specifiers real CMS dumps use.
 fn format_datetime(p: &(i64, i64, i64, i64, i64, i64), fmt: &str) -> String {
     let (y, mo, d, hh, mm, ss) = *p;
     let weekday = (days_from_civil(y, mo as u32, d as u32).rem_euclid(7) + 4) % 7; // 1970-01-01 = Thursday
-    let months = [
-        "January", "February", "March", "April", "May", "June", "July",
-        "August", "September", "October", "November", "December",
-    ];
-    let days_n = [
-        "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
-    ];
+    let months = &MONTH_NAMES;
+    let days_n = &DAY_NAMES;
     let mut out = String::new();
     let mut chars = fmt.chars().peekable();
     while let Some(c) = chars.next() {

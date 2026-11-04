@@ -10,6 +10,31 @@ impl SParser {
         let ignore = self.kw("IGNORE");
         self.expect_kw("INTO")?;
         let table = self.ident()?;
+        // MySQL form 3: `INSERT INTO t SET col = v, col2 = v2` (OpenCart's
+        // installer seeds the admin user this way). Desugared to one row of
+        // named values; the ON DUPLICATE KEY UPDATE tail is shared.
+        if self.kw("SET") {
+            let mut row: Vec<(String, Value)> = Vec::new();
+            loop {
+                let col = self.ident()?;
+                self.expect(STok::Eq)?;
+                let v = self.value()?;
+                row.push((col, v));
+                if matches!(self.peek(), STok::Comma) {
+                    self.next();
+                } else {
+                    break;
+                }
+            }
+            let on_conflict = self.parse_on_conflict_tail()?;
+            self.eat_semi();
+            return Ok(Stmt::Insert {
+                table,
+                rows: vec![row],
+                on_conflict,
+                ignore,
+            });
+        }
         // MySQL allows omitting the column list: `INSERT INTO t VALUES (…)`
         // — values then map to the declared columns positionally. Parse the
         // tuples with empty column names; exec_insert_tx fills them from the
