@@ -264,6 +264,7 @@ impl CmsSqlGate {
         // every write, so rejecting them here breaks real clients with
         // errno 1064 where real MySQL answers OK.
         if upper == "COMMIT" || upper == "ROLLBACK" {
+            self.with_session(session, |s| s.savepoints.clear());
             let has_tx = self
                 .txs
                 .lock()
@@ -275,6 +276,64 @@ impl CmsSqlGate {
                     "{}, no active transaction",
                     upper.to_ascii_lowercase()
                 )));
+            }
+        }
+
+        // ---------- SAVEPOINT markers (Drupal nested transactions) ----------
+        // `SAVEPOINT name` / `RELEASE SAVEPOINT name` / `ROLLBACK TO name`.
+        // See CmsSession::savepoints for the semantics.
+        {
+            let head = upper.split_whitespace().next().unwrap_or("");
+            match head {
+                "SAVEPOINT" => {
+                    let name = sql["SAVEPOINT".len()..].trim().to_string();
+                    self.with_session(session, |s| s.savepoints.push(name));
+                    return Ok(empty_ok("savepoint set"));
+                }
+                "RELEASE" => {
+                    let rest = sql["RELEASE".len()..].trim();
+                    let name = rest
+                        .strip_prefix("SAVEPOINT")
+                        .unwrap_or(rest)
+                        .trim()
+                        .trim_matches('`')
+                        .to_string();
+                    self.with_session(session, |s| {
+                        if let Some(pos) = s.savepoints.iter().position(|x| *x == name) {
+                            s.savepoints.truncate(pos);
+                        }
+                    });
+                    return Ok(empty_ok(format!("savepoint {} released", name)));
+                }
+                "ROLLBACK" => {
+                    let rest = sql["ROLLBACK".len()..].trim_start();
+                    if rest
+                        .to_ascii_uppercase()
+                        .strip_prefix("TO")
+                        .map(|r| r.trim_start())
+                        .map(|r| r.strip_prefix("SAVEPOINT").unwrap_or(r).trim())
+                        .map(|name| !name.is_empty())
+                        .unwrap_or(false)
+                    {
+                        let raw = rest
+                            .trim_start()
+                            .strip_prefix("TO")
+                            .unwrap()
+                            .trim_start()
+                            .strip_prefix("SAVEPOINT")
+                            .unwrap_or(rest.trim_start().strip_prefix("TO").unwrap().trim_start())
+                            .trim()
+                            .trim_matches('`')
+                            .to_string();
+                        self.with_session(session, |s| {
+                            if let Some(pos) = s.savepoints.iter().position(|x| *x == raw) {
+                                s.savepoints.truncate(pos + 1);
+                            }
+                        });
+                        return Ok(empty_ok(format!("rolled back to savepoint {}", raw)));
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -350,6 +409,19 @@ impl CmsSqlGate {
         }
 
         // ---------- real execution ----------
+        // MySQL: issuing BEGIN / START TRANSACTION while a transaction is
+        // active performs an implicit COMMIT of the current one, then starts
+        // a fresh transaction. Drupal 11's schema installer does exactly
+        // that (nested startTransaction during DDL); rejecting with
+        // "transaction already active" aborts the whole install. The CMS
+        // read-your-writes model already flushed the buffer after every
+        // statement, so dropping it here IS the implicit commit.
+        if upper == "BEGIN" || upper == "BEGIN WORK" || upper == "START TRANSACTION" {
+            self.txs
+                .lock()
+                .expect("tx map poisoned")
+                .remove(&session);
+        }
         let is_select = upper.starts_with("SELECT") || upper.starts_with("WITH");
         // The session owns the BEGIN..COMMIT buffer. Since the CMS edition
         // guarantees read-your-writes (see below), the buffer only lives for

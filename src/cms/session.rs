@@ -139,6 +139,12 @@ pub struct CmsSession {
     pub last_insert_id: u64,
     /// `ROW_COUNT()` — affected rows of the previous DML.
     pub affected_rows: u64,
+    /// Open SAVEPOINT markers, innermost last. The CMS engine flushes every
+    /// statement immediately (read-your-writes), so savepoints are markers,
+    /// not MVCC snapshots: `ROLLBACK TO` answers OK and releases the inner
+    /// markers (Drupal 11 nests transactions via savepoints and requires the
+    /// statements to succeed; real undo is documented as a limitation).
+    pub savepoints: Vec<String>,
     /// `FOUND_ROWS()` — row count of the previous SELECT.
     pub found_rows: u64,
     /// sql_mode, see [`SqlMode`].
@@ -158,6 +164,7 @@ impl CmsSession {
             autocommit: true,
             last_insert_id: 0,
             affected_rows: 0,
+            savepoints: Vec::new(),
             found_rows: 0,
             sql_mode: SqlMode::default(),
             // WordPress sets utf8mb4 explicitly, but MySQL 8 defaults to

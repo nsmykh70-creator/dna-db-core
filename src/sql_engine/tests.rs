@@ -1124,6 +1124,34 @@ mod tests {
     }
 
 #[test]
+fn composite_pk_delete_removes_row() {
+    // Drupal re-inserts user 1 (users_field_data PK = (uid, langcode))
+    // after DELETE ... WHERE uid = 1 — the delete must hit the full
+    // storage key table:uid:langcode, not the truncated table:uid.
+    let (_engine, sql) = setup();
+    sql.execute("CREATE TABLE cpk (uid INT NOT NULL, langcode VARCHAR(12) NOT NULL, name VARCHAR(60), PRIMARY KEY (uid, langcode))").unwrap();
+    sql.execute("INSERT INTO cpk (uid, langcode, name) VALUES (1, 'en', 'placeholder')").unwrap();
+    sql.execute("DELETE FROM cpk WHERE uid = '1'").unwrap();
+    let r = sql.execute("SELECT COUNT(*) AS n FROM cpk").unwrap();
+    assert_eq!(r.rows[0]["n"].to_string(), "0", "quoted-literal delete missed");
+    sql.execute("INSERT INTO cpk (uid, langcode, name) VALUES (1, 'en', 'real')").unwrap();
+    let r = sql.execute("SELECT name FROM cpk WHERE uid = 1").unwrap();
+    assert_eq!(r.rows[0]["name"].to_string(), "real");
+}
+
+#[test]
+fn insert_without_column_list_maps_positionally() {
+    let (_engine, sql) = setup();
+    sql.execute("CREATE TABLE posl (a INT, b TEXT, c INT, PRIMARY KEY (a))").unwrap();
+    sql.execute("INSERT INTO posl VALUES (1, 'x', 7)").unwrap();
+    let r = sql.execute("SELECT a, b, c FROM posl WHERE a = 1").unwrap();
+    assert_eq!(r.rows[0]["b"].to_string(), "x");
+    assert_eq!(r.rows[0]["c"].to_string(), "7");
+    // count mismatch must error
+    assert!(sql.execute("INSERT INTO posl VALUES (2, 'y')").is_err());
+}
+
+#[test]
 fn derived_table_zero_rows_still_reports_columns() {
     // MediaWiki RevisionStore::findIdenticalRevision: a zero-row derived
     // table (LIMIT offset skips everything) must still produce a

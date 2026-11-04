@@ -1327,3 +1327,26 @@ fn strip_index_hints_forms() {
         "SELECT 'FORCE INDEX (x)' AS a"
     );
 }
+
+#[test]
+fn catalog_probe_multi_condition_where() {
+    use super::catalog::{split_on_and, where_eq_pairs};
+    // Drupal 11 tableExists(): parenthesised AND conditions, double-quoted
+    // identifiers, single-quoted values.
+    let q = "SELECT 1 FROM information_schema.tables WHERE (\"table_schema\" = 'drupaldna') \
+             AND (\"table_name\" = 'config') AND (\"table_type\" = 'BASE TABLE')";
+    let pairs = where_eq_pairs(q);
+    assert_eq!(
+        pairs,
+        vec![
+            ("table_schema".to_string(), "drupaldna".to_string()),
+            ("table_name".to_string(), "config".to_string()),
+            ("table_type".to_string(), "BASE TABLE".to_string()),
+        ]
+    );
+    assert_eq!(split_on_and("a = 1 AND b = 2").len(), 2);
+    assert_eq!(split_on_and("('x' = 'a AND b') AND (y = 2)").len(), 2);
+    // WordPress-style unparenthesised probe keeps working
+    let wp = "SELECT 1 FROM information_schema.tables WHERE table_schema = 'wp' AND table_name = 'wp_options'";
+    assert_eq!(where_eq_pairs(wp).len(), 2);
+}

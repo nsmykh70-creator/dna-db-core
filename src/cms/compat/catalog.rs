@@ -145,19 +145,22 @@ pub(crate) fn split_on_and(s: &str) -> Vec<String> {
                     cur.push(c);
                 }
                 _ if depth == 0 && c.to_ascii_uppercase() == 'A' => {
-                    // lookahead for a standalone AND
-                    let rest: String = chars.clone().take(3).collect();
+                    // lookahead for a standalone AND. NOTE: the 'A' is already
+                    // consumed, so the peeked rest starts at "ND …" — checking
+                    // rest for "AND" here never matched (the splitter silently
+                    // degraded to one condition per WHERE, breaking Drupal's
+                    // parenthesised catalog probes).
+                    let rest: Vec<char> = chars.clone().take(3).collect();
                     let before = cur
                         .chars()
                         .last()
                         .map(|c| c.is_whitespace())
                         .unwrap_or(true);
-                    let after = rest
-                        .chars()
-                        .next()
-                        .map(|c| c.is_whitespace())
-                        .unwrap_or(false);
-                    if before && after && rest.to_ascii_uppercase().starts_with("AND") {
+                    let is_and = rest.len() >= 3
+                        && rest[0].to_ascii_uppercase() == 'N'
+                        && rest[1].to_ascii_uppercase() == 'D'
+                        && rest[2].is_whitespace();
+                    if before && is_and {
                         for _ in 0..3 {
                             chars.next();
                         }

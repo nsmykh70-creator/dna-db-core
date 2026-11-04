@@ -997,6 +997,40 @@ impl SParser {
         let ignore = self.kw("IGNORE");
         self.expect_kw("INTO")?;
         let table = self.ident()?;
+        // MySQL allows omitting the column list: `INSERT INTO t VALUES (…)`
+        // — values then map to the declared columns positionally. Parse the
+        // tuples with empty column names; exec_insert_tx fills them from the
+        // schema's declared order (Drupal, plain mysqldump output).
+        if !matches!(self.peek(), STok::LParen) {
+            self.expect_kw("VALUES")?;
+            let mut rows = Vec::new();
+            loop {
+                self.expect(STok::LParen)?;
+                let mut values = Vec::new();
+                loop {
+                    values.push(self.value()?);
+                    if matches!(self.peek(), STok::Comma) {
+                        self.next();
+                    } else {
+                        break;
+                    }
+                }
+                self.expect(STok::RParen)?;
+                rows.push(values.into_iter().map(|v| (String::new(), v)).collect());
+                if matches!(self.peek(), STok::Comma) {
+                    self.next();
+                } else {
+                    break;
+                }
+            }
+            self.eat_semi();
+            return Ok(Stmt::Insert {
+                table,
+                rows,
+                on_conflict: None,
+                ignore,
+            });
+        }
         self.expect(STok::LParen)?;
 
         // Form 1 (extended, typed): INSERT INTO t (col = v1, col2 = v2)
@@ -1386,6 +1420,11 @@ impl SParser {
                     let mut default: Option<String> = None;
                     loop {
                         if self.kw("UNSIGNED") || self.kw("ZEROFILL") {
+                            continue;
+                        }
+                        // MySQL attribute form `VARCHAR(n) BINARY` — binary
+                        // comparison for the column (Drupal's file_managed.uri).
+                        if self.kw("BINARY") {
                             continue;
                         }
                         if self.kw("NOT") {

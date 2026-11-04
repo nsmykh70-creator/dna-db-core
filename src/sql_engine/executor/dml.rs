@@ -66,6 +66,26 @@ impl SqlEngine {
         let mut stmt_unique: std::collections::HashMap<(String, Vec<u8>), String> =
             std::collections::HashMap::new();
         for row in rows {
+            // Positional INSERT (no column list): unnamed values map to the
+            // declared columns in order (MySQL semantics; Drupal and plain
+            // mysqldump output rely on it).
+            let row = if row.iter().any(|(c, _)| c.is_empty()) {
+                let declared = schema.declared_columns();
+                if row.len() != declared.len() {
+                    return Err(format!(
+                        "INSERT INTO {} VALUES: {} values for {} declared columns",
+                        table,
+                        row.len(),
+                        declared.len()
+                    ));
+                }
+                row.into_iter()
+                    .zip(declared.iter())
+                    .map(|((_, v), c)| (c.clone(), v))
+                    .collect::<Vec<_>>()
+            } else {
+                row
+            };
             let map: BTreeMap<String, Value> = row.into_iter().collect();
             // CMS edition: AUTO_INCREMENT assignment. A missing / NULL / 0
             // value for the sequence column gets the next generated id;
@@ -718,7 +738,12 @@ impl SqlEngine {
                 continue;
             }
             let pk = Self::pk_of(&schema, &row)?;
-            selected.push((Self::row_key(table, &pk), pk, row));
+            // Full storage key: composite PKs are stored as
+            // `table:<pk1>:<pk2>` (row_key_from_row) — a single-part key
+            // silently deletes nothing (Drupal's DELETE users_field_data
+            // WHERE uid = 1 before re-inserting user 1).
+            let key = Self::row_key_from_row(table, &schema, &row)?;
+            selected.push((key, pk, row));
         }
 
         let selected_keys: std::collections::HashSet<String> =
@@ -740,7 +765,7 @@ impl SqlEngine {
                         .unwrap_or(false)
                     {
                         let child_pk = Self::pk_of(&child_schema, &child)?;
-                        let child_key = Self::row_key(child_table, &child_pk);
+                        let child_key = Self::row_key_from_row(child_table, &child_schema, &child)?;
                         if !fk.on_delete_cascade && !selected_keys.contains(&child_key) {
                             return Err(format!(
                                 "RESTRICT violation: {} row {} is referenced by {}",
