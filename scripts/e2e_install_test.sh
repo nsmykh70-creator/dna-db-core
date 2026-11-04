@@ -14,7 +14,7 @@
 #   Phase 4  --uninstall — binary + unit/pidfile removed, process stopped,
 #            data directory kept.
 #
-# Env overrides: E2E_ROOT (work dir), E2E_PORT, PHP_BIN (mysqli client for the
+# Env overrides: E2E_ROOT (work dir), E2E_PORT, PHP_BIN_OVERRIDE (mysqli client for the
 # wire check; the phase is skipped when PHP with mysqli is unavailable).
 set -u
 
