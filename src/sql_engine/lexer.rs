@@ -164,7 +164,15 @@ pub(super) fn stokenize(input: &str) -> Result<Vec<STok>, String> {
                 if !closed {
                     return Err("SQL: unterminated string".into());
                 }
-                toks.push(STok::Str(s));
+                // Standard SQL: double quotes delimit an IDENTIFIER, not a
+                // string — Drupal's installer emits
+                // `CREATE TABLE "drupal_install_test" (...)`. Single quotes
+                // stay string literals (MySQL behaviour).
+                if quote == '"' {
+                    toks.push(STok::Ident(s));
+                } else {
+                    toks.push(STok::Str(s));
+                }
             }
             // `-5` is a negative literal only at an operand start position;
             // after an operand (`a-5`) the same character is the subtraction

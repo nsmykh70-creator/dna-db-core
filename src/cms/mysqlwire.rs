@@ -671,6 +671,13 @@ fn handle_connection(
             }
             COM_QUERY => {
                 stats.total_queries.fetch_add(1, Ordering::Relaxed);
+                // DNA_LOG_SQL=1: statement-level trace for CMS installer
+                // debugging (off by default; stderr only).
+                if std::env::var("DNA_LOG_SQL").as_deref() == Ok("1") {
+                    let sql = String::from_utf8_lossy(body);
+                    let head: String = sql.chars().take(140).collect();
+                    eprintln!("[SQL] {head}");
+                }
                 if let Err(e) = handle_query(&mut conn, gate, sid, body, caps) {
                     if e.kind() != std::io::ErrorKind::UnexpectedEof {
                         stats.total_errors.fetch_add(1, Ordering::Relaxed);

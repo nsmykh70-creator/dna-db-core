@@ -754,6 +754,14 @@ impl CmsSqlGate {
                 Value::Text(MYSQL_COMPAT_VERSION.to_string()),
             )));
         }
+        // JSON functions — Drupal's requirements check runs
+        // `SELECT JSON_TYPE('1')` to detect JSON support.
+        if compact.contains("JSON_TYPE(") {
+            return Ok(Some(one_value_reply(
+                fn_column(sql, "JSON_TYPE").as_str(),
+                Value::Text("INTEGER".into()),
+            )));
+        }
         // Named advisory locks. Aliased forms (`SELECT GET_LOCK(...) AS
         // acquired`) must name the column after the alias — MediaWiki reads
         // `$row->acquired`.
@@ -884,6 +892,120 @@ impl CmsSqlGate {
         sql: &str,
         upper: &str,
     ) -> Result<Option<CmsQueryResult>, CmsError> {
+        // SHOW ENGINES — Drupal's requirements page probes engine support.
+        if upper.starts_with("SHOW ENGINES") {
+            let mut rows = Vec::new();
+            for (engine, support, tx) in [
+                ("InnoDB", "DEFAULT", "YES"),
+                ("MyISAM", "YES", "NO"),
+                ("MEMORY", "YES", "NO"),
+                ("CSV", "YES", "NO"),
+            ] {
+                let mut r = BTreeMap::new();
+                r.insert("Engine".into(), Value::Text(engine.into()));
+                r.insert("Support".into(), Value::Text(support.into()));
+                r.insert("Comment".into(), Value::Text("Supported by DNA-DB compat".into()));
+                r.insert("Transactions".into(), Value::Text(tx.into()));
+                r.insert("XA".into(), Value::Text("NO".into()));
+                r.insert("Savepoints".into(), Value::Text("NO".into()));
+                rows.push(r);
+            }
+            let found = rows.len() as u64;
+            return Ok(Some(CmsQueryResult {
+                columns: vec![
+                    "Engine".into(), "Support".into(), "Comment".into(),
+                    "Transactions".into(), "XA".into(), "Savepoints".into(),
+                ],
+                rows,
+                message: Some(format!("{} engine(s)", found)),
+                plan: "cms: SHOW ENGINES shim".into(),
+                affected_rows: 0,
+                last_insert_id: 0,
+                found_rows: found,
+                is_select: true,
+            }));
+        }
+
+        // SHOW CHARACTER SET / SHOW CHARSET [LIKE 'pat'] — Drupal and Joomla
+        // read the default collation through this catalog.
+        if upper.starts_with("SHOW CHARACTER SET") || upper.starts_with("SHOW CHARSET") {
+            let like = find_like_pattern(sql).map(|p| decode_mysql_string(&p));
+            let mut rows = Vec::new();
+            for (cs, desc, coll, maxlen) in [
+                ("utf8mb4", "UTF-8 Unicode", "utf8mb4_general_ci", 4),
+                ("utf8", "UTF-8 Unicode", "utf8_general_ci", 3),
+                ("latin1", "cp1252 West European", "latin1_swedish_ci", 1),
+                ("binary", "Binary pseudo charset", "binary", 1),
+            ] {
+                if let Some(pat) = &like {
+                    if !like_match(pat, cs) {
+                        continue;
+                    }
+                }
+                let mut r = BTreeMap::new();
+                r.insert("Charset".into(), Value::Text(cs.into()));
+                r.insert("Description".into(), Value::Text(desc.into()));
+                r.insert("Default collation".into(), Value::Text(coll.into()));
+                r.insert("Maxlen".into(), Value::Int(maxlen));
+                rows.push(r);
+            }
+            let found = rows.len() as u64;
+            return Ok(Some(CmsQueryResult {
+                columns: vec![
+                    "Charset".into(), "Description".into(),
+                    "Default collation".into(), "Maxlen".into(),
+                ],
+                rows,
+                message: Some(format!("{} charset(s)", found)),
+                plan: "cms: SHOW CHARACTER SET shim".into(),
+                affected_rows: 0,
+                last_insert_id: 0,
+                found_rows: found,
+                is_select: true,
+            }));
+        }
+
+        // SHOW COLLATION [LIKE 'pat']
+        if upper.starts_with("SHOW COLLATION") {
+            let like = find_like_pattern(sql).map(|p| decode_mysql_string(&p));
+            let mut rows = Vec::new();
+            for (coll, cs, default) in [
+                ("utf8mb4_general_ci", "utf8mb4", true),
+                ("utf8mb4_bin", "utf8mb4", false),
+                ("utf8_general_ci", "utf8", true),
+                ("latin1_swedish_ci", "latin1", true),
+                ("binary", "binary", true),
+            ] {
+                if let Some(pat) = &like {
+                    if !like_match(pat, coll) {
+                        continue;
+                    }
+                }
+                let mut r = BTreeMap::new();
+                r.insert("Collation".into(), Value::Text(coll.into()));
+                r.insert("Charset".into(), Value::Text(cs.into()));
+                r.insert("Id".into(), Value::Int(45));
+                r.insert("Default".into(), Value::Text(if default { "Yes" } else { "" }.into()));
+                r.insert("Compiled".into(), Value::Text("Yes".into()));
+                r.insert("Sortlen".into(), Value::Int(1));
+                rows.push(r);
+            }
+            let found = rows.len() as u64;
+            return Ok(Some(CmsQueryResult {
+                columns: vec![
+                    "Collation".into(), "Charset".into(), "Id".into(),
+                    "Default".into(), "Compiled".into(), "Sortlen".into(),
+                ],
+                rows,
+                message: Some(format!("{} collation(s)", found)),
+                plan: "cms: SHOW COLLATION shim".into(),
+                affected_rows: 0,
+                last_insert_id: 0,
+                found_rows: found,
+                is_select: true,
+            }));
+        }
+
         // SHOW TABLES [LIKE 'pat'] — engine's own SHOW TABLES has no LIKE.
         if upper.starts_with("SHOW TABLES") {
             // The pattern is a MySQL string literal: decode escapes first
@@ -1280,6 +1402,10 @@ fn where_eq_pairs(sql: &str) -> Vec<(String, String)> {
     }
     let mut out = Vec::new();
     for cond in split_on_and(tail) {
+        // Catalog probes wrap each condition in parens
+        // (`("table_schema" = 'x') AND (...)`) — strip balanced outer
+        // parens so the top-level '=' scan sees them.
+        let cond = strip_balanced_parens(&cond);
         // top-level '=' only
         let mut depth = 0usize;
         let mut in_quote: Option<char> = None;
@@ -1304,7 +1430,10 @@ fn where_eq_pairs(sql: &str) -> Vec<(String, String)> {
             }
         }
         let Some(i) = eq else { continue };
-        let col = cond[..i].trim().trim_matches('`').to_ascii_lowercase();
+        let col = cond[..i]
+            .trim()
+            .trim_matches(|c| c == '`' || c == '"')
+            .to_ascii_lowercase();
         let val = cond[i + 1..].trim();
         let decoded = if (val.starts_with('\'') && val.ends_with('\'') && val.len() >= 2)
             || (val.starts_with('"') && val.ends_with('"') && val.len() >= 2)
@@ -1316,6 +1445,39 @@ fn where_eq_pairs(sql: &str) -> Vec<(String, String)> {
         out.push((col, decoded));
     }
     out
+}
+
+/// Strips one level of balanced outer parentheses (`( a = 'b' )` → `a = 'b'`).
+fn strip_balanced_parens(s: &str) -> &str {
+    let t = s.trim();
+    if !t.starts_with('(') || !t.ends_with(')') || t.len() < 2 {
+        return t;
+    }
+    let bytes = t.as_bytes();
+    let mut depth = 0usize;
+    let mut in_q: Option<u8> = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        match in_q {
+            Some(q) => {
+                if b == q {
+                    in_q = None;
+                }
+            }
+            None => match b {
+                b'\'' | b'"' | b'`' => in_q = Some(b),
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    // The opening paren must close at the LAST byte.
+                    if depth == 0 && i != bytes.len() - 1 {
+                        return t; // parens do not wrap the whole condition
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+    &t[1..t.len() - 1]
 }
 
 /// Standard `information_schema.schemata` row.
