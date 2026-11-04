@@ -47,7 +47,9 @@ impl SParser {
                 let pk = self.ident()?;
                 // Prefix index `PRIMARY KEY (id(100))` (Joomla's
                 // webauthn_credentials) — the length is dropped; the engine
-                // indexes the whole column.
+                // indexes the whole column. cms-gated: keeps the plain
+                // (non-cms) build byte-identical to pre-cms behaviour.
+                #[cfg(feature = "cms")]
                 self.consume_type_len()?;
                 // CMS edition: composite PRIMARY KEY (a, b) — the engine keys
                 // on the first column for native paths; the full list is
