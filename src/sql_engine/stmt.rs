@@ -182,6 +182,18 @@ pub(crate) enum SelectItem {
         /// Aggregate key inside HAVING/ORDER BY (canonical rendering).
         canonical: String,
     },
+    /// CMS edition: `SUM(expr)` / `AVG(expr)` … with an EXPRESSION argument
+    /// (Joomla's dashboard: `SUM(CASE WHEN … END) AS due_count`). The
+    /// expression is materialised per row under `arg_name` before
+    /// aggregation; only the aggregate output column is emitted.
+    AggOverExpr {
+        expr: Expr,
+        /// Row key the expression is materialised under (= its rendering).
+        arg_name: String,
+        func: AggFunc,
+        rendered: String,
+        canonical: String,
+    },
     /// Computed projection: an arithmetic expression, e.g. `total_usd * 2`.
     Computed {
         expr: Expr,

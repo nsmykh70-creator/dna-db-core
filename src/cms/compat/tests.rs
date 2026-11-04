@@ -1350,3 +1350,226 @@ fn catalog_probe_multi_condition_where() {
     let wp = "SELECT 1 FROM information_schema.tables WHERE table_schema = 'wp' AND table_name = 'wp_options'";
     assert_eq!(where_eq_pairs(wp).len(), 2);
 }
+
+#[test]
+fn key_named_with_type_keyword_is_a_constraint() {
+    // Joomla base.sql: `KEY time (time)` / `KEY userid (userid)` — the
+    // index name may be ANY identifier, including type keywords; only the
+    // paren content (identifiers = columns vs numbers = type length)
+    // distinguishes it from a column named `key` with a length-carrying
+    // type (`KEY char(32)`).
+    let g = gate("key_time");
+    let s = g.open_session();
+    g.execute(
+        s,
+        "CREATE TABLE jsml_session (
+            session_id varbinary(192) NOT NULL,
+            client_id tinyint unsigned DEFAULT NULL,
+            guest tinyint unsigned DEFAULT 1,
+            time int NOT NULL DEFAULT 0,
+            userid int DEFAULT 0,
+            PRIMARY KEY (session_id),
+            KEY userid (userid),
+            KEY time (time),
+            KEY client_id_guest (client_id, guest)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 DEFAULT COLLATE=utf8mb4_unicode_ci",
+    )
+    .unwrap();
+    g.execute(
+        s,
+        "INSERT INTO jsml_session (session_id, time, userid) VALUES ('abc123', 1700000000, 42)",
+    )
+    .unwrap();
+    let r = g
+        .execute(s, "SELECT time, userid FROM jsml_session WHERE session_id = 'abc123'")
+        .unwrap();
+    assert_eq!(r.rows.len(), 1);
+    assert_eq!(v(&r.rows[0], "time"), "1700000000");
+    assert_eq!(v(&r.rows[0], "userid"), "42");
+
+    // A column named `key` whose type carries a paren stays a column.
+    g.execute(
+        s,
+        "CREATE TABLE jsml_keycol (id int PRIMARY KEY, `key` char(32) NOT NULL DEFAULT '')",
+    )
+    .unwrap();
+    g.execute(s, "INSERT INTO jsml_keycol (id, `key`) VALUES (1, 'k1')").unwrap();
+    let r = g.execute(s, "SELECT `key` FROM jsml_keycol WHERE id = 1").unwrap();
+    assert_eq!(v(&r.rows[0], "key"), "k1");
+}
+
+#[test]
+fn alter_database_is_a_noop_ok() {
+    // Joomla's installer: ALTER DATABASE ... CHARACTER SET ... COLLATE ...
+    // right after CREATE DATABASE — answered with a plain OK packet.
+    let g = gate("alter_db");
+    let s = g.open_session();
+    let r = g
+        .execute(
+            s,
+            "ALTER DATABASE `dnajoomla` CHARACTER SET `utf8mb4` COLLATE `utf8mb4_unicode_ci`",
+        )
+        .unwrap();
+    assert!(r.message.is_some());
+}
+
+#[test]
+fn prefix_indexes_in_pk_and_nameless_index() {
+    // Joomla supports.sql: webauthn_credentials uses `PRIMARY KEY (id(100))`
+    // (prefix length on the FIRST PK column) and a nameless `INDEX (col(100))`.
+    let g = gate("prefix_idx");
+    let s = g.open_session();
+    g.execute(
+        s,
+        "CREATE TABLE jsml_webauthn_credentials (
+            id VARCHAR(1000) NOT NULL COMMENT 'Credential ID',
+            user_id VARCHAR(128) NOT NULL COMMENT 'User handle',
+            label VARCHAR(190) NOT NULL COMMENT 'Human readable label',
+            credential MEDIUMTEXT NOT NULL COMMENT 'Credential source data, JSON format',
+            PRIMARY KEY (id(100)),
+            INDEX (user_id(100))
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 DEFAULT COLLATE=utf8mb4_unicode_ci",
+    )
+    .unwrap();
+    g.execute(
+        s,
+        "INSERT INTO jsml_webauthn_credentials (id, user_id, label, credential) VALUES ('cred-1', 'u42', 'yubikey', '{}')",
+    )
+    .unwrap();
+    // PK point lookup by the full column value (prefix index ≈ whole-column).
+    let r = g
+        .execute(s, "SELECT label FROM jsml_webauthn_credentials WHERE id = 'cred-1'")
+        .unwrap();
+    assert_eq!(r.rows.len(), 1);
+    assert_eq!(v(&r.rows[0], "label"), "yubikey");
+}
+
+#[test]
+fn joomla_extensions_sql_seed_quirks() {
+    // Joomla extensions.sql: negative DEFAULTs, scalar functions
+    // (CONCAT/NOW/DATE_FORMAT/TIME_FORMAT + INTERVAL arithmetic) in
+    // INSERT VALUES, and a PK-less table (finder_terms_common) whose rows
+    // are keyed by the implicit hidden __rowid.
+    let g = gate("ext_quirks");
+    let s = g.open_session();
+    g.execute(
+        s,
+        "CREATE TABLE jsml_banners (id int unsigned NOT NULL AUTO_INCREMENT, purchase_type tinyint NOT NULL DEFAULT -1, track_clicks tinyint NOT NULL DEFAULT -1, PRIMARY KEY (id))",
+    )
+    .unwrap();
+    g.execute(s, "INSERT INTO jsml_banners (id) VALUES (1)").unwrap();
+    let r = g
+        .execute(s, "SELECT purchase_type FROM jsml_banners WHERE id = 1")
+        .unwrap();
+    assert_eq!(v(&r.rows[0], "purchase_type"), "-1");
+
+    // scheduler rows: function calls + INTERVAL arithmetic in VALUES
+    g.execute(
+        s,
+        "CREATE TABLE jsml_scheduler_tasks (id int unsigned NOT NULL AUTO_INCREMENT, rule_type varchar(50) NOT NULL DEFAULT '', next_execution datetime, last_execution datetime, PRIMARY KEY (id))",
+    )
+    .unwrap();
+    g.execute(
+        s,
+        "INSERT INTO jsml_scheduler_tasks (id, rule_type, next_execution, last_execution) VALUES (1, CONCAT('interval', '-days'), DATE_FORMAT(NOW() + INTERVAL 30 DAY, '%Y-%m-%d %H:00:00'), DATE_FORMAT(NOW(), '%e')), (2, 'session.gc', DATE_FORMAT(NOW() + INTERVAL 24 HOUR, '%Y-%m-%d %H:00:00'), TIME_FORMAT(NOW(), '%H:00'))",
+    )
+    .unwrap();
+    let r = g
+        .execute(s, "SELECT rule_type, next_execution FROM jsml_scheduler_tasks WHERE id = 1")
+        .unwrap();
+    assert_eq!(v(&r.rows[0], "rule_type"), "interval-days");
+    let next1 = v(&r.rows[0], "next_execution");
+    // NOW()+30 days: same clock time, date shifted by a month-ish
+    assert_eq!(next1.len(), 19, "DATETIME shape: {next1}");
+    let r = g
+        .execute(s, "SELECT next_execution FROM jsml_scheduler_tasks WHERE id = 2")
+        .unwrap();
+    assert_eq!(v(&r.rows[0], "next_execution").len(), 19);
+
+    // PK-less table: rows are keyed by the hidden __rowid; SELECT * does
+    // NOT expose it, inserts without any PK succeed.
+    g.execute(
+        s,
+        "CREATE TABLE jsml_finder_terms_common (term varchar(75) NOT NULL DEFAULT '', language char(7) NOT NULL DEFAULT '', custom int NOT NULL DEFAULT 0, UNIQUE KEY idx_term_language (term, language), KEY idx_lang (language))",
+    )
+    .unwrap();
+    g.execute(
+        s,
+        "INSERT INTO jsml_finder_terms_common (term, language, custom) VALUES ('joomla', 'en-GB', 0)",
+    )
+    .unwrap();
+    let r = g
+        .execute(
+            s,
+            "SELECT term, language, custom FROM jsml_finder_terms_common WHERE term = 'joomla'",
+        )
+        .unwrap();
+    assert_eq!(r.rows.len(), 1);
+    assert_eq!(v(&r.rows[0], "language"), "en-GB");
+    // SELECT * never leaks the hidden key column
+    let r = g.execute(s, "SELECT * FROM jsml_finder_terms_common").unwrap();
+    assert_eq!(r.columns, vec!["term", "language", "custom"]);
+    // duplicate rows are legal in a PK-less MySQL table
+    g.execute(
+        s,
+        "INSERT INTO jsml_finder_terms_common (term, language, custom) VALUES ('joomla', 'de-DE', 1)",
+    )
+    .unwrap();
+    let r = g
+        .execute(s, "SELECT COUNT(*) c FROM jsml_finder_terms_common")
+        .unwrap();
+    assert_eq!(v(&r.rows[0], "c"), "2");
+}
+
+#[test]
+fn case_expression_through_gate() {
+    let g = gate("case_gate");
+    let s = g.open_session();
+    g.execute(
+        s,
+        "CREATE TABLE jsml_content (id int PRIMARY KEY, title varchar(100), state int, publish_up datetime, created datetime)",
+    )
+    .unwrap();
+    g.execute(
+        s,
+        "INSERT INTO jsml_content (id, title, state, publish_up, created) VALUES (1, 't', 1, NULL, '2026-01-01 10:00:00')",
+    )
+    .unwrap();
+    // the exact Joomla ArticlesModel projection shape (first CASE item)
+    let r = g
+        .execute(
+            s,
+            "SELECT `a`.`id`,`a`.`title`,CASE WHEN `a`.`publish_up` IS NULL THEN `a`.`created` ELSE `a`.`publish_up` END AS `publish_up` FROM jsml_content AS `a` WHERE `a`.`state` = 1",
+        )
+        .unwrap();
+    assert_eq!(r.rows.len(), 1);
+    assert_eq!(v(&r.rows[0], "publish_up"), "2026-01-01 10:00:00");
+}
+
+#[test]
+fn order_by_case_expression() {
+    // Joomla frontpage: ORDER BY c.lft, a.featured DESC, fp.ordering,
+    // CASE WHEN a.publish_up IS NULL THEN a.created ELSE a.publish_up END DESC
+    let g = gate("order_case");
+    let s = g.open_session();
+    g.execute(
+        s,
+        "CREATE TABLE jsml_articles (id int PRIMARY KEY, title varchar(100), publish_up datetime, created datetime, state int)",
+    )
+    .unwrap();
+    g.execute(
+        s,
+        "INSERT INTO jsml_articles (id, title, publish_up, created, state) VALUES (1, 'old-published', '2026-01-01 10:00:00', '2026-01-01 09:00:00', 1), (2, 'null-published', NULL, '2026-02-01 09:00:00', 1)",
+    )
+    .unwrap();
+    let r = g
+        .execute(
+            s,
+            "SELECT id, CASE WHEN publish_up IS NULL THEN created ELSE publish_up END AS sortkey FROM jsml_articles WHERE state = 1 ORDER BY CASE WHEN publish_up IS NULL THEN created ELSE publish_up END DESC",
+        )
+        .unwrap();
+    assert_eq!(r.rows.len(), 2);
+    // the NULL publish_up row falls back to created (2026-02-01) — newer
+    assert_eq!(v(&r.rows[0], "id"), "2");
+    assert_eq!(v(&r.rows[1], "id"), "1");
+}

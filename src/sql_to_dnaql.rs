@@ -320,6 +320,11 @@ fn emit_columns(
                     rendered
                 ));
             }
+            // CMS edition: expression aggregates render as their canonical
+            // aggregate column (same shape as plain aggregates).
+            SelectItem::AggOverExpr { rendered, .. } => {
+                cols.push(rendered.clone());
+            }
             SelectItem::Column { source, alias } => {
                 if let Some(a) = alias {
                     if a != source {

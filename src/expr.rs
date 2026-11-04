@@ -134,8 +134,18 @@ pub fn is_scalar_fn(name: &str) -> bool {
             | "NULLIF"
             | "IF"
             | "GREATEST" | "LEAST"
+            // MySQL datetime functions + formatting (Joomla's scheduler
+            // seed rows in extensions.sql use NOW()/DATE_FORMAT/
+            // TIME_FORMAT inside INSERT VALUES).
+            | "NOW" | "CURDATE" | "CURTIME" | "UNIX_TIMESTAMP"
+            | "DATE_FORMAT" | "TIME_FORMAT"
     )
 }
+
+/// Sentinel pattern for `LIKE NULL` (parameter probes): every row yields
+/// SQL NULL per MySQL three-valued logic. Never matches a real pattern —
+/// a literal NUL byte cannot appear in a parsed string literal.
+pub const NULL_LIKE_PATTERN: &str = "\u{0}like-null";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArithOp {
@@ -241,6 +251,9 @@ impl Expr {
             | Expr::ScalarSubquery { .. }
             | Expr::Exists { .. } => Some(Value::Null),
             Expr::Like { operand, pattern, negated } => {
+                if pattern == NULL_LIKE_PATTERN {
+                    return Some(Value::Null);
+                }
                 let v = operand.eval(row)?;
                 if v.is_null() {
                     return Some(Value::Null);
@@ -553,7 +566,7 @@ pub fn eval_for_translator(name: &str, vals: &[Option<Value>]) -> Option<Value> 
 /// the server: most functions return NULL on any NULL input; COALESCE /
 /// IFNULL / CONCAT_WS / IF have their documented exceptions.
 #[allow(clippy::too_many_lines)]
-fn eval_scalar_fn(name: &str, vals: &[Option<Value>]) -> Option<Value> {
+pub(crate) fn eval_scalar_fn(name: &str, vals: &[Option<Value>]) -> Option<Value> {
     // eval() yields Option<Value> where BOTH None (no value) and
     // Some(Value::Null) mean SQL NULL here — function NULL semantics must
     // treat them identically (CONCAT('a', NULL) → NULL etc.).
@@ -769,8 +782,228 @@ fn eval_scalar_fn(name: &str, vals: &[Option<Value>]) -> Option<Value> {
             }
             Some(best)
         }
+        "NOW" => Some(Value::Text(datetime_text(now_parts()))),
+        "CURDATE" => {
+            let (y, m, d, _, _, _) = now_parts();
+            Some(Value::Text(format!("{y:04}-{m:02}-{d:02}")))
+        }
+        "CURTIME" => {
+            let (_, _, _, hh, mm, ss) = now_parts();
+            Some(Value::Text(format!("{hh:02}:{mm:02}:{ss:02}")))
+        }
+        "UNIX_TIMESTAMP" => Some(Value::Int(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64,
+        )),
+        "DATE_FORMAT" | "TIME_FORMAT" => {
+            let dt = txt(0)?;
+            let fmt = txt(1)?;
+            Some(Value::Text(format_datetime(&parse_datetime(&dt), &fmt)))
+        }
         _ => None, // is_scalar_fn gate keeps this unreachable
     }
+}
+
+// --- MySQL datetime helpers (scalar fn support) --------------------------
+
+/// Current UTC time as (year, month, day, hour, minute, second).
+pub(crate) fn now_parts() -> (i64, i64, i64, i64, i64, i64) {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    (y, m as i64, d as i64, rem / 3600, (rem % 3600) / 60, rem % 60)
+}
+
+/// Howard Hinnant's days-since-epoch → (year, month, day).
+pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Days since epoch for a proleptic Gregorian date (inverse of civil_from_days).
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = m as i64;
+    let doy = (153 * (if mp > 2 { mp - 3 } else { mp + 9 }) + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Parse `YYYY-MM-DD[ HH:MM:SS[:fraction]]` (MySQL DATE/DATETIME text).
+/// Missing time parts default to 00:00:00.
+pub(crate) fn parse_datetime(s: &str) -> (i64, i64, i64, i64, i64, i64) {
+    let s = s.trim();
+    let mut date = s;
+    let mut time = "";
+    if let Some(sp) = s.find(' ') {
+        date = &s[..sp];
+        time = s[sp + 1..].trim_end_matches('Z');
+    }
+    let nums: Vec<i64> = date
+        .split('-')
+        .filter_map(|p| p.parse::<i64>().ok())
+        .collect();
+    let (y, m, d) = match nums.as_slice() {
+        [y, m, d] => (*y, *m, *d),
+        _ => {
+            let (y, m, d, _, _, _) = now_parts();
+            (y, m, d)
+        }
+    };
+    let tnums: Vec<i64> = time
+        .split(':')
+        .map(|p| p.split('.').next().unwrap_or(p))
+        .filter_map(|p| p.parse::<i64>().ok())
+        .collect();
+    let (hh, mm, ss) = match tnums.as_slice() {
+        [a, b, c] => (*a, *b, *c),
+        [a, b] => (*a, *b, 0),
+        [a] => (*a, 0, 0),
+        _ => (0, 0, 0),
+    };
+    (y, m, d, hh, mm, ss)
+}
+
+/// (y, m, d, hh, mm, ss) → `YYYY-MM-DD HH:MM:SS`.
+pub(crate) fn datetime_text(p: (i64, i64, i64, i64, i64, i64)) -> String {
+    let (y, m, d, hh, mm, ss) = p;
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        p.0, p.1, p.2, p.3, p.4, p.5
+    )
+}
+
+/// Shift a datetime value by `n` units (MySQL `+/- INTERVAL n UNIT`).
+/// Date parts carry (months for MONTH/YEAR, days for the rest).
+pub(crate) fn shift_datetime(
+    v: &Value,
+    n: i64,
+    unit: &str,
+) -> Value {
+    let (y, mo, d, hh, mm, ss) = parse_datetime(&fn_to_text(v));
+    match unit.to_ascii_uppercase().as_str() {
+        "YEAR" | "MONTH" => {
+            let months = y * 12 + mo as i64 - 1
+                + if unit.eq_ignore_ascii_case("YEAR") { n * 12 } else { n };
+            let ny = months.div_euclid(12);
+            let nmo = months.rem_euclid(12) as u32 + 1;
+            // clamp day to the target month's length
+            let dim = days_in_month(ny, nmo);
+            let nd = (d as i64).min(dim) as u32;
+            Value::Text(datetime_text((ny, nmo as i64, nd as i64, hh, mm, ss)))
+        }
+        "SECOND" | "MINUTE" | "HOUR" | "DAY" | "WEEK" => {
+            let mult = match unit.to_ascii_uppercase().as_str() {
+                "SECOND" => 1,
+                "MINUTE" => 60,
+                "HOUR" => 3600,
+                "DAY" => 86_400,
+                _ => 604_800,
+            };
+            let total = days_from_civil(y, mo as u32, d as u32) * 86_400
+                + hh * 3600
+                + mm * 60
+                + ss
+                + n * mult;
+            let days = total.div_euclid(86_400);
+            let rem = total.rem_euclid(86_400);
+            let (ny, nmo, nd) = civil_from_days(days);
+            Value::Text(datetime_text((
+                ny,
+                nmo as i64,
+                nd as i64,
+                rem / 3600,
+                (rem % 3600) / 60,
+                rem % 60,
+            )))
+        }
+        _ => v.clone(),
+    }
+}
+
+fn days_in_month(y: i64, m: u32) -> i64 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 30,
+    }
+}
+
+/// MySQL DATE_FORMAT subset: the specifiers real CMS dumps use.
+fn format_datetime(p: &(i64, i64, i64, i64, i64, i64), fmt: &str) -> String {
+    let (y, mo, d, hh, mm, ss) = *p;
+    let weekday = (days_from_civil(y, mo as u32, d as u32).rem_euclid(7) + 4) % 7; // 1970-01-01 = Thursday
+    let months = [
+        "January", "February", "March", "April", "May", "June", "July",
+        "August", "September", "October", "November", "December",
+    ];
+    let days_n = [
+        "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
+    ];
+    let mut out = String::new();
+    let mut chars = fmt.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('Y') => out.push_str(&format!("{y:04}")),
+            Some('y') => out.push_str(&format!("{:02}", y.rem_euclid(100))),
+            Some('m') => out.push_str(&format!("{mo:02}")),
+            Some('c') => out.push_str(&mo.to_string()),
+            Some('d') => out.push_str(&format!("{d:02}")),
+            Some('e') => out.push_str(&d.to_string()),
+            Some('H') => out.push_str(&format!("{hh:02}")),
+            Some('k') => out.push_str(&hh.to_string()),
+            Some('h') | Some('I') => {
+                let h12 = if hh % 12 == 0 { 12 } else { hh % 12 };
+                out.push_str(&format!("{h12:02}"))
+            }
+            Some('i') => out.push_str(&format!("{mm:02}")),
+            Some('s') | Some('S') => out.push_str(&format!("{ss:02}")),
+            Some('f') => out.push_str("000000"),
+            Some('p') => out.push_str(if hh < 12 { "AM" } else { "PM" }),
+            Some('W') => out.push_str(days_n[weekday as usize]),
+            Some('a') => out.push_str(&days_n[weekday as usize][..3]),
+            Some('M') => out.push_str(months[(mo as usize - 1).min(11)]),
+            Some('b') => out.push_str(&months[(mo as usize - 1).min(11)][..3]),
+            Some('j') => out.push_str(&format!(
+                "{:03}",
+                days_from_civil(y, mo as u32, d as u32) - days_from_civil(y, 1, 1) + 1
+            )),
+            Some('%') => out.push('%'),
+            Some(other) => {
+                out.push('%');
+                out.push(other);
+            }
+            None => out.push('%'),
+        }
+    }
+    out
 }
 
 #[cfg(test)]

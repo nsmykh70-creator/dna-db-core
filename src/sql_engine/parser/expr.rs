@@ -7,7 +7,7 @@ use super::*;
 
 impl SParser {
     pub(super) fn value(&mut self) -> Result<Value, String> {
-        match self.next() {
+        let v = match self.next() {
             STok::Minus => match self.next() {
                 STok::Int(i) => i
                     .checked_neg()
@@ -30,7 +30,59 @@ impl SParser {
                 }
                 Ok(Value::Text(Self::current_pseudo_literal_value(&s)))
             }
+            // Scalar function call in a value position: CONCAT('a', 'b'),
+            // NOW(), DATE_FORMAT(NOW() + INTERVAL 30 DAY, '%Y-%m-%d').
+            // Joomla's extensions.sql seeds scheduler tasks with these.
+            STok::Ident(s)
+                if matches!(self.peek(), STok::LParen)
+                    && crate::expr::is_scalar_fn(&s) =>
+            {
+                self.next(); // '('
+                let mut args: Vec<Option<Value>> = Vec::new();
+                if !matches!(self.peek(), STok::RParen) {
+                    loop {
+                        args.push(Some(self.value()?));
+                        if matches!(self.peek(), STok::Comma) {
+                            self.next();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                self.expect(STok::RParen)?;
+                Ok(crate::expr::eval_scalar_fn(&s, &args).unwrap_or(Value::Null))
+            }
             t => Err(format!("SQL: expected literal, got {:?}", t)),
+        }?;
+        self.fold_datetime_interval(v)
+    }
+
+    /// `NOW() + INTERVAL 30 DAY` / `NOW() - INTERVAL 24 HOUR` — datetime
+    /// arithmetic the CMS seed data uses. Folded right in `value()` so
+    /// VALUES / DEFAULT / SET all accept it; a `+`/`-` NOT followed by
+    /// INTERVAL is left untouched for the expression grammar.
+    fn fold_datetime_interval(&mut self, v: Value) -> Result<Value, String> {
+        let mut acc = v;
+        loop {
+            let is_interval_next = |w: &STok| {
+                matches!(w, STok::Ident(w2) if w2.eq_ignore_ascii_case("INTERVAL"))
+            };
+            let dir: i64 = match self.peek() {
+                STok::Plus if is_interval_next(&self.peek_at(1)) => 1,
+                STok::Minus if is_interval_next(&self.peek_at(1)) => -1,
+                _ => return Ok(acc),
+            };
+            self.next(); // '+' | '-'
+            self.next(); // INTERVAL
+            let n = match self.next() {
+                STok::Int(i) => i,
+                t => return Err(format!("SQL: bad INTERVAL value, got {:?}", t)),
+            };
+            let unit = match self.next() {
+                STok::Ident(u) => u,
+                t => return Err(format!("SQL: bad INTERVAL unit, got {:?}", t)),
+            };
+            acc = crate::expr::shift_datetime(&acc, dir * n, &unit);
         }
     }
 
@@ -222,6 +274,13 @@ impl SParser {
         }
         let pattern = match self.next() {
             STok::Str(s) => s,
+            // `LIKE NULL` — MySQL yields NULL for every row (three-valued
+            // logic). Real queries bind the pattern as a parameter; the
+            // prepared-statement probe substitutes NULL and must still
+            // parse (Joomla's assets search: WHERE name LIKE ?).
+            STok::Ident(n) if n.eq_ignore_ascii_case("NULL") => {
+                return Ok(crate::expr::NULL_LIKE_PATTERN.to_string())
+            }
             t => return Err(format!("SQL: LIKE expects a quoted pattern, got {:?}", t)),
         };
         if paren {
@@ -286,6 +345,21 @@ impl SParser {
                 Ok(Expr::Literal(typed_string_literal(&s)))
             }
             STok::Ident(s) => {
+                // MySQL CASE — desugared to nested scalar IF() calls (the
+                // engine's IF has MySQL truthiness; NULL conditions fall to
+                // the ELSE arm). Both forms:
+                //   CASE WHEN cond THEN r [WHEN … THEN …] [ELSE e] END
+                //   CASE operand WHEN v THEN r […] [ELSE e] END
+                // (Joomla's ArticlesModel projection uses the searched form.)
+                // Arms recurse through the whole grammar, so the same depth
+                // guard as parse_or/parse_select applies (hostile
+                // CASE CASE CASE … input would otherwise overflow the stack).
+                if s.eq_ignore_ascii_case("CASE") {
+                    self.enter()?;
+                    let r = self.parse_case_body();
+                    self.leave();
+                    return r;
+                }
                 // MySQL `CAST(expr AS type)` (WordPress meta queries:
                 // `CAST(meta_value AS SIGNED) > 100`).
                 if s.eq_ignore_ascii_case("CAST") && matches!(self.peek_at(1), STok::LParen) {
@@ -418,5 +492,49 @@ impl SParser {
             }
             t => Err(format!("SQL: expected operand, got {:?}", t)),
         }
+    }
+    /// CASE body after the `CASE` keyword (depth-guarded by the caller).
+    fn parse_case_body(&mut self) -> Result<Expr, String> {
+        self.next(); // CASE (consumed here; the caller only guards depth)
+        // peek, don't consume: the WHEN belongs to the arms loop
+        let base = if matches!(
+            self.peek(),
+            STok::Ident(w) if w.eq_ignore_ascii_case("WHEN")
+        ) {
+            None
+        } else {
+            Some(self.parse_primary()?)
+        };
+        let mut arms: Vec<(Expr, Expr)> = Vec::new();
+        while self.kw("WHEN") {
+            let when = self.parse_or()?;
+            self.expect_kw("THEN")?;
+            let then = self.parse_or()?;
+            arms.push((when, then));
+        }
+        if arms.is_empty() {
+            return Err("SQL: CASE without WHEN".into());
+        }
+        let mut acc = if self.kw("ELSE") {
+            self.parse_or()?
+        } else {
+            Expr::Literal(Value::Null)
+        };
+        self.expect_kw("END")?;
+        for (when, then) in arms.into_iter().rev() {
+            let cond = match &base {
+                Some(b) => Expr::Cmp {
+                    op: CmpOp::Eq,
+                    left: Box::new(b.clone()),
+                    right: Box::new(when),
+                },
+                None => when,
+            };
+            acc = Expr::Fn {
+                name: "IF".to_string(),
+                args: vec![cond, then, acc],
+            };
+        }
+        Ok(acc)
     }
 }

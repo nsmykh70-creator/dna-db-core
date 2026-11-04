@@ -355,10 +355,17 @@ impl SParser {
                 // (Plain builds keep the original strict grammar: the key
                 // ends here and the operator surfaces as trailing tokens.)
                 else if cfg!(feature = "cms")
-                    && matches!(
+                    && (matches!(
                         self.peek(),
                         STok::Plus | STok::Minus | STok::Star | STok::Slash
-                    )
+                    ) || matches!(
+                        // `ORDER BY CASE … END [DESC]` — Joomla's frontpage
+                        // ordering sorts on a CASE expression; rewind and
+                        // parse the whole key as an expression like the
+                        // arithmetic idiom above.
+                        self.peek(),
+                        STok::Ident(w) if w.eq_ignore_ascii_case("WHEN")
+                    ))
                 {
                     self.pos = start;
                     let expr = self.parse_expr()?;
@@ -604,12 +611,47 @@ impl SParser {
                     // CMS edition: qualified aggregate arguments —
                     // SUM(postmeta.meta_value) — the qualifier is stripped
                     // (single-namespace row model, like GROUP BY t.col).
-                    let mut col = self.ident()?;
-                    if matches!(self.peek(), STok::Dot) {
-                        self.next();
-                        col = self.ident()?;
+                    let is_plain = match (self.peek(), self.peek_at(1)) {
+                        (STok::Ident(_), STok::RParen) => true,
+                        (STok::Ident(_), STok::Dot) => {
+                            matches!(self.peek_at(2), STok::Ident(_))
+                                && matches!(self.peek_at(3), STok::RParen)
+                        }
+                        _ => false,
+                    };
+                    if is_plain {
+                        let mut col = self.ident()?;
+                        if matches!(self.peek(), STok::Dot) {
+                            self.next();
+                            col = self.ident()?;
+                        }
+                        Some(col)
+                    } else {
+                        // Expression argument — `SUM(CASE WHEN … END)`,
+                        // `AVG(a.x + a.y)` (Joomla's admin dashboard counts).
+                        // The caller receives AggOverExpr: the executor
+                        // materialises the expression per row under its
+                        // rendered name and aggregates over that column.
+                        let expr = self.parse_or()?;
+                        let arg_name = expr.describe();
+                        self.expect(STok::RParen)?;
+                        if distinct {
+                            return Err(
+                                "SQL: DISTINCT aggregate requires a column argument".into()
+                            );
+                        }
+                        let func = AggFunc::from_name(&s)?;
+                        let canonical = render_agg_distinct(&s, Some(&arg_name), false);
+                        let alias = self.maybe_as_alias()?;
+                        let rendered = alias.unwrap_or_else(|| canonical.clone());
+                        return Ok(SelectItem::AggOverExpr {
+                            expr,
+                            arg_name,
+                            func,
+                            rendered,
+                            canonical,
+                        });
                     }
-                    Some(col)
                 };
                 self.expect(STok::RParen)?;
                 if distinct && arg.is_none() {

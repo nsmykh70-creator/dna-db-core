@@ -38,6 +38,14 @@ pub(super) fn stokenize(input: &str) -> Result<Vec<STok>, String> {
         let c = b[i];
         match c {
             ' ' | '\t' | '\r' | '\n' => i += 1,
+            '#' => {
+                // MySQL `#` line comment — skip to end of line. Joomla's
+                // base.sql (like classic mysqldump output) uses `#` header
+                // comments; the lexer must treat them as whitespace.
+                while i < b.len() && b[i] != '\n' {
+                    i += 1;
+                }
+            }
             ',' => {
                 toks.push(STok::Comma);
                 i += 1;

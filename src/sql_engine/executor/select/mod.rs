@@ -327,6 +327,27 @@ impl SqlEngine {
             plan.push_str(" -> ScalarSub(per-row)");
         }
 
+        // Expression aggregates (`SUM(CASE WHEN … END)`) materialise their
+        // argument expressions into the rows BEFORE aggregation, so the
+        // aggregate reads a real column (same mechanism as ORDER BY keys).
+        for item in projection {
+            let mk = match item {
+                SelectItem::OrderKeyOnly { expr, rendered } => Some((expr, rendered)),
+                SelectItem::AggOverExpr {
+                    expr, arg_name, ..
+                } => Some((expr, arg_name)),
+                _ => None,
+            };
+            if let Some((expr, rendered)) = mk {
+                for row in current.iter_mut() {
+                    if !row.contains_key(rendered) {
+                        let v = expr.eval(row).unwrap_or(Value::Null);
+                        row.insert(rendered.clone(), v);
+                    }
+                }
+            }
+        }
+
         // Aggregation (GROUP BY / HAVING / aggregate projections).
         let agg_items = collect_agg_items(projection, having.as_ref());
         let has_agg = !group_by.is_empty() || !agg_items.is_empty() || having.is_some();
@@ -496,23 +517,51 @@ impl SqlEngine {
                             computed.push((rendered.clone(), expr.clone()));
                         }
                         SelectItem::Agg { rendered, .. } => specs.push(rendered.clone()),
+                        SelectItem::AggOverExpr { rendered, .. } => {
+                            specs.push(rendered.clone())
+                        }
                         // CMS edition: sort keys emit no output column.
                         SelectItem::OrderKeyOnly { .. }
                         | SelectItem::AliasStar(_)
                         | SelectItem::Star => {}
                     }
                 }
-                // A computed expression may only reference real columns of
-                // the source table (plain columns keep the legacy behaviour
-                // of being skipped when absent).
-                if let Some(schema) = self.get_schema(&from) {
+                // A computed expression may only reference real columns —
+                // resolved against the JOIN universe (FROM + every JOIN
+                // table), because rows are flattened into one namespace
+                // after the joins: Joomla's CASE projections reference
+                // `c.published` / `ua.name` from joined tables. Plain
+                // columns keep the legacy behaviour of being skipped when
+                // absent; a column in NO reachable schema is errno 1054.
+                if !computed.is_empty() {
+                    let mut universe: Vec<String> = vec![from.to_string()];
+                    universe.extend(joins.iter().map(|j| j.table.clone()));
                     let mut refs = Vec::new();
                     for (_, expr) in &computed {
                         expr.collect_columns(&mut refs);
                     }
+                    let mut any_schema = false;
                     for c in refs {
-                        if !schema.columns.contains_key(&c) {
-                            return Err(format!("SQL: unknown column '{}' in projection", c));
+                        let mut found = false;
+                        for t in &universe {
+                            if let Some(schema) = self.get_schema(t) {
+                                any_schema = true;
+                                if schema.columns.contains_key(&c)
+                                    || schema
+                                        .columns
+                                        .keys()
+                                        .any(|k| k.eq_ignore_ascii_case(&c))
+                                {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if !found && any_schema {
+                            return Err(format!(
+                                "SQL: unknown column '{}' in projection",
+                                c
+                            ));
                         }
                     }
                 }
@@ -557,6 +606,11 @@ impl SqlEngine {
                             let out = alias.clone().unwrap_or_else(|| source.clone());
                             if !keep.contains(&out) {
                                 keep.push(out);
+                            }
+                        }
+                        SelectItem::AggOverExpr { rendered, .. } => {
+                            if !keep.contains(rendered) {
+                                keep.push(rendered.clone());
                             }
                         }
                         SelectItem::Agg { rendered, .. } => {
@@ -620,6 +674,7 @@ impl SqlEngine {
                         cols.push(alias.clone().unwrap_or_else(|| source.clone()));
                     }
                     SelectItem::Agg { rendered, .. }
+                    | SelectItem::AggOverExpr { rendered, .. }
                     | SelectItem::Window { rendered, .. }
                     | SelectItem::ScalarSub { rendered, .. }
                     | SelectItem::Computed { rendered, .. } => {

@@ -140,6 +140,14 @@ impl SParser {
 
 }
 impl SParser {
+    /// Debug helper for "trailing tokens" parse errors: the next few
+    /// tokens around the failure point, for the wire error message.
+    pub(super) fn debug_context(&self) -> String {
+        let end = (self.pos + 8).min(self.toks.len());
+        let parts: Vec<String> = self.toks[self.pos..end].iter().map(|t| format!("{:?}", t)).collect();
+        parts.join(" ")
+    }
+
     pub(super) fn parse_stmt(&mut self) -> Result<Stmt, String> {
         if self.kw("SELECT") {
             self.parse_select_tail()

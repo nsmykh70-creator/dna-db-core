@@ -492,6 +492,7 @@ pub(super) fn render_select_sql(stmt: &Stmt) -> String {
                     }
                 }
                 SelectItem::Agg { canonical, .. } => Some(canonical.clone()),
+                SelectItem::AggOverExpr { canonical, .. } => Some(canonical.clone()),
                 SelectItem::ScalarSub { canonical, .. } => Some(canonical.clone()),
                 SelectItem::Window { canonical, .. } => Some(canonical.clone()),
                 // CMS edition: sort keys are not part of the SQL text.

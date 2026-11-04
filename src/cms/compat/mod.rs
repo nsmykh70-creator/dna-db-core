@@ -258,6 +258,13 @@ impl CmsSqlGate {
             return Ok(empty_ok(format!("database dropped: '{}'", db)));
         }
 
+        // ALTER DATABASE [name] CHARACTER SET / COLLATE / … — per-database
+        // charset metadata the engine does not model. Joomla's installer
+        // sends this right after CREATE DATABASE; real MySQL answers OK.
+        if upper.starts_with("ALTER DATABASE") {
+            return Ok(empty_ok("database altered".to_string()));
+        }
+
         // MySQL: COMMIT / ROLLBACK without an open transaction are silent
         // no-ops. PHP drivers that run with autocommit=0 (pymysql, mysqli
         // defaults, wpdb in transactional plugins) send bare COMMITs after

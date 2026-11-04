@@ -154,6 +154,9 @@ pub(super) fn collect_stmt_columns(stmt: &Stmt, out: &mut Vec<String>) -> Result
                     SelectItem::Computed { expr, .. } => {
                         expr.collect_columns(out);
                     }
+                    SelectItem::AggOverExpr { expr, .. } => {
+                        expr.collect_columns(out);
+                    }
                     SelectItem::Agg { arg, .. } => {
                         if let Some(c) = arg {
                             if !out.contains(c) {

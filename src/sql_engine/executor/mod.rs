@@ -304,8 +304,9 @@ impl SqlEngine {
         let stmt = p.parse_stmt()?;
         if p.peek() != &STok::Eof {
             return Err(format!(
-                "SQL: unexpected trailing tokens starting at {:?} (unsupported syntax?)",
-                p.peek()
+                "SQL: unexpected trailing tokens starting at {:?} near {} (unsupported syntax?)",
+                p.peek(),
+                p.debug_context()
             ));
         }
         let (columns, rows, plan, message) = self.exec_stmt(stmt, tx)?;

@@ -90,6 +90,10 @@ pub(crate) fn stmt_prepare(
             }
             Ok(_) => {}
             Err(ce) => {
+                if std::env::var("DNA_LOG_SQL").as_deref() == Ok("1") {
+                    let head: String = probe_sql.chars().take(8000).collect();
+                    eprintln!("[SQL:probe error {}] {} | {}", ce.errno, ce.message, head);
+                }
                 // MySQL reports the REAL error at prepare time (a missing
                 // table prepares → 1146/42S02), not a generic PS code.
                 return conn.write_packet(&err_packet(ce.errno, ce.sqlstate(), &ce.message));
@@ -235,6 +239,9 @@ pub(crate) fn stmt_execute(
         }
     }
     let sql = substitute_params(&st.sql, &values);
+    // DNA_LOG_SQL=1: executions of prepared statements fail invisibly
+    // without this — installer debugging needs the statement + error text.
+    let trace = std::env::var("DNA_LOG_SQL").as_deref() == Ok("1");
     // The immutable borrow of `st` ends with `substitute_params`; persist the
     // freshly bound types so later executes without a type block decode right.
     if n > 0 && new_bound == 1 {
@@ -258,6 +265,10 @@ pub(crate) fn stmt_execute(
             Ok(true)
         }
         Err(ce) => {
+            if trace {
+                let head: String = sql.chars().take(160).collect();
+                eprintln!("[SQL:exec error {}] {} | {}", ce.errno, ce.message, head);
+            }
             conn.write_packet(&err_packet(ce.errno, ce.sqlstate(), &ce.message))?;
             Ok(true)
         }

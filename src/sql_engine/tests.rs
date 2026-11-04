@@ -1324,4 +1324,77 @@ mod security_regression_tests {
         let left_joined = hash_join_left(&left, &right, "id", "id");
         assert_eq!(left_joined.len(), 4);
     }
+
+    #[test]
+    fn hash_line_comments_are_whitespace() {
+        use crate::engine::{Engine, EngineConfig};
+        use crate::wal::SyncMode;
+        let dir = std::env::temp_dir().join(format!(
+            "dna_sql_hash_comments_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let engine = Engine::open(EngineConfig {
+            dir_path: dir,
+            memtable_capacity: 4 * 1024 * 1024,
+            sync_mode: SyncMode::Strict,
+            mirror_disk_path: None,
+            ..Default::default()
+        })
+        .unwrap();
+        let sql = SqlEngine::new(engine);
+        // Joomla's base.sql (like classic mysqldump output) uses `#` line
+        // comments; the lexer must skip them like `--` and `/* */`.
+        sql.execute(
+            "# header comment\nCREATE TABLE chr_hash_comments (id INT PRIMARY KEY, note TEXT) # table opts tail\n",
+        )
+        .unwrap();
+        sql.execute("INSERT INTO chr_hash_comments (id, note) VALUES (1, 'ok') # done").unwrap();
+        let res = sql
+            .execute("SELECT note FROM chr_hash_comments WHERE id = 1")
+            .unwrap();
+        assert_eq!(res.rows.len(), 1);
+        assert_eq!(res.rows[0].get("note"), Some(&Value::Text("ok".into())));
+    }
+}
+
+#[test]
+fn case_expression_searched_and_simple() {
+    use crate::engine::{Engine, EngineConfig};
+    use crate::wal::SyncMode;
+    let dir = std::env::temp_dir().join(format!(
+        "dna_sql_case_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+    ));
+    let engine = Engine::open(EngineConfig {
+        dir_path: dir,
+        memtable_capacity: 4 * 1024 * 1024,
+        sync_mode: SyncMode::Strict,
+        mirror_disk_path: None,
+        ..Default::default()
+    })
+    .unwrap();
+    let sql = SqlEngine::new(engine);
+    sql.execute("CREATE TABLE chr_case (id INT PRIMARY KEY, balance FLOAT)").unwrap();
+    sql.execute("INSERT INTO chr_case (id, balance) VALUES (1, 10.0), (2, 0.0), (3, NULL)").unwrap();
+    // searched form (Joomla ArticlesModel projection)
+    let res = sql
+        .execute("SELECT id, CASE WHEN balance > 5.0 THEN 'rich' ELSE 'poor' END AS tier FROM chr_case ORDER BY id")
+        .unwrap();
+    assert_eq!(res.rows[0].get("tier"), Some(&Value::Text("rich".into())));
+    assert_eq!(res.rows[1].get("tier"), Some(&Value::Text("poor".into())));
+    // NULL condition falls to ELSE (MySQL IF semantics)
+    assert_eq!(res.rows[2].get("tier"), Some(&Value::Text("poor".into())));
+    // simple form with several arms
+    let res = sql
+        .execute("SELECT id, CASE id WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END AS n FROM chr_case ORDER BY id")
+        .unwrap();
+    assert_eq!(res.rows[0].get("n"), Some(&Value::Text("one".into())));
+    assert_eq!(res.rows[1].get("n"), Some(&Value::Text("two".into())));
+    assert_eq!(res.rows[2].get("n"), Some(&Value::Text("other".into())));
 }

@@ -45,6 +45,10 @@ impl SParser {
                 self.expect_kw("KEY")?;
                 self.expect(STok::LParen)?;
                 let pk = self.ident()?;
+                // Prefix index `PRIMARY KEY (id(100))` (Joomla's
+                // webauthn_credentials) — the length is dropped; the engine
+                // indexes the whole column.
+                self.consume_type_len()?;
                 // CMS edition: composite PRIMARY KEY (a, b) — the engine keys
                 // on the first column for native paths; the full list is
                 // retained so row keys encode every key part (MediaWiki
@@ -189,6 +193,21 @@ impl SParser {
                                     self.next();
                                     v.to_string()
                                 }
+                                // Negative numeric default (`DEFAULT -1`,
+                                // Joomla's banners/track counters).
+                                STok::Minus => {
+                                    self.next();
+                                    match self.next() {
+                                        STok::Int(v) => format!("-{v}"),
+                                        STok::Float(v) => format!("-{v}"),
+                                        t => {
+                                            return Err(format!(
+                                                "SQL: bad DEFAULT value after '-', got {:?}",
+                                                t
+                                            ))
+                                        }
+                                    }
+                                }
                                 STok::Ident(s) => {
                                     self.next();
                                     s
@@ -243,6 +262,21 @@ impl SParser {
             }
         }
         self.expect(STok::RParen)?;
+        // CMS edition: MySQL tables without PRIMARY KEY are legal — InnoDB
+        // keys them by a hidden monotonic row id. Mirror that: no declared
+        // PK and no `id` column → rows are keyed by an implicit
+        // auto-increment `__rowid` that never joins the declared columns
+        // (SELECT * / SHOW COLUMNS / information_schema cannot see it) but
+        // stays stable for UPDATE/DELETE row keys (Joomla's
+        // finder_terms_common).
+        #[cfg(feature = "cms")]
+        if t.primary_locus_column == "id"
+            && !t.columns.contains_key("id")
+            && t.auto_increment_column.is_none()
+        {
+            t.primary_locus_column = "__rowid".to_string();
+            t.auto_increment_column = Some("__rowid".to_string());
+        }
         // CMS edition: MySQL table options after the column list —
         // `ENGINE=InnoDB AUTO_INCREMENT=1 DEFAULT CHARSET=utf8mb4
         // COLLATE=utf8mb4_unicode_520_ci` — consumed and ignored.
@@ -479,9 +513,22 @@ impl SParser {
         if matches!(self.toks.get(i), Some(STok::LParen)) {
             return true;
         }
-        // named constraint: name must not be a type keyword, then '('
+        // Named constraint: after the name a constraint reaches '(' while a
+        // column def reaches its TYPE keyword. The name itself may be ANY
+        // identifier — Joomla's base.sql has `KEY time (time)`, an index
+        // legitimately named with a type keyword. Disambiguation:
+        //   - name + '(' → constraint, unless the paren content is a type
+        //     length (`KEY char(32)` is a COLUMN named key of type char);
+        //     index column lists hold identifiers, type lengths hold
+        //     numbers or enum/set string lists;
+        //   - otherwise → column def (name = type keyword or bare type).
         match ident_at(self, i) {
-            Some(w) if !type_word(&w) => matches!(self.toks.get(i + 1), Some(STok::LParen)),
+            Some(_) if matches!(self.toks.get(i + 1), Some(STok::LParen)) => {
+                if !type_word(&ident_at(self, i).unwrap()) {
+                    return true;
+                }
+                matches!(self.toks.get(i + 2), Some(STok::Ident(_)))
+            }
             _ => false,
         }
     }
