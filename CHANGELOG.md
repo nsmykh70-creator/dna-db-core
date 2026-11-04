@@ -2,6 +2,31 @@
 
 ## Unreleased (CMS Edition — branch `cms-edition`)
 
+### Joomla 5.4.10 installs and renders on DNA-DB (2026-11-04)
+
+Driven end-to-end by the real Joomla 5.4.10 web installer (stock mysqli →
+`dna-db-core mysqld :13306`): install completes, `installation/` removes
+itself, the site frontend AND the administrator login render (HTTP 200),
+admin user + 248 extension rows + 92 assets present, article INSERT/SELECT
+via prepared statements. Report: `docs/cms/E2E_JOOMLA_MYSQLWIRE_REPORT.md`;
+reusable driver: `scripts/joomla_e2e.php`.
+
+SQL surface gained (each with a regression test): MySQL `#` line comments;
+`ALTER DATABASE … CHARACTER SET/COLLATE` no-op; index names that collide
+with type keywords (`KEY time (time)`) with paren-content disambiguation;
+prefix indexes (`PRIMARY KEY (id(100))`, nameless `INDEX (col(100))`);
+negative `DEFAULT -1`; scalar functions in VALUES/DEFAULT (`NOW`,
+`CURDATE`, `CURTIME`, `UNIX_TIMESTAMP`, `DATE_FORMAT`, `TIME_FORMAT`) plus
+`+/- INTERVAL n UNIT` datetime folding; `CASE [operand] WHEN … THEN …
+[ELSE …] END` in expressions (desugared to nested scalar `IF`, depth
+guarded); `ORDER BY <expression>` (`CASE … END DESC`, Joomla frontpage);
+expression aggregates (`SUM(CASE …)` — argument materialised per row before
+aggregation); computed-projection column refs resolved against the JOIN
+universe; `LIKE NULL` (prepared-statement probe semantics); implicit
+hidden auto-increment `__rowid` for PK-less tables (`finder_terms_common`),
+invisible to `SELECT *` / SHOW COLUMNS / information_schema.
+
+
 ### Installer: prebuilt fast path + uninstall + containers (2026-11-03)
 
 - `scripts/install.sh` no longer requires Rust: it downloads the
