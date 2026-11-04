@@ -1343,7 +1343,6 @@ impl SParser {
                 while matches!(self.peek(), STok::Comma) {
                     self.next();
                     let _ = self.ident()?;
-                    self.consume_type_len()?;
                 }
                 t.primary_locus_column = pk;
                 self.expect(STok::RParen)?;
@@ -1401,6 +1400,11 @@ impl SParser {
                         }
                         if self.kw("AUTO_INCREMENT") {
                             t.auto_increment_column = Some(col.clone());
+                            continue;
+                        }
+                        // Column-level COMMENT '…' (Drupal schema definitions).
+                        if self.kw("COMMENT") {
+                            let _ = self.value()?;
                             continue;
                         }
                         // MySQL inline key forms after the type: `id BIGINT
@@ -1536,6 +1540,9 @@ impl SParser {
                         self.next();
                     }
                     let _ = self.ident()?;
+                } else if self.kw("COMMENT") {
+                    // Table-level COMMENT '…' (Drupal CREATE TABLE tail).
+                    let _ = self.value()?;
                 } else if self.kw("CHARSET") || self.kw("COLLATE") {
                     if matches!(self.peek(), STok::Eq) {
                         self.next();
