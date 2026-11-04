@@ -152,6 +152,16 @@ impl SParser {
             STok::Float(f) => Ok(Value::Float(f)),
             STok::Str(s) => Ok(typed_string_literal(&s)),
             STok::Ident(s) if s.eq_ignore_ascii_case("NULL") => Ok(Value::Null),
+            // MySQL pseudo-literals usable in VALUES / DEFAULT:
+            // CURRENT_TIMESTAMP [()], CURRENT_DATE [()], CURRENT_TIME [()].
+            // Joomla's seed data (base.sql) writes CURRENT_TIMESTAMP().
+            STok::Ident(s) if Self::is_current_pseudo_literal_name(&s) => {
+                if matches!(self.peek(), STok::LParen) {
+                    self.next();
+                    self.expect(STok::RParen)?;
+                }
+                Ok(Value::Text(Self::current_pseudo_literal_value(&s)))
+            }
             t => Err(format!("SQL: expected literal, got {:?}", t)),
         }
     }
@@ -1441,6 +1451,14 @@ impl SParser {
                             t.auto_increment_column = Some(col.clone());
                             continue;
                         }
+                        // MySQL attribute `ON UPDATE CURRENT_TIMESTAMP` —
+                        // the engine applies defaults, not update triggers;
+                        // consumed for dialect compatibility (Joomla tags).
+                        if self.kw("ON") {
+                            self.expect_kw("UPDATE")?;
+                            let _ = self.value()?;
+                            continue;
+                        }
                         // Column-level COMMENT '…' (Drupal schema definitions).
                         if self.kw("COMMENT") {
                             let _ = self.value()?;
@@ -1580,7 +1598,10 @@ impl SParser {
                     }
                     let _ = self.ident()?;
                 } else if self.kw("COMMENT") {
-                    // Table-level COMMENT '…' (Drupal CREATE TABLE tail).
+                    // Table-level COMMENT[='…'] (Drupal / Joomla tails).
+                    if matches!(self.peek(), STok::Eq) {
+                        self.next();
+                    }
                     let _ = self.value()?;
                 } else if self.kw("CHARSET") || self.kw("COLLATE") {
                     if matches!(self.peek(), STok::Eq) {
@@ -1712,6 +1733,31 @@ impl SParser {
         Ok(())
     }
 
+    /// True for the MySQL CURRENT_* pseudo-literals accepted by value().
+    fn is_current_pseudo_literal_name(name: &str) -> bool {
+        matches!(
+            name.to_ascii_uppercase().as_str(),
+            "CURRENT_TIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME"
+        )
+    }
+
+    /// Value for a CURRENT_* pseudo-literal (string form, MySQL DATETIME).
+    fn current_pseudo_literal_value(name: &str) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let secs = now.as_secs() as i64;
+        let days = secs.div_euclid(86_400);
+        let rem = secs.rem_euclid(86_400);
+        let (y, m, d) = civil_from_days_impl(days);
+        let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+        match name.to_ascii_uppercase().as_str() {
+            "CURRENT_DATE" => format!("{y:04}-{m:02}-{d:02}"),
+            "CURRENT_TIME" => format!("{hh:02}:{mm:02}:{ss:02}"),
+            _ => format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02}"),
+        }
+    }
+
     /// Consumes a DEFAULT/COMMENT value literal: string, number, or bare
     /// identifier (NULL / CURRENT_TIMESTAMP) (cms only).
     #[cfg(feature = "cms")]
@@ -1727,12 +1773,66 @@ impl SParser {
 
     /// True when the next token starts a MySQL constraint line inside
     /// CREATE TABLE (cms only): KEY / INDEX / UNIQUE / FULLTEXT / SPATIAL.
+    ///
+    /// A column can legitimately be NAMED `key` (backticked, backticks
+    /// stripped in preprocessing) — `KEY char(32) …` is a column def whose
+    /// name collides with the constraint keyword, while
+    /// `KEY idx_name (col)` is a constraint. Disambiguate by lookahead:
+    /// after the optional name, a constraint reaches '(' where the name is
+    /// NOT a type keyword (a column def's next token is a type keyword
+    /// before its length paren).
     #[cfg(feature = "cms")]
     fn peek_is_cms_constraint(&self) -> bool {
-        matches!(self.peek(), STok::Ident(w) if matches!(
+        let type_word = |w: &str| matches!(
             w.to_ascii_uppercase().as_str(),
-            "KEY" | "INDEX" | "UNIQUE" | "FULLTEXT" | "SPATIAL"
-        ))
+            "INT" | "INTEGER" | "BIGINT" | "TINYINT" | "SMALLINT" | "MEDIUMINT"
+            | "CHAR" | "VARCHAR" | "TEXT" | "TINYTEXT" | "MEDIUMTEXT" | "LONGTEXT"
+            | "BLOB" | "TINYBLOB" | "MEDIUMBLOB" | "LONGBLOB" | "VARBINARY"
+            | "BINARY" | "DATETIME" | "DATE" | "TIME" | "TIMESTAMP" | "FLOAT"
+            | "DOUBLE" | "DECIMAL" | "DNA" | "DNA2BIT" | "STRING" | "ENUM" | "SET"
+        );
+        let ident_at = |s: &SParser, i: usize| -> Option<String> {
+            match s.toks.get(i) {
+                Some(STok::Ident(w)) => Some(w.clone()),
+                _ => None,
+            }
+        };
+        let mut i = self.pos;
+        // first word: KEY / INDEX / UNIQUE / FULLTEXT / SPATIAL
+        let w0 = match ident_at(self, i) {
+            Some(w) if matches!(
+                w.to_ascii_uppercase().as_str(),
+                "KEY" | "INDEX" | "UNIQUE" | "FULLTEXT" | "SPATIAL"
+            ) =>
+            {
+                w
+            }
+            _ => return false,
+        };
+        i += 1;
+        // optional second keyword: UNIQUE KEY / FULLTEXT KEY / UNIQUE INDEX
+        if matches!(
+            w0.to_ascii_uppercase().as_str(),
+            "UNIQUE" | "FULLTEXT" | "SPATIAL"
+        ) {
+            match ident_at(self, i) {
+                Some(w) if matches!(w.to_ascii_uppercase().as_str(), "KEY" | "INDEX") => {
+                    i += 1;
+                }
+                // `UNIQUE (col)` — nameless constraint
+                Some(_) => {}
+                None => {}
+            }
+        }
+        // nameless constraint: '(' follows directly
+        if matches!(self.toks.get(i), Some(STok::LParen)) {
+            return true;
+        }
+        // named constraint: name must not be a type keyword, then '('
+        match ident_at(self, i) {
+            Some(w) if !type_word(&w) => matches!(self.toks.get(i + 1), Some(STok::LParen)),
+            _ => false,
+        }
     }
 
     /// Parses one MySQL constraint line into the table's secondary indexes
@@ -1769,6 +1869,12 @@ impl SParser {
             }
         }
         self.expect(STok::RParen)?;
+        // Optional index algorithm: `KEY name (cols) USING BTREE` — the
+        // engine has one index structure, so the hint is consumed and
+        // dropped (Joomla base.sql).
+        if self.kw("USING") {
+            let _ = self.ident()?;
+        }
         if first_col.is_empty() {
             return Err("SQL: empty key column list".into());
         }
@@ -2215,3 +2321,18 @@ impl SParser {
 // ---------------------------------------------------------------------------
 // Executor
 // ---------------------------------------------------------------------------
+
+/// Days-since-epoch to (year, month, day) — Howard Hinnant's algorithm,
+/// duplicated from the compat layer (the core parser has no cms deps).
+fn civil_from_days_impl(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}

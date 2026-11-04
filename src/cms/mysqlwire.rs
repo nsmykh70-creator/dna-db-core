@@ -1020,6 +1020,12 @@ fn stmt_prepare(
     stmts: &mut HashMap<u32, Prepared>,
 ) -> std::io::Result<()> {
     let params = count_placeholders(sql);
+    // DNA_LOG_SQL=1: prepared statements are invisible to the COM_QUERY
+    // trace — Joomla drives every statement through COM_STMT_PREPARE.
+    if std::env::var("DNA_LOG_SQL").as_deref() == Ok("1") {
+        let head: String = sql.chars().take(140).collect();
+        eprintln!("[SQL:prepare n={params}] {head}");
+    }
     let head = first_word(sql).to_ascii_lowercase();
     let reads_rows = matches!(
         head.as_str(),

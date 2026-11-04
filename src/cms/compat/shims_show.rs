@@ -189,7 +189,11 @@ impl CmsSqlGate {
         }
 
         // SHOW TABLES [LIKE 'pat'] — engine's own SHOW TABLES has no LIKE.
-        if upper.starts_with("SHOW TABLES") {
+        // SHOW [FULL] TABLES [FROM|IN db] [LIKE 'pat' | WHERE expr] — the
+        // FULL form (Joomla's getTableList) adds the Table_type column; all
+        // DNA-DB relations are BASE TABLE, so the WHERE filter is a no-op.
+        if upper.starts_with("SHOW TABLES") || upper.starts_with("SHOW FULL TABLES") {
+            let full = upper.starts_with("SHOW FULL TABLES");
             // The pattern is a MySQL string literal: decode escapes first
             // ('wp\\_%' → wp\_% — one backslash, as LIKE expects).
             let like = find_like_pattern(sql).map(|p| decode_mysql_string(&p));
@@ -210,14 +214,21 @@ impl CmsSqlGate {
                 }
                 let mut r = BTreeMap::new();
                 r.insert(label.clone(), Value::Text(t));
+                if full {
+                    r.insert("Table_type".into(), Value::Text("BASE TABLE".into()));
+                }
                 rows.push(r);
             }
             let found = rows.len() as u64;
+            let mut columns = vec![label];
+            if full {
+                columns.push("Table_type".into());
+            }
             return Ok(Some(CmsQueryResult {
-                columns: vec![label],
+                columns,
                 rows,
                 message: Some(format!("{} table(s)", found)),
-                plan: "cms: SHOW TABLES [LIKE] via catalog".into(),
+                plan: "cms: SHOW [FULL] TABLES [LIKE] via catalog".into(),
                 affected_rows: 0,
                 last_insert_id: 0,
                 found_rows: found,
