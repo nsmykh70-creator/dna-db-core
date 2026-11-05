@@ -56,6 +56,11 @@ pub struct CmsTableMeta {
     pub primary_key: Vec<String>,
     pub indexes: Vec<CmsIndexMeta>,
     pub auto_increment_column: Option<String>,
+    /// Raw table options after the closing paren (`ENGINE=InnoDB AUTO_INCREMENT=12
+    /// DEFAULT CHARSET=utf8mb4 COLLATE=…`) — kept verbatim so SHOW CREATE
+    /// TABLE / mysqldump export round-trips the declaration. `None` when the
+    /// DDL carried no options.
+    pub table_options: Option<String>,
 }
 
 /// Split a string into "top-level" comma segments, honouring parentheses
@@ -239,15 +244,14 @@ impl CmsTableMeta {
         }
         let _ = upper; // (kept for future keyword dispatch)
 
-        // Body: balanced parens from body_start.
+        // Body: balanced parens from body_start. `body_end` is the BYTE
+        // offset of the closing paren (char_indices — multibyte-safe; DDL
+        // options/comments may carry non-ASCII text).
         let mut depth = 0usize;
         let mut in_quote = false;
         let mut body_end = ddl.len();
-        let bytes: Vec<char> = ddl.chars().collect();
-        let mut byte_idx = 0usize;
-        for (ci, c) in bytes.iter().enumerate() {
-            byte_idx = ci;
-            if ci < body_start {
+        for (bi, c) in ddl.char_indices() {
+            if bi < body_start {
                 continue;
             }
             if in_quote {
@@ -264,7 +268,7 @@ impl CmsTableMeta {
                 ')' => {
                     depth -= 1;
                     if depth == 0 {
-                        body_end = ci;
+                        body_end = bi;
                         break;
                     }
                 }
@@ -273,12 +277,19 @@ impl CmsTableMeta {
         }
         let body = &ddl[body_start + 1..body_end];
 
+        let tail = ddl[body_end + 1..]
+            .trim()
+            .trim_end_matches(';')
+            .trim()
+            .to_string();
+        let table_options = if tail.is_empty() { None } else { Some(tail) };
         let mut meta = CmsTableMeta {
             table,
             columns: Vec::new(),
             primary_key: Vec::new(),
             indexes: Vec::new(),
             auto_increment_column: None,
+            table_options,
         };
 
         for seg in split_top_level(body) {
@@ -332,13 +343,33 @@ impl CmsTableMeta {
                     // Skipped in the overlay (engine FKs declared separately).
                 }
                 _ => {
-                    // Column definition.
-                    let mut tokens = seg.split_whitespace();
-                    let field = strip_backticks(tokens.next().unwrap_or(""));
+                    // Column definition. Backtick-quoted field names are
+                    // supported so SHOW CREATE TABLE output (and mysqldump
+                    // DDL) re-parses byte-identically when called directly
+                    // (the gate strips backticks earlier, but the parser is
+                    // also a public entry point for dump roundtrips).
+                    let seg_trim = seg.trim_start();
+                    let field;
+                    let after_name;
+                    if let Some(open) = seg_trim.strip_prefix('`') {
+                        let Some(close) = open.find('`') else {
+                            return Err(format!(
+                                "DDL {}: unterminated backticked column name",
+                                meta.table
+                            ));
+                        };
+                        field = open[..close].to_string();
+                        after_name = open[close + 1..].trim_start();
+                    } else {
+                        field = strip_backticks(seg_trim.split_whitespace().next().unwrap_or(""));
+                        if field.is_empty() {
+                            return Err(format!("DDL {}: empty column name", meta.table));
+                        }
+                        after_name = seg_trim[field.len()..].trim_start();
+                    }
                     if field.is_empty() {
                         return Err(format!("DDL {}: empty column name", meta.table));
                     }
-                    let after_name = seg[seg.find(&field).unwrap_or(0) + field.len()..].trim();
                     // Type = identifier + optional (n[,m]).
                     let mut type_text = String::new();
                     let mut rest = after_name;
@@ -538,6 +569,90 @@ impl CmsTableMeta {
             push_rows(&idx.name, idx.unique, &idx.columns);
         }
         rows
+    }
+
+    /// Reconstructed `CREATE TABLE` statement in the MariaDB
+    /// `SHOW CREATE TABLE` shape — the exact text `mariadb-dump` copies into
+    /// its dump file, so an exported dump re-imports into real MariaDB/MySQL:
+    ///
+    /// ```text
+    /// CREATE TABLE `t` (
+    ///   `id` bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+    ///   `name` varchar(191) DEFAULT NULL,
+    ///   PRIMARY KEY (`id`),
+    ///   KEY `k` (`name`(191))
+    /// ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    /// ```
+    ///
+    /// Defaults render MySQL-style (`DEFAULT '0'` — quoted even for numbers;
+    /// `DEFAULT CURRENT_TIMESTAMP` unquoted when the DDL carried it;
+    /// `DEFAULT NULL` only for nullable columns without a default). `ON UPDATE
+    /// CURRENT_TIMESTAMP` is not modelled by the overlay and therefore not
+    /// echoed (documented divergence, CMS_EDITION_RU.md §4).
+    pub fn show_create_table_ddl(&self) -> String {
+        let mut lines: Vec<String> = Vec::new();
+        for col in &self.columns {
+            let mut l = format!("  `{}` {}", col.field, col.mysql_type);
+            if col.not_null {
+                l.push_str(" NOT NULL");
+            }
+            match &col.default {
+                Some(d) => {
+                    if d.eq_ignore_ascii_case("CURRENT_TIMESTAMP")
+                        || d.eq_ignore_ascii_case("CURRENT_TIMESTAMP()")
+                        || d.eq_ignore_ascii_case("NOW()")
+                    {
+                        l.push_str(" DEFAULT CURRENT_TIMESTAMP");
+                    } else {
+                        l.push_str(&format!(" DEFAULT '{}'", d.replace('\'', "''")));
+                    }
+                }
+                None => {
+                    if !col.not_null {
+                        l.push_str(" DEFAULT NULL");
+                    }
+                }
+            }
+            if col.auto_increment {
+                l.push_str(" AUTO_INCREMENT");
+            }
+            lines.push(l);
+        }
+        if !self.primary_key.is_empty() {
+            let cols = self
+                .primary_key
+                .iter()
+                .map(|c| format!("`{}`", c))
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(format!("  PRIMARY KEY ({})", cols));
+        }
+        for idx in &self.indexes {
+            let cols = idx
+                .columns
+                .iter()
+                .map(|(c, len)| match len {
+                    Some(n) => format!("`{}`({})", c, n),
+                    None => format!("`{}`", c),
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            if idx.unique {
+                lines.push(format!("  UNIQUE KEY `{}` ({})", idx.name, cols));
+            } else {
+                lines.push(format!("  KEY `{}` ({})", idx.name, cols));
+            }
+        }
+        let options = self
+            .table_options
+            .clone()
+            .unwrap_or_else(|| "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4".to_string());
+        format!(
+            "CREATE TABLE `{}` (\n{}\n) {}",
+            self.table,
+            lines.join(",\n"),
+            options
+        )
     }
 
     /// Normalized engine-dialect DDL: base types, single PK (first column of

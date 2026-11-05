@@ -35,6 +35,22 @@ impl CmsSqlGate {
             ("columns", true, false)
         } else if from_information_schema(sql, "statistics") {
             ("statistics", false, false)
+        } else if from_information_schema(sql, "files") {
+            // mariadb-dump probes INNODB undo-log tablespaces
+            // (`SELECT … FROM INFORMATION_SCHEMA.FILES WHERE FILE_TYPE =
+            // 'UNDO LOG' …`) before dumping. DNA-DB has no tablespaces — an
+            // empty FILES listing makes the dumper skip that section.
+            return Ok(Some(empty_catalog_result("files")));
+        } else if from_information_schema(sql, "triggers")
+            || from_information_schema(sql, "events")
+            || from_information_schema(sql, "routines")
+            || from_information_schema(sql, "parameters")
+        {
+            // Per-table trigger/event/routine probes from mysqldump
+            // (`SELECT TRIGGER_NAME FROM INFORMATION_SCHEMA.TRIGGERS WHERE
+            // EVENT_OBJECT_SCHEMA = DATABASE() …`). DNA-DB models none —
+            // empty listings simply omit these sections from the dump.
+            return Ok(Some(empty_catalog_result("routines")));
         } else {
             return Ok(None);
         };
@@ -686,6 +702,33 @@ pub(crate) fn empty_catalog_result(table: &str) -> CmsQueryResult {
             "INDEX_COMMENT",
             "IS_VISIBLE",
             "EXPRESSION",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect(),
+        // statistics
+        _ if false => vec![],
+        "files" => vec![
+            "TABLESPACE_NAME",
+            "FILE_TYPE",
+            "LOGFILE_GROUP_NAME",
+            "FILE_NAME",
+            "TOTAL_EXTENTS",
+            "INITIAL_SIZE",
+            "ENGINE",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect(),
+        "routines" => vec![
+            "TRIGGER_NAME",
+            "EVENT_OBJECT_SCHEMA",
+            "EVENT_OBJECT_TABLE",
+            "EVENT_MANIPULATION",
+            "ACTION_STATEMENT",
+            "ROUTINE_NAME",
+            "ROUTINE_TYPE",
+            "PARAMETER_NAME",
         ]
         .into_iter()
         .map(String::from)

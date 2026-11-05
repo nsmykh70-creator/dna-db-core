@@ -331,6 +331,27 @@ cms-модуля 13 → 15. Обе сборки зелёные: 190 тестов
 ci-проекции + errno 1054, `VERSION()` → `10.11.11-MariaDB`, SHOW INDEX в
 14-колоночной форме MariaDB (`Index_comment`/`Ignored`).
 
+### Прогон №9: mysqldump / mariadb-dump roundtrip — Фаза 3 открыта (2026-11-06)
+
+Миграция MySQL ⇄ DNA-DB штатным дампером (первый приёмочный пункт Фазы 3).
+Направление IMPORT: дамп с эталона MariaDB 10.11.11 (условные комментарии,
+LOCK TABLES, DISABLE KEYS, extended INSERT с `\0 \' \\`-эскейпами, префиксные
+и составные ключи, табличные опции) проигрывается в DNA-DB клиентом
+`mariadb`. Направление EXPORT: `mariadb-dump` подключается к DNA-DB как к
+MySQL (SHOW CREATE TABLE, SQL_NO_CACHE, пробы information_schema.FILES/
+TRIGGERS) и дамп проигрывается в чистую MariaDB — реконструированный гейтом
+DDL валиден для MariaDB. Содержимое ref→imp→back совпадает побайтно
+(кириллица, эмодзи, blob-байты, DECIMAL-шкала, NULL/'', порядок колонок),
+автоинкремент после импорта продолжает с max+1 (99 → 100,
+LAST_INSERT_ID корректен). Ядро: `unwrap_versioned_comments` (версионный
+гейт 101111, строки не трогаются), `strip_fk_constraints`, LOCK/UNLOCK
+TABLES + FLUSH + DISABLE/ENABLE KEYS no-op, SHOW CREATE TABLE /
+CREATE DATABASE / TABLE STATUS / пустые каталоги рутин, `table_options` в
+оверлее, бэктики в `parse_create_table`, байтовые смещения в парсере тела
+DDL (не-ASCII в DEFAULT безопасны). Детали:
+`docs/cms/E2E_MYSQLDUMP_ROUNDTRIP_REPORT.md`. Тестов: 316 с фичей (+4),
+195 без — main-сборка не тронута.
+
 ## 5. Фазы
 
 **Фаза 0 — корпус запросов (1–2 нед).** ✅ Выполнено:
@@ -373,9 +394,20 @@ deadlock-retry и DECIMAL-шкала закрыты — Фаза 2 выполн�
 unsigned-семантика) переносятся в Фазу 3 как инженерные задачи без
 приёмочных блокеров.
 
-**Фаза 3 — эксплуатация (2–4 нед).** mysqldump-совместимый импорт/экспорт,
-бэкап/рестор, docker-образ, гайд «миграция WP с MySQL за 3 шага»,
-Prometheus-дашборд для CMS-метрик.
+**Фаза 3 — эксплуатация (2–4 нед).** 🔶 В прогрессе: **mysqldump-совместимый
+импорт/экспорт ✅ (6.11: реальный `mariadb-dump` 10.11.11 в обе стороны —
+дамп с эталона MariaDB проигрывается в DNA-DB штатным клиентом `mariadb`,
+дамп С DNA-DB проигрывается в чистую MariaDB; содержимое ref→imp→back
+совпадает побайтно, автоинкремент продолжается с max+1 — см.
+E2E_MYSQLDUMP_ROUNDTRIP_REPORT)**. Гейт дополнен: разворачивание
+условных комментариев `/*!NNNNN … */`, LOCK/UNLOCK TABLES + DISABLE/ENABLE
+KEYS + SQL_NO_CACHE как no-op/стриппинг, `SHOW CREATE TABLE` (реконструкция
+из оверлея с табличными опциями; идемпотентен parse→emit→parse),
+`SHOW CREATE DATABASE`, `SHOW TABLE STATUS`, пустые каталоги
+триггеров/рутин, `information_schema.FILES/TRIGGERS/EVENTS/ROUTINES`,
+`@@collation_database` и пр. Остаются: бэкап/рестор, docker-образ,
+гайд «миграция WP с MySQL за 3 шага», Prometheus-дашборд для CMS-метик,
+инженерные хвосты Фазы 2 (коллации, online-смена типа, unsigned).
 
 **Фаза 4 — MySQL wire protocol (8–16 нед).** Полный вход B: тогда и
 mysqli/PDO_mysql/phpMyAdmin работают сами. CMS-редакция становится

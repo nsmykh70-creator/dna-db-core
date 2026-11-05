@@ -62,6 +62,26 @@ impl CmsSqlGate {
                 Value::Int(0),
             )));
         }
+        // mariadb-dump asks for the effective database collation/charset and
+        // the packet budget at connect; canned CMS-edition values.
+        if compact.contains("@@COLLATION_DATABASE") {
+            return Ok(Some(one_value_reply(
+                shim_column(sql, "@@collation_database").as_str(),
+                Value::Text("utf8mb4_unicode_520_ci".into()),
+            )));
+        }
+        if compact.contains("@@CHARACTER_SET_DATABASE") {
+            return Ok(Some(one_value_reply(
+                shim_column(sql, "@@character_set_database").as_str(),
+                Value::Text("utf8mb4".into()),
+            )));
+        }
+        if compact.contains("@@MAX_ALLOWED_PACKET") {
+            return Ok(Some(one_value_reply(
+                shim_column(sql, "@@max_allowed_packet").as_str(),
+                Value::Int(1_073_741_824),
+            )));
+        }
         // NOTE: @@VERSION_COMMENT must be checked BEFORE @@VERSION — the
         // longer name contains the shorter one as a substring, and
         // `SELECT @@version_comment` (mysqldump, PHPMyAdmin) would

@@ -356,7 +356,269 @@ impl CmsSqlGate {
                 decimal_scales: Vec::new(),
             }));
         }
+        // SHOW CREATE TABLE [db.]tbl — the core of the mysqldump/mariadb-dump
+        // EXPORT path: the dump file embeds this text verbatim, and it must
+        // re-import into real MariaDB. Rebuilt from the MySQL-dialect overlay
+        // (exact declared types), falling back to the engine schema.
+        if upper.starts_with("SHOW CREATE TABLE") {
+            // NB: slice the ORIGINAL sql by the (length-preserving) uppercase
+            // prefix — the client may send any case mix (`show create table`).
+            let rest = sql["SHOW CREATE TABLE".len()..].trim();
+            let rest = rest.trim_end_matches(';').trim();
+            // Optionally db-qualified: `db`.`tbl` / db.tbl — the engine is a
+            // single catalog, so only the table part matters.
+            let table = rest
+                .rsplit('.')
+                .next()
+                .unwrap_or(rest)
+                .trim_matches('`')
+                .to_string();
+            let ddl = self.show_create_table_ddl(&table)?;
+            let mut r = BTreeMap::new();
+            r.insert("Table".into(), Value::Text(table.clone()));
+            r.insert("Create Table".into(), Value::Text(ddl));
+            return Ok(Some(CmsQueryResult {
+                columns: vec!["Table".into(), "Create Table".into()],
+                rows: vec![r],
+                message: Some("1 row(s)".into()),
+                plan: format!("cms: SHOW CREATE TABLE overlay for {}", table),
+                affected_rows: 0,
+                last_insert_id: 0,
+                found_rows: 1,
+                is_select: true,
+                decimal_scales: Vec::new(),
+            }));
+        }
+
+        // SHOW CREATE DATABASE [IF NOT EXISTS] db — mariadb-dump --databases
+        // header (`CREATE DATABASE /*!32312 IF NOT EXISTS*/ ...`).
+        if upper.starts_with("SHOW CREATE DATABASE") {
+            let tail = sql["SHOW CREATE DATABASE".len()..].trim();
+            let tail = tail
+                .trim_start_matches("IF NOT EXISTS")
+                .trim()
+                .trim_end_matches(';')
+                .trim_matches('`')
+                .to_string();
+            let stmt = format!(
+                "CREATE DATABASE `{}` /*!40100 DEFAULT CHARACTER SET utf8mb4 */",
+                tail
+            );
+            let mut r = BTreeMap::new();
+            r.insert("Database".into(), Value::Text(tail.clone()));
+            r.insert("Create Database".into(), Value::Text(stmt));
+            return Ok(Some(CmsQueryResult {
+                columns: vec!["Database".into(), "Create Database".into()],
+                rows: vec![r],
+                message: Some("1 row(s)".into()),
+                plan: "cms: SHOW CREATE DATABASE shim".into(),
+                affected_rows: 0,
+                last_insert_id: 0,
+                found_rows: 1,
+                is_select: true,
+                decimal_scales: Vec::new(),
+            }));
+        }
+
+        // SHOW TRIGGERS / SHOW EVENTS / SHOW [FUNCTION|PROCEDURE] STATUS /
+        // SHOW CREATE {TRIGGER|PROCEDURE|FUNCTION|EVENT} — mariadb-dump
+        // probes routines and triggers per database; DNA-DB models none, so
+        // every listing comes back empty and the dump simply omits them.
+        const EMPTY_SHOWS: [(&str, &[&str]); 4] = [
+            ("SHOW TRIGGERS", &["Trigger", "Event", "Table", "Statement", "Timing", "Created", "sql_mode", "Definer", "character_set_client", "collation_connection", "Database Collation"]),
+            ("SHOW EVENTS", &["Db", "Name", "Definer", "Time zone", "Event body", "Event definition", "Event type", "Execute at", "Interval value", "Interval field", "Starts", "Ends", "Status", "Originator", "character_set_client", "collation_connection", "Database Collation"]),
+            ("SHOW FUNCTION STATUS", &["Db", "Name", "Type", "Definer", "Modified", "Created", "Security_type", "Comment", "character_set_client", "collation_connection", "Database Collation"]),
+            ("SHOW PROCEDURE STATUS", &["Db", "Name", "Type", "Definer", "Modified", "Created", "Security_type", "Comment", "character_set_client", "collation_connection", "Database Collation"]),
+        ];
+        for (head, cols) in EMPTY_SHOWS {
+            if upper.starts_with(head) {
+                let columns: Vec<String> = cols.iter().map(|c| c.to_string()).collect();
+                return Ok(Some(CmsQueryResult {
+                    columns,
+                    rows: Vec::new(),
+                    message: Some("empty set".into()),
+                    plan: format!("cms: {} empty catalog", head),
+                    affected_rows: 0,
+                    last_insert_id: 0,
+                    found_rows: 0,
+                    is_select: true,
+                    decimal_scales: Vec::new(),
+                }));
+            }
+        }
+        if upper.starts_with("SHOW CREATE TRIGGER")
+            || upper.starts_with("SHOW CREATE PROCEDURE")
+            || upper.starts_with("SHOW CREATE FUNCTION")
+            || upper.starts_with("SHOW CREATE EVENT")
+        {
+            return Err(CmsError {
+                errno: errno::ER_SP_DOES_NOT_EXIST,
+                message: "routines and triggers are not modelled by the CMS edition".into(),
+            });
+        }
+
+        // SHOW TABLE STATUS [FROM db] [LIKE 'pat'] — table inventory used by
+        // admin clients (phpMyAdmin table list, diagnostics). DNA-DB answers
+        // InnoDB-shaped rows with zeroed statistics (documented divergence:
+        // row counts are not materialized here).
+        if upper.starts_with("SHOW TABLE STATUS") {
+            let like = find_like_pattern(sql).map(|p| decode_mysql_string(&p));
+            let mut rows = Vec::new();
+            for t in self.engine.list_tables() {
+                if let Some(pat) = &like {
+                    if !like_match(pat, &t) {
+                        continue;
+                    }
+                }
+                rows.push(self.table_status_row(&t));
+            }
+            let found = rows.len() as u64;
+            return Ok(Some(CmsQueryResult {
+                columns: vec![
+                    "Name".into(),
+                    "Engine".into(),
+                    "Version".into(),
+                    "Row_format".into(),
+                    "Rows".into(),
+                    "Avg_row_length".into(),
+                    "Data_length".into(),
+                    "Max_data_length".into(),
+                    "Index_length".into(),
+                    "Data_free".into(),
+                    "Auto_increment".into(),
+                    "Create_time".into(),
+                    "Update_time".into(),
+                    "Check_time".into(),
+                    "Collation".into(),
+                    "Checksum".into(),
+                    "Create_options".into(),
+                    "Comment".into(),
+                ],
+                rows,
+                message: Some(format!("{} table(s)", found)),
+                plan: "cms: SHOW TABLE STATUS shim".into(),
+                affected_rows: 0,
+                last_insert_id: 0,
+                found_rows: found,
+                is_select: true,
+                decimal_scales: Vec::new(),
+            }));
+        }
+
         Ok(None)
+    }
+
+    /// One MariaDB-shaped SHOW TABLE STATUS row for `table`.
+    fn table_status_row(&self, table: &str) -> BTreeMap<String, Value> {
+        let mut r = BTreeMap::new();
+        r.insert("Name".into(), Value::Text(table.to_string()));
+        r.insert("Engine".into(), Value::Text("InnoDB".into()));
+        r.insert("Version".into(), Value::Int(10));
+        r.insert("Row_format".into(), Value::Text("Dynamic".into()));
+        r.insert("Rows".into(), Value::Int(0));
+        r.insert("Avg_row_length".into(), Value::Int(0));
+        r.insert("Data_length".into(), Value::Int(16384));
+        r.insert("Max_data_length".into(), Value::Int(0));
+        r.insert("Index_length".into(), Value::Int(0));
+        r.insert("Data_free".into(), Value::Int(0));
+        let auto_inc = self
+            .table_meta(table)
+            .and_then(|m| m.auto_increment_column.clone())
+            .and_then(|col| {
+                // NB: no backticks — the engine tokenizer has none, and this
+                // is the gate-internal path (identifiers are gate-normalized).
+                let q = format!("SELECT MAX({}) AS m FROM {}", col, table);
+                let mut buf = None;
+                self.engine.execute_in_tx(&q, &mut buf).ok().and_then(|res| {
+                    res.rows
+                        .first()
+                        .and_then(|r| r.get("m"))
+                        .and_then(|v| match v {
+                            Value::Int(i) => Some(*i as u64),
+                            Value::Text(t) => t.parse::<u64>().ok(),
+                            _ => None,
+                        })
+                })
+            });
+        let auto_inc = match auto_inc {
+            Some(v) => self
+                .engine
+                .cms_sequences
+                .current(table, || Ok(v))
+                .ok()
+                .map(|c| c as i64 + 1),
+            None => None,
+        };
+        match auto_inc {
+            Some(v) => r.insert("Auto_increment".into(), Value::Int(v)),
+            None => r.insert("Auto_increment".into(), Value::Null),
+        };
+        r.insert("Create_time".into(), Value::Null);
+        r.insert("Update_time".into(), Value::Null);
+        r.insert("Check_time".into(), Value::Null);
+        r.insert(
+            "Collation".into(),
+            Value::Text("utf8mb4_unicode_520_ci".into()),
+        );
+        r.insert("Checksum".into(), Value::Null);
+        r.insert("Create_options".into(), Value::Text(String::new()));
+        r.insert("Comment".into(), Value::Text(String::new()));
+        r
+    }
+
+    /// CREATE TABLE text for SHOW CREATE TABLE: the MySQL-dialect overlay
+    /// when the table was created through the gate, else a generic
+    /// reconstruction from the engine schema (documented fallback: coarser
+    /// types). `Err(1146)` for a table the engine has never heard of — the
+    /// same errno real MySQL answers with.
+    fn show_create_table_ddl(&self, table: &str) -> Result<String, CmsError> {
+        if let Some(m) = self.table_meta(table) {
+            return Ok(m.show_create_table_ddl());
+        }
+        let ci = self
+            .meta
+            .read()
+            .expect("meta map poisoned")
+            .values()
+            .find(|m| m.table.eq_ignore_ascii_case(table))
+            .cloned();
+        if let Some(m) = ci {
+            return Ok(m.show_create_table_ddl());
+        }
+        let Some(schema) = self.engine.get_schema(table) else {
+            return Err(CmsError {
+                errno: errno::ER_NO_SUCH_TABLE,
+                message: format!("Table '{}' doesn't exist", table),
+            });
+        };
+        let order: Vec<String> = if schema.column_order.is_empty() {
+            schema.columns.keys().cloned().collect()
+        } else {
+            schema
+                .column_order
+                .iter()
+                .filter(|c| schema.columns.contains_key(*c))
+                .cloned()
+                .collect()
+        };
+        let mut lines: Vec<String> = Vec::new();
+        for c in &order {
+            let ty = schema.columns.get(c).cloned().unwrap_or(crate::relational::ColumnType::Text);
+            lines.push(format!("  `{}` {} DEFAULT NULL", c, fallback_type(&ty)));
+        }
+        let mut pk: Vec<String> = schema.primary_key_cols.clone();
+        if pk.is_empty() && !schema.primary_locus_column.is_empty() {
+            pk.push(schema.primary_locus_column.clone());
+        }
+        if !pk.is_empty() {
+            let cols = pk.iter().map(|c| format!("`{}`", c)).collect::<Vec<_>>().join(", ");
+            lines.push(format!("  PRIMARY KEY ({})", cols));
+        }
+        Ok(format!(
+            "CREATE TABLE `{}` (\n{}\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+            table,
+            lines.join(",\n")
+        ))
     }
 
     /// SHOW FULL COLUMNS rows: overlay when registered, else derived from

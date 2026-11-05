@@ -14,7 +14,8 @@ use super::*;
 /// 3) `NOW()` inside INSERT/UPDATE → the current timestamp as a literal
 ///    (engine INSERT values are literals; Woo order timestamps use NOW()).
 pub(crate) fn preprocess_mysql_dialect(sql: &str) -> String {
-    let stripped = strip_index_hints(&strip_backticks(sql));
+    let unwrapped = unwrap_versioned_comments(sql);
+    let stripped = strip_index_hints(&strip_backticks(&unwrapped));
     let upper = stripped.trim_start().to_ascii_uppercase();
     let mut out = if upper.starts_with("DESCRIBE ") || upper.starts_with("DESC ") {
         let off = if upper.starts_with("DESCRIBE ") { 9 } else { 5 };
@@ -581,4 +582,185 @@ pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
     let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// MySQL versioned-comment unwrapping: `/*!NNNNN body */` → `body` when
+/// `NNNNN` ≤ the compat server version (10.11.11-MariaDB → 101111), the
+/// empty string otherwise. Plain `/* … */` comments and `/*! … */` without a
+/// version number are dropped as well (the engine tokenizer has no comment
+/// token). String literals (single/double quotes, backslash escapes) are
+/// copied verbatim — a dump value may legitimately contain `/*`.
+///
+/// Real mysqldump / mariadb-dump output is full of these
+/// (`/*!40101 SET @saved_cs_client=@@character_set_client */;`,
+/// `CREATE DATABASE /*!32312 IF NOT EXISTS*/ db`, `LOCK TABLES t READ
+/// /*!32311 LOCAL */`, `SELECT /*!40001 SQL_NO_CACHE */ * …`), and
+/// `mariadb < dump.sql` forwards them as statements.
+pub(crate) fn unwrap_versioned_comments(s: &str) -> String {
+    const SERVER_VERSION_NUM: u64 = 101_111; // 10.11.11-MariaDB
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    let mut in_string: Option<char> = None;
+    while i < chars.len() {
+        let c = chars[i];
+        if let Some(q) = in_string {
+            out.push(c);
+            if c == '\\' && i + 1 < chars.len() {
+                out.push(chars[i + 1]);
+                i += 2;
+                continue;
+            }
+            if c == q {
+                in_string = None;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '\'' || c == '"' {
+            in_string = Some(c);
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        // Comment start?
+        if c == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
+            if i + 2 < chars.len() && chars[i + 2] == '!' {
+                // Versioned: parse the digits after `/*!`.
+                let mut j = i + 3;
+                let mut ver: u64 = 0;
+                let mut has_digits = false;
+                while j < chars.len() && chars[j].is_ascii_digit() {
+                    ver = ver * 10 + (chars[j] as u64 - '0' as u64);
+                    j += 1;
+                    has_digits = true;
+                }
+                // Find the closing `*/` at the same nesting level (comments
+                // do not nest in dump output, but honour `/*` inside anyway).
+                let mut depth = 1usize;
+                let mut k = j;
+                let mut inner = String::new();
+                let mut closed_at: Option<usize> = None;
+                while k < chars.len() {
+                    if k + 1 < chars.len() && chars[k] == '/' && chars[k + 1] == '*' {
+                        depth += 1;
+                        inner.push_str("/*");
+                        k += 2;
+                        continue;
+                    }
+                    if k + 1 < chars.len() && chars[k] == '*' && chars[k + 1] == '/' {
+                        depth -= 1;
+                        if depth == 0 {
+                            closed_at = Some(k + 2);
+                            break;
+                        }
+                        inner.push_str("*/");
+                        k += 2;
+                        continue;
+                    }
+                    inner.push(chars[k]);
+                    k += 1;
+                }
+                if let Some(end) = closed_at {
+                    let executes = !has_digits || ver <= SERVER_VERSION_NUM;
+                    if executes {
+                        out.push_str(&inner);
+                    }
+                    i = end;
+                    continue;
+                }
+                // Unterminated comment — copy the rest verbatim.
+                out.push_str(chars[i..].iter().collect::<String>().as_str());
+                return out;
+            }
+            // Plain `/* … */` — drop it entirely (top level, outside strings).
+            let mut k = i + 2;
+            let mut closed_at: Option<usize> = None;
+            while k < chars.len() {
+                if k + 1 < chars.len() && chars[k] == '*' && chars[k + 1] == '/' {
+                    closed_at = Some(k + 2);
+                    break;
+                }
+                k += 1;
+            }
+            if let Some(end) = closed_at {
+                i = end;
+                continue;
+            }
+            out.push_str(chars[i..].iter().collect::<String>().as_str());
+            return out;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// Removes `FOREIGN KEY …`, `CONSTRAINT … FOREIGN KEY|CHECK …` and `CHECK …`
+/// segments from a CREATE TABLE body before the DDL reaches the engine
+/// (the engine grammar has no referential-action parsing; the overlay already
+/// skips these lines — this mirrors that for the forwarded DDL). Referential
+/// integrity itself is enforced by the engine's declared FK layer when used.
+///
+/// The input is a full CREATE TABLE statement; the function is a no-op for
+/// every other statement shape.
+pub(crate) fn strip_fk_constraints(create_table_sql: &str) -> String {
+    let s = create_table_sql.trim();
+    let upper_head = s.to_ascii_uppercase();
+    if !upper_head.starts_with("CREATE TABLE") && !upper_head.starts_with("CREATE TEMPORARY TABLE") {
+        return s.to_string();
+    }
+    let Some(body_start) = s.find('(') else {
+        return s.to_string();
+    };
+    // Balanced end of the column-list paren (string-aware).
+    let chars: Vec<char> = s.chars().collect();
+    let mut depth = 0usize;
+    let mut in_quote = false;
+    let mut body_end = chars.len();
+    for (i, &c) in chars.iter().enumerate().skip(body_start) {
+        if in_quote {
+            if c == '\\' {
+                continue;
+            }
+            if c == '\'' {
+                in_quote = false;
+            }
+            continue;
+        }
+        match c {
+            '\'' => in_quote = true,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    body_end = i + 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    if body_end > chars.len() {
+        return s.to_string();
+    }
+    let head = s[..body_start].to_string();
+    let body = &s[body_start + 1..body_end - 1];
+    let tail = s[body_end..].to_string();
+    let segments = crate::cms::ddl_meta::split_top_level(body);
+    let kept: Vec<String> = segments
+        .into_iter()
+        .filter(|seg| {
+            let first = seg
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_ascii_uppercase();
+            !matches!(first.as_str(), "FOREIGN" | "CONSTRAINT" | "CHECK")
+        })
+        .collect();
+    if kept.is_empty() {
+        return s.to_string();
+    }
+    format!("{} ({}) {}", head.trim_end(), kept.join(", "), tail.trim())
 }

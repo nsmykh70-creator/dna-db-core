@@ -195,10 +195,10 @@ impl CmsSqlGate {
         let sql = pre.trim();
         let sql = sql.strip_suffix(';').unwrap_or(sql).trim();
         if sql.is_empty() {
-            return Err(CmsError {
-                errno: errno::ER_PARSE_ERROR,
-                message: "empty query".into(),
-            });
+            // After versioned-comment unwrapping a dump statement can be
+            // comment-only (`/*!99999 ...*/` above our compat level) — MySQL
+            // answers OK for those, so the gate does the same.
+            return Ok(empty_ok("no-op"));
         }
         let upper = sql.to_ascii_uppercase();
 
@@ -214,6 +214,25 @@ impl CmsSqlGate {
                 .to_string();
             self.with_session(session, |s| s.database = Some(db.clone()));
             return Ok(empty_ok(format!("database changed to '{}'", db)));
+        }
+
+        // ---------- mysqldump / mariadb-dump session statements ----------
+        // `LOCK TABLES \`t\` [READ [LOCAL]|WRITE][, …]` (both directions of a
+        // dump: the dumper takes READ locks around a table copy, the dumped
+        // file replays them on import). DNA-DB is a single-writer engine —
+        // table-level locking is already implied, so the statement is
+        // accepted as an OK with no bookkeeping (documented parity choice:
+        // row locks keep enforcing real InnoDB semantics).
+        if upper.starts_with("LOCK TABLES") {
+            return Ok(empty_ok("lock tables acquired"));
+        }
+        if upper == "UNLOCK TABLES" {
+            return Ok(empty_ok("unlock tables"));
+        }
+        // FLUSH … (LOGS | TABLES | STATUS | PRIVILEGES) — maintenance noise
+        // from admin tools; no-op (the engine flushes on every checkpoint).
+        if upper.starts_with("FLUSH ") {
+            return Ok(empty_ok("flush acknowledged"));
         }
 
         // CREATE DATABASE [IF NOT EXISTS] name — the engine is
@@ -387,11 +406,31 @@ impl CmsSqlGate {
             }
         }
 
-        // ---------- SQL_CALC_FOUND_ROWS ----------
+        // ---------- SQL_CALC_FOUND_ROWS / SQL_NO_CACHE ----------
         let mut forwarded = sql.to_string();
         if let Some(pos) = find_ci(&forwarded, "SQL_CALC_FOUND_ROWS") {
             forwarded.replace_range(pos..pos + "SQL_CALC_FOUND_ROWS".len(), "");
             forwarded = forwarded.split_whitespace().collect::<Vec<_>>().join(" ");
+        }
+        // `SELECT /*!40001 SQL_NO_CACHE */ * FROM t` — mariadb-dump's per-table
+        // copy query. Advisory for a cacheless engine: strip like the above.
+        if let Some(pos) = find_ci(&forwarded, "SQL_NO_CACHE") {
+            forwarded.replace_range(pos..pos + "SQL_NO_CACHE".len(), "");
+            forwarded = forwarded.split_whitespace().collect::<Vec<_>>().join(" ");
+        }
+        // CREATE TABLE forwarded to the engine: drop FOREIGN KEY / CONSTRAINT /
+        // CHECK segments (overlay already skips them; the engine grammar has
+        // no referential-action parsing) so FK-bearing dumps parse.
+        if upper.starts_with("CREATE TABLE") {
+            forwarded = strip_fk_constraints(&forwarded);
+        }
+        // `ALTER TABLE t DISABLE|ENABLE KEYS` — dump import bookkeeping around
+        // bulk INSERTs (index maintenance hint). No-op: DNA-DB maintains its
+        // indexes inline.
+        if upper.starts_with("ALTER TABLE")
+            && (upper.contains(" DISABLE KEYS") || upper.contains(" ENABLE KEYS"))
+        {
+            return Ok(empty_ok("keys maintenance acknowledged"));
         }
         // `LOCK IN SHARE MODE` (MediaWiki User::addToDatabase) is a
         // gate-recognised locking tail but not part of the engine grammar —

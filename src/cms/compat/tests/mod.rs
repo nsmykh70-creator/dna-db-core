@@ -35,6 +35,8 @@ fn v(row: &BTreeMap<String, Value>, k: &str) -> String {
 #[cfg(test)]
 mod gate;
 #[cfg(test)]
+mod dump;
+#[cfg(test)]
 mod row_locks;
 #[cfg(test)]
 mod wire;

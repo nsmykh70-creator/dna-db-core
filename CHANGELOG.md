@@ -2,6 +2,53 @@
 
 ## Unreleased (CMS Edition — branch `cms-edition`)
 
+### mysqldump / mariadb-dump roundtrip — phase 3 opens (2026-11-06)
+
+First phase-3 acceptance item ("эксплуатация"): MySQL ⇄ DNA-DB migration
+with the real dumper. Both directions verified against a **MariaDB
+10.11.11 reference** by `scripts/e2e_mysqldump_roundtrip.sh` +
+`scripts/mysqldump_roundtrip_harness.php`:
+
+- **IMPORT** — `mariadb-dump` dumps the reference database, the stock
+  `mariadb` client replays the dump into `dna-db-core mysqld`. The dump
+  carries the full real-format load: versioned comments
+  (`/*!40101 SET @OLD_… */`, `/*!32312 IF NOT EXISTS*/`, `/*!32311 LOCAL */`,
+  `/*!40000 DISABLE KEYS */`), `LOCK TABLES`/`UNLOCK TABLES`, extended
+  multi-row INSERTs with `\0 \' \" \\` escapes, prefix and composite keys,
+  table options.
+- **EXPORT** — `mariadb-dump` connects to DNA-DB as a MySQL server and
+  dumps it (SHOW CREATE TABLE, `SELECT /*!40001 SQL_NO_CACHE */ *`,
+  information_schema FILES/TRIGGERS probes); the dump replays into a clean
+  MariaDB database untouched.
+
+Verdict: **ref → imp → back match byte-for-byte** on all tables
+(cyrillic, emoji, blob bytes `00 27 01 5c…`, DECIMAL `250.00` scale,
+NULL vs '', declared column order); auto-increment continues at
+max(id)+1 after import (99 → 100, LAST_INSERT_ID correct). Report:
+`docs/cms/E2E_MYSQLDUMP_ROUNDTRIP_REPORT.md`.
+
+Gate additions (all behind `--features cms`): `dialect::
+unwrap_versioned_comments` (execute `/*!NNNNN … */` when
+NNNNN ≤ 101111, drop above; string literals untouched) and
+`dialect::strip_fk_constraints` (FOREIGN KEY/CONSTRAINT/CHECK segments
+removed from CREATE TABLE before the engine sees it); LOCK/UNLOCK TABLES,
+FLUSH and `ALTER TABLE … DISABLE|ENABLE KEYS` answer OK as no-ops;
+`SQL_NO_CACHE` is stripped; comment-only statements answer OK. New SHOW
+shims: **SHOW CREATE TABLE** (rebuilt from the overlay with the original
+table options; idempotent parse→emit→parse; errno 1146 for unknown
+tables), SHOW CREATE DATABASE, SHOW TABLE STATUS (InnoDB-shaped,
+honest auto-increment), empty trigger/routine catalogs. `SELECT
+@@collation_database / @@character_set_database / @@max_allowed_packet`
+answered. information_schema.FILES / TRIGGERS / EVENTS / ROUTINES /
+PARAMETERS return empty sets so dumpers skip those sections. Overlay:
+`CmsTableMeta.table_options` keeps the raw DDL tail; the CREATE TABLE
+parser now handles backtick-quoted column names (SHOW CREATE TABLE output
+re-parses into identical metadata) and uses byte offsets (multibyte-safe
+defaults/comments).
+
+Tests: 316 with `--features cms` (+4 in `cms::compat::tests::dump`), 195
+without (4 pre-existing cms-gated battery failures unchanged).
+
 ### Phase 2 acceptance closed — deadlock-retry e2e + DECIMAL scale (2026-11-06)
 
 The last two phase-2 items are done, closing the phase:
