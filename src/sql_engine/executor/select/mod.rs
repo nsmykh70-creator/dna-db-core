@@ -188,7 +188,11 @@ impl SqlEngine {
             // the surviving filter lives in WHERE, exactly like MySQL.
             let is_cross = j.left_col == "1" && j.right_col == "1";
             let next = if is_cross {
-                cross_join(&current, &right)
+                // extras still belong to the ON of this join — INNER/cross
+                // semantics: filter the product right here (≡ WHERE only
+                // because no outer side is involved).
+                let rows = cross_join(&current, &right);
+                self.apply_on_extras(rows, &j.on_extra)?
             } else {
                 // MySQL allows either orientation in ON (`a.x = b.y` or
                 // `b.y = a.x`); orient the pair by where the columns actually
@@ -219,14 +223,41 @@ impl SqlEngine {
                     }
                 };
                 match j.join_type {
-                    JoinType::Inner => hash_join(&current, &right, &lc, &rc),
-                    JoinType::Left => hash_join_left(&current, &right, &lc, &rc),
+                    JoinType::Inner => {
+                        let rows = hash_join(&current, &right, &lc, &rc);
+                        self.apply_on_extras(rows, &j.on_extra)?
+                    }
+                    JoinType::Left => {
+                        if j.on_extra.is_empty() {
+                            hash_join_left(&current, &right, &lc, &rc)
+                        } else {
+                            hash_join_left_extras(&current, &right, &lc, &rc, &|row| {
+                                self.conjuncts_hold(&j.on_extra, row)
+                            })?
+                        }
+                    }
                     // RIGHT JOIN == LEFT JOIN with the sides swapped (the row
                     // model is single-namespace, so column naming is unchanged).
-                    JoinType::Right => hash_join_left(&right, &current, &rc, &lc),
+                    JoinType::Right => {
+                        if j.on_extra.is_empty() {
+                            hash_join_left(&right, &current, &rc, &lc)
+                        } else {
+                            hash_join_left_extras(&right, &current, &rc, &lc, &|row| {
+                                self.conjuncts_hold(&j.on_extra, row)
+                            })?
+                        }
+                    }
                     // FULL OUTER JOIN: left join + every right row that never
                     // matched, padded with NULLs on the left columns.
-                    JoinType::Full => hash_join_full(&current, &right, &lc, &rc),
+                    JoinType::Full => {
+                        if j.on_extra.is_empty() {
+                            hash_join_full(&current, &right, &lc, &rc)
+                        } else {
+                            hash_join_full_extras(&current, &right, &lc, &rc, &|row| {
+                                self.conjuncts_hold(&j.on_extra, row)
+                            })?
+                        }
+                    }
                 }
             };
             plan.push_str(&format!(

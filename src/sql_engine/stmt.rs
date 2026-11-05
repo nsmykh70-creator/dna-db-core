@@ -288,6 +288,13 @@ pub(crate) struct JoinSpec {
     pub(crate) alias: Option<String>,
     pub(crate) left_col: String, // qualified or bare (resolved later)
     pub(crate) right_col: String,
+    /// CMS edition: non-equi conjuncts of a compound ON (`ON a.x = b.y AND
+    /// a.z = b.w`, `ON … AND p.deleted = 0`). INNER joins apply them as a
+    /// post-join filter (equivalent to the old WHERE fold); OUTER joins MUST
+    /// hold them during the ON match — folding them into WHERE would drop
+    /// the NULL-padded unmatched rows (Drupal 11 entity loads join with
+    /// `LEFT JOIN … ON e = uid AND p.langcode = u.langcode AND p.deleted = 0`).
+    pub(crate) on_extra: Vec<Expr>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

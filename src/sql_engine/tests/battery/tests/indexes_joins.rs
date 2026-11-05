@@ -210,6 +210,112 @@ use super::*;
         assert_eq!(crick.get("order_id"), Some(&Value::Null));
     }
 
+    // CMS edition regression (Drupal 11): a compound ON (`a = b AND c = d`)
+    // inside a LEFT JOIN must be part of the MATCH, not the WHERE filter.
+    // Folding the extra conjuncts into WHERE dropped the NULL-padded
+    // unmatched rows, which broke Drupal's entity loads (`LEFT JOIN … ON
+    // p.entity_id = u.uid AND p.langcode = u.langcode AND p.deleted = 0`
+    // returned no row for users without a picture) and with it the admin
+    // login (`default_langcode = 1` came back as NULL after the re-save).
+
+    #[test]
+    fn left_join_compound_on_keeps_unmatched_left_rows() {
+        let (_e, sql) = setup();
+        sql.execute(
+            "INSERT INTO chr_users (user_id = 12, username = 'dr_watson', balance = 100.0)",
+        )
+        .unwrap();
+        sql.execute(
+            "INSERT INTO chr_users (user_id = 14, username = 'prof_crick', balance = 200.0)",
+        )
+        .unwrap();
+        sql.execute(
+            "INSERT INTO chr_orders (order_id = 1, user_id = 12, total_usd = 50.0, status = 'OK')",
+        )
+        .unwrap();
+        // the second ON conjunct is never true for the only order — MySQL
+        // keeps BOTH users with NULL order columns (LEFT JOIN semantics)
+        let res = sql
+            .execute(
+                "SELECT username, order_id FROM chr_users LEFT JOIN chr_orders ON user_id = user_id AND chr_orders.status = 'REFUND'",
+            )
+            .unwrap();
+        assert_eq!(res.rows.len(), 2, "rows: {:?}", res.rows);
+        let w = res
+            .rows
+            .iter()
+            .find(|r| r.get("username") == Some(&Value::Text("dr_watson".into())))
+            .unwrap();
+        assert_eq!(w.get("order_id"), Some(&Value::Null));
+    }
+
+    #[test]
+    fn left_join_compound_on_matches_when_every_conjunct_holds() {
+        let (_e, sql) = setup();
+        sql.execute(
+            "INSERT INTO chr_users (user_id = 12, username = 'dr_watson', balance = 100.0)",
+        )
+        .unwrap();
+        sql.execute(
+            "INSERT INTO chr_users (user_id = 14, username = 'prof_crick', balance = 200.0)",
+        )
+        .unwrap();
+        sql.execute(
+            "INSERT INTO chr_orders (order_id = 1, user_id = 12, total_usd = 50.0, status = 'OK')",
+        )
+        .unwrap();
+        sql.execute(
+            "INSERT INTO chr_orders (order_id = 2, user_id = 12, total_usd = 70.0, status = 'REFUND')",
+        )
+        .unwrap();
+        // three-conjunct ON (Drupal shape): order 1 is blocked by the status
+        // conjunct, order 2 passes, user 14 stays NULL-padded
+        let res = sql
+            .execute(
+                "SELECT username, order_id FROM chr_users LEFT JOIN chr_orders ON user_id = user_id AND chr_orders.status = 'REFUND' AND total_usd > 0",
+            )
+            .unwrap();
+        assert_eq!(res.rows.len(), 2, "rows: {:?}", res.rows);
+        let w = res
+            .rows
+            .iter()
+            .find(|r| r.get("username") == Some(&Value::Text("dr_watson".into())))
+            .unwrap();
+        assert_eq!(w.get("order_id"), Some(&Value::Int(2)), "rows: {:?}", res.rows);
+        let c = res
+            .rows
+            .iter()
+            .find(|r| r.get("username") == Some(&Value::Text("prof_crick".into())))
+            .unwrap();
+        assert_eq!(c.get("order_id"), Some(&Value::Null));
+    }
+
+    #[test]
+    fn inner_join_compound_on_filters_pairs() {
+        let (_e, sql) = setup();
+        sql.execute(
+            "INSERT INTO chr_users (user_id = 12, username = 'dr_watson', balance = 100.0)",
+        )
+        .unwrap();
+        sql.execute(
+            "INSERT INTO chr_orders (order_id = 1, user_id = 12, total_usd = 50.0, status = 'OK')",
+        )
+        .unwrap();
+        sql.execute(
+            "INSERT INTO chr_orders (order_id = 2, user_id = 12, total_usd = 70.0, status = 'REFUND')",
+        )
+        .unwrap();
+        // INNER + compound ON: only the passing pair survives (same result as
+        // the old WHERE fold — WooCommerce refund totals shape)
+        let res = sql
+            .execute(
+                "SELECT username, order_id FROM chr_users INNER JOIN chr_orders ON user_id = user_id AND chr_orders.status = 'REFUND'",
+            )
+            .unwrap();
+        assert_eq!(res.rows.len(), 1, "rows: {:?}", res.rows);
+        assert_eq!(res.rows[0].get("order_id"), Some(&Value::Int(2)));
+    }
+
     #[test]
     fn limit_and_multi_insert() {
         let (_e, sql) = setup();

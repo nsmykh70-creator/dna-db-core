@@ -28,6 +28,43 @@ impl SqlEngine {
         Ok(refs)
     }
 
+    /// CMS edition: hold ALL compound-ON conjuncts on one merged row.
+    /// NULL / 0 / unresolved → the conjunct fails, matching SQL three-valued
+    /// ON semantics (a pair only matches when every conjunct is TRUE).
+    pub(crate) fn conjuncts_hold(
+        &self,
+        extras: &[Expr],
+        row: &BTreeMap<String, Value>,
+    ) -> Result<bool, String> {
+        for e in extras {
+            let resolved = self.resolve_expr_for_row(e, row)?;
+            if !resolved.eval_bool(row) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// INNER-join extras: post-join row filter (for INNER joins filtering
+    /// here is equivalent to MySQL's ON filtering, and to the old
+    /// fold-into-WHERE path — the rows cannot be re-padded afterwards).
+    pub(crate) fn apply_on_extras(
+        &self,
+        rows: Vec<BTreeMap<String, Value>>,
+        extras: &[Expr],
+    ) -> Result<Vec<BTreeMap<String, Value>>, String> {
+        if extras.is_empty() {
+            return Ok(rows);
+        }
+        let mut kept = Vec::with_capacity(rows.len());
+        for row in rows {
+            if self.conjuncts_hold(extras, &row)? {
+                kept.push(row);
+            }
+        }
+        Ok(kept)
+    }
+
     /// Resolve subquery nodes of `e` for ONE outer row: replace
     /// ScalarSubquery / Exists / correlated InSubquery with literal values.
     /// Non-subquery subtrees are evaluated directly (they stay intact).

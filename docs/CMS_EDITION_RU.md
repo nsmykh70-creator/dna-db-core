@@ -1,4 +1,4 @@
-# DNA-DB CMS Edition — WordPress / Joomla
+# DNA-DB CMS Edition — WordPress / Joomla / OpenCart / Drupal / MediaWiki
 
 Ветка `cms-edition`, feature-гейт `cms`. База: v4.1 (`main`, панель v4.1,
 компакция, журнал компакций, Prometheus-гейджи).
@@ -12,6 +12,9 @@
 | WordPress | 6.x | drop-in `wp-content/db.php` (замена `wpdb`) либо MySQL wire | 1 |
 | WooCommerce | 8.x+ | тот же `wpdb` + транзакции/блокировки | 1 |
 | Joomla | 5.x | `Joomla\Database\DatabaseDriver` (MySQLi/PDO MySQL/**PDO PgSQL**) | 2 |
+| OpenCart | 4.x | MySQL wire — штатный mysqli, официальный CLI-установщик | 2 |
+| Drupal | 11.x | MySQL wire — штатный PDO MySQL, web-установщик `core/install.php` | 2 |
+| MediaWiki | 1.43 LTS | MySQL wire — штатный mysqli, CLI-установщик `maintenance/install.php` | 2 |
 | Прочее PHP | — | MySQL wire protocol (фаза 4) | 3 |
 
 Ключевой факт: WordPress официально поддерживает подмену слоя БД
@@ -302,8 +305,15 @@ WooCommerce ✅ (11.2.1, HPOS, артефакты = MariaDB, см. E2E_WOO_REPOR
 (5.4.10 через штатный mysqli → wire-адаптер: установщик, фронтенд и
 админка — см. E2E_JOOMLA_MYSQLWIRE_REPORT), **установка OpenCart ✅
 (4.1.0.4 официальным CLI-установщиком, storefront/admin 200, 159 таблиц —
-см. E2E_OPENCART_MYSQLWIRE_REPORT)**. Приёмка: e2e-заказ ✅,
-установка Joomla ✅ (wire; pgwire для Joomla больше не нужен).
+см. E2E_OPENCART_MYSQLWIRE_REPORT)**, **установка Drupal ✅ (11.4.10
+штатным web-установщиком через PDO MySQL → wire: batch standard-профиля,
+homepage 200, админ-сессия, фикс compound-ON outer joins — см.
+E2E_DRUPAL_MYSQLWIRE_REPORT)**, **установка MediaWiki ✅ (1.43.11
+официальным CLI-установщиком через mysqli → wire: рендер, правка через
+maintenance/edit.php, API, MCR-цепочка — см.
+E2E_MEDIAWIKI_MYSQLWIRE_REPORT)**. Приёмка: e2e-заказ ✅,
+установка Joomla ✅ (wire; pgwire для Joomla больше не нужен),
+**установки OpenCart/Drupal/MediaWiki ✅ — пять CMS зелёные на wire-адаптере**.
 
 **Фаза 3 — эксплуатация (2–4 нед).** mysqldump-совместимый импорт/экспорт,
 бэкап/рестор, docker-образ, гайд «миграция WP с MySQL за 3 шага»,
@@ -317,8 +327,9 @@ mysqli/PDO_mysql/phpMyAdmin работают сами. CMS-редакция ст
 
 - База — `main`; rebase на main не реже чем раз в фазу.
 - Всё CMS-специфичное — за feature `cms`: `cargo build --release --features cms`.
-- Обычная сборка и тесты main не должны меняться (сейчас: 221 тест без
-  фичи, 276 с `--features cms`).
+- Обычная сборка и тесты main не должны меняться (сейчас: 195 тестов без
+  фичи зелёные + 4 известных отказа cms-гейтованных батарейных тестов,
+  285 с `--features cms`).
 - При зрелости фазы 2 — обсуждение слияния `cms` в main как опциональной
   фичи; ветка остаётся для фаз 3–4.
 - CI ветки: cargo test с `--features cms` + сборка без неё.

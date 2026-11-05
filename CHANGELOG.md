@@ -2,6 +2,48 @@
 
 ## Unreleased (CMS Edition — branch `cms-edition`)
 
+### Drupal 11.4.10 installs end-to-end via the official web installer (2026-11-05)
+
+`core/install.php` driven over HTTP by `scripts/drupal_e2e.php` (stock PDO
+MySQL, `EMULATE_PREPARES`) against `dna-db-core mysqld :13307`: language →
+profile → database settings → full standard-profile batch → site
+configuration → redirect to the site. Homepage renders (HTTP 200), the
+installer-authenticated admin session shows `Log out` on `/user/1`, 54
+`dp_*` tables (config=137, menu_tree=65, key_value=315, watchdog=49),
+prepared SELECT roundtrip OK. Report:
+`docs/cms/E2E_DRUPAL_MYSQLWIRE_REPORT.md`.
+
+Engine fix — **compound-ON outer joins** (with 3 regression tests): Drupal's
+entity loads join with `LEFT JOIN … ON p.entity_id = u.uid AND
+p.langcode = u.langcode AND p.deleted = 0`. The parser used to keep only the
+first `col = col` pair for the hash join and fold the remaining conjuncts
+into WHERE — equivalent for INNER, wrong for OUTER joins: the NULL-padded
+unmatched rows vanished, the installer re-saved uid 1 with
+`created/changed/default_langcode = NULL`, and the admin login
+(`… AND default_langcode = 1`) found nothing ("Unrecognized username or
+password"). Now `JoinSpec.on_extra` carries the non-equi conjuncts (top-level
+AND chains are split), INNER joins apply them as a post-join filter, and
+LEFT/RIGHT/FULL evaluate them inside the ON match
+(`hash_join_left_extras` / `hash_join_full_extras`) so unmatched rows keep
+their NULL padding. 285 lib tests green with `--features cms` (195 without,
+4 pre-existing cms-gated battery failures unchanged).
+
+### MediaWiki 1.43.11 E2E round — install, edit, API, MCR chain (2026-11-05)
+
+The official CLI installer (`maintenance/install.php`) installs MediaWiki
+1.43.11 on DNA-DB over stock mysqli (base `wikidna`, prefix `mwd_`, 58
+tables); `Main_Page` renders (HTTP 200), an edit through
+`maintenance/edit.php` is visible via `action=raw` and `api.php` statistics
+(`edits: 2`), and the 1.43 MCR chain page → revision → slots → content →
+text stays consistent through the wire (JOINs +
+`ORDER BY r.rev_id DESC LIMIT 1`). Driver: `scripts/e2e_mediawiki_mysqlwire.sh`.
+Report: `docs/cms/E2E_MEDIAWIKI_MYSQLWIRE_REPORT.md`. Noted non-blocking
+gaps: aggregates over `information_schema` catalog shims (COUNT(*) returns
+catalog rows instead of one row) and unknown columns in ON/WHERE silently
+yielding an empty result instead of SQLSTATE 42S22 — candidates for the next
+engine round; MediaWiki's MySQL adapter wants the port inside `--dbserver`
+(`--dbport` is PostgreSQL-only there).
+
 ### OpenCart 4.1.0.4 installs via the official CLI installer (2026-11-04)
 
 `install/cli_install.php install --db_port …` builds all 159 tables from its

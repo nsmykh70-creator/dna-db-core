@@ -664,6 +664,157 @@ pub(super) fn hash_join_left(
     out
 }
 
+/// Merge one left and one right row (single-namespace model): colliding
+/// right-side columns get the `joined_` prefix, same as `hash_join`.
+fn merge_join_rows(
+    l: &BTreeMap<String, Value>,
+    r: &BTreeMap<String, Value>,
+) -> BTreeMap<String, Value> {
+    let mut merged = l.clone();
+    for (k, val) in r.iter() {
+        let name = if merged.contains_key(k) {
+            format!("joined_{}", k)
+        } else {
+            k.clone()
+        };
+        merged.insert(name, val.clone());
+    }
+    merged
+}
+
+/// Guard over the non-equi conjuncts of a compound ON, evaluated on a merged
+/// row (NULL/0 → false, matching SQL three-valued ON semantics).
+pub(super) type OnGuard<'a> = &'a dyn Fn(&BTreeMap<String, Value>) -> Result<bool, String>;
+
+/// CMS edition: LEFT/RIGHT hash join whose compound-ON conjuncts
+/// (`ON e = uid AND p.langcode = u.langcode AND p.deleted = 0`) are part of
+/// the MATCH instead of the WHERE filter. A pair counts as matched only when
+/// the equi-pair hits AND the guard holds; a preserved-side row with no
+/// passing pair keeps its other-side columns as NULLs. Folding these
+/// conjuncts into WHERE used to destroy exactly this padding (Drupal 11
+/// entity loads: `LEFT JOIN … ON p.entity_id = u.uid AND p.langcode =
+/// u.langcode AND p.deleted = 0` dropped every user without a picture).
+pub(super) fn hash_join_left_extras(
+    preserved: &[BTreeMap<String, Value>],
+    other: &[BTreeMap<String, Value>],
+    p_col: &str,
+    o_col: &str,
+    guard: OnGuard<'_>,
+) -> Result<Vec<BTreeMap<String, Value>>, String> {
+    use std::collections::HashMap;
+    let mut index: HashMap<Vec<u8>, Vec<&BTreeMap<String, Value>>> = HashMap::new();
+    for r in other {
+        if let Some(v) = r.get(o_col) {
+            if let Some(key) = join_key(v) {
+                index.entry(key).or_default().push(r);
+            }
+        }
+    }
+    let other_cols: Vec<String> = other
+        .first()
+        .map(|r| r.keys().cloned().collect())
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for l in preserved {
+        let mut matched = false;
+        if let Some(v) = l.get(p_col) {
+            if let Some(key) = join_key(v) {
+                if let Some(cands) = index.get(&key) {
+                    for r in cands {
+                        let merged = merge_join_rows(l, r);
+                        if guard(&merged)? {
+                            matched = true;
+                            out.push(merged);
+                        }
+                    }
+                }
+            }
+        }
+        if !matched {
+            let mut row = l.clone();
+            for c in &other_cols {
+                if !row.contains_key(c) {
+                    row.insert(c.clone(), Value::Null);
+                }
+            }
+            out.push(row);
+        }
+    }
+    Ok(out)
+}
+
+/// FULL OUTER JOIN with compound-ON conjuncts in the match: pairs must pass
+/// the guard; both unmatched sides keep their rows NULL-padded (same merge
+/// rules as `hash_join_full`).
+pub(super) fn hash_join_full_extras(
+    left_rows: &[BTreeMap<String, Value>],
+    right_rows: &[BTreeMap<String, Value>],
+    left_col: &str,
+    right_col: &str,
+    guard: OnGuard<'_>,
+) -> Result<Vec<BTreeMap<String, Value>>, String> {
+    use std::collections::HashMap;
+    let mut index: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
+    for (i, r) in right_rows.iter().enumerate() {
+        if let Some(k) = join_key(r.get(right_col).unwrap_or(&Value::Null)) {
+            index.entry(k).or_default().push(i);
+        }
+    }
+    let right_cols: Vec<String> = right_rows
+        .first()
+        .map(|r| r.keys().cloned().collect())
+        .unwrap_or_default();
+    let left_cols: Vec<String> = left_rows
+        .first()
+        .map(|r| r.keys().cloned().collect())
+        .unwrap_or_default();
+    let mut matched_right: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for l in left_rows {
+        let key = join_key(l.get(left_col).unwrap_or(&Value::Null));
+        let matches: &[usize] = key
+            .as_ref()
+            .and_then(|k| index.get(k))
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        let mut matched = false;
+        for &ri in matches {
+            let r = &right_rows[ri];
+            let mut row = l.clone();
+            for (k, v) in r.iter() {
+                row.insert(k.clone(), v.clone());
+            }
+            if guard(&row)? {
+                matched = true;
+                matched_right.insert(ri);
+                out.push(row);
+            }
+        }
+        if !matched {
+            let mut row = l.clone();
+            for c in &right_cols {
+                if !row.contains_key(c) {
+                    row.insert(c.clone(), Value::Null);
+                }
+            }
+            out.push(row);
+        }
+    }
+    for (i, r) in right_rows.iter().enumerate() {
+        if matched_right.contains(&i) {
+            continue;
+        }
+        let mut row = r.clone();
+        for c in &left_cols {
+            if !row.contains_key(c) {
+                row.insert(c.clone(), Value::Null);
+            }
+        }
+        out.push(row);
+    }
+    Ok(out)
+}
+
 /// v3.6 FULL OUTER JOIN: every matched pair, plus unmatched LEFT rows (right
 /// columns NULL) and unmatched RIGHT rows (left columns NULL). NULL keys
 /// never match (three-valued logic, same as hash_join/hash_join_left).

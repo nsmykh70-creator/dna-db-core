@@ -141,9 +141,6 @@ impl SParser {
         };
         let from_alias = self.maybe_alias();
         let mut joins = Vec::new();
-        // CMS edition: extra ON predicates of compound join conditions
-        // (`ON a = b AND c = d`) — folded into WHERE after the join loop.
-        let mut on_extra: Vec<Expr> = Vec::new();
         loop {
             let join_type = if self.kw("INNER") {
                 self.expect_kw("JOIN")?;
@@ -199,6 +196,7 @@ impl SParser {
                     alias: jalias,
                     left_col: col.clone(),
                     right_col: col,
+                    on_extra: Vec::new(),
                 });
                 continue;
             }
@@ -226,52 +224,69 @@ impl SParser {
                         alias: jalias,
                         left_col: "1".to_string(),
                         right_col: "1".to_string(),
+                        on_extra: Vec::new(),
                     });
                     continue;
                 }
                 self.pos = save;
             }
             // CMS edition: the ON predicate is parsed as a full expression.
-            // A plain `col = col` equality keeps the hash join; every other
-            // shape (column = literal, compound AND chains — WooCommerce
-            // refund totals `ON ( t.type = 'refund' AND t.parent = 11 )`)
-            // becomes a filtered cross join (ON 1=1 + WHERE) — identical
-            // results for INNER joins, which is what WordPress/WooCommerce
-            // emit. Parens are handled by the expression grammar itself.
-            let cond = self.parse_expr()?;
-            let simple = match &cond {
-                Expr::Cmp {
-                    op: CmpOp::Eq,
-                    left,
-                    right,
-                } => match (&**left, &**right) {
-                    (Expr::Column(l), Expr::Column(r)) => Some((l.clone(), r.clone())),
-                    _ => None,
-                },
-                _ => None,
-            };
-            match simple {
-                Some((l, r)) => joins.push(JoinSpec {
-                    join_type,
-                    table,
-                    alias: jalias,
-                    left_col: l,
-                    right_col: r,
-                }),
-                None => {
-                    joins.push(JoinSpec {
-                        join_type,
-                        table,
-                        alias: jalias,
-                        left_col: "1".to_string(),
-                        right_col: "1".to_string(),
-                    });
-                    on_extra.push(cond);
+            // A plain `col = col` equality drives the hash join; every other
+            // conjunct of a compound ON (`a.x = b.y AND a.z = b.w`, column =
+            // literal, …) rides in JoinSpec::on_extra. INNER joins apply the
+            // extras as a post-join filter (equivalent to the old WHERE
+            // fold); OUTER joins MUST evaluate them inside the ON match —
+            // folding them into WHERE would drop the NULL-padded unmatched
+            // rows (Drupal 11: `LEFT JOIN … ON e = uid AND p.langcode =
+            // u.langcode AND p.deleted = 0`). Parens are handled by the
+            // expression grammar itself.
+            // parse_expr returns the whole top-level AND chain as one
+            // Expr::And — split it into individual conjuncts first.
+            fn split_conjuncts(e: Expr, out: &mut Vec<Expr>) {
+                match e {
+                    Expr::And(a, b) => {
+                        split_conjuncts(*a, out);
+                        split_conjuncts(*b, out);
+                    }
+                    other => out.push(other),
                 }
             }
+            let mut conjuncts = Vec::new();
+            split_conjuncts(self.parse_expr()?, &mut conjuncts);
             while self.kw("AND") {
-                on_extra.push(self.parse_expr()?);
+                split_conjuncts(self.parse_expr()?, &mut conjuncts);
             }
+            let mut hash_pair: Option<(String, String)> = None;
+            let mut extras: Vec<Expr> = Vec::new();
+            for c in conjuncts {
+                let simple = match &c {
+                    Expr::Cmp {
+                        op: CmpOp::Eq,
+                        left,
+                        right,
+                    } => match (&**left, &**right) {
+                        (Expr::Column(l), Expr::Column(r)) => Some((l.clone(), r.clone())),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if hash_pair.is_none() {
+                    if let Some(pair) = simple {
+                        hash_pair = Some(pair);
+                        continue;
+                    }
+                }
+                extras.push(c);
+            }
+            let (l, r) = hash_pair.unwrap_or(("1".to_string(), "1".to_string()));
+            joins.push(JoinSpec {
+                join_type,
+                table,
+                alias: jalias,
+                left_col: l,
+                right_col: r,
+                on_extra: extras,
+            });
             if paren {
                 self.expect(STok::RParen)?;
             }
@@ -281,17 +296,9 @@ impl SParser {
         } else {
             None
         };
-        // fold the extra ON predicates into the filter (see the join loop)
-        if !on_extra.is_empty() {
-            let extra = on_extra
-                .into_iter()
-                .reduce(|a, b| Expr::And(Box::new(a), Box::new(b)))
-                .expect("on_extra non-empty");
-            where_clause = Some(match where_clause {
-                Some(w) => Expr::And(Box::new(extra), Box::new(w)),
-                None => extra,
-            });
-        }
+        // NOTE: compound-ON conjuncts no longer fold into WHERE — they stay
+        // in JoinSpec::on_extra so OUTER joins can hold them during the ON
+        // match (see the join loop in the executor).
         let group_by = if self.kw("GROUP") {
             self.expect_kw("BY")?;
             let mut cols = Vec::new();
