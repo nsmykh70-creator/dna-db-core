@@ -137,6 +137,7 @@ pub(crate) fn column_def_packet(
     org_name: &str,
     ctype: u8,
     flags: u16,
+    decimals: u8,
     with_default: bool,
 ) -> Vec<u8> {
     let mut p = Vec::with_capacity(64);
@@ -147,7 +148,10 @@ pub(crate) fn column_def_packet(
     write_lenenc_bytes(&mut p, name.as_bytes());
     write_lenenc_bytes(&mut p, org_name.as_bytes());
     write_lenenc_int(&mut p, 0x0c); // length of fixed-length fields
-    let numeric = matches!(ctype, MYSQL_TYPE_LONGLONG | MYSQL_TYPE_DOUBLE);
+    let numeric = matches!(
+        ctype,
+        MYSQL_TYPE_LONGLONG | MYSQL_TYPE_DOUBLE | MYSQL_TYPE_NEWDECIMAL
+    );
     let charset = if numeric { COLLATION_BINARY } else { COLLATION_UTF8MB4 };
     p.extend_from_slice(&charset.to_le_bytes());
     p.extend_from_slice(&255u32.to_le_bytes()); // column length
@@ -160,7 +164,7 @@ pub(crate) fn column_def_packet(
         f |= COLUMN_FLAG_BINARY | COLUMN_FLAG_NUM;
     }
     p.extend_from_slice(&f.to_le_bytes());
-    p.push(0); // decimals
+    p.push(decimals); // decimals
     p.extend_from_slice(&[0u8, 0]); // filler
     if with_default {
         p.push(0xfb); // default value: NULL

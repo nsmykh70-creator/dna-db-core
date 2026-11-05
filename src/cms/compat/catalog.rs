@@ -712,6 +712,7 @@ pub(crate) fn empty_catalog_result(table: &str) -> CmsQueryResult {
         last_insert_id: 0,
         found_rows: 0,
         is_select: true,
+        decimal_scales: Vec::new(),
     }
 }
 
@@ -784,6 +785,7 @@ pub(crate) fn apply_catalog_projection(
                 last_insert_id: 0,
                 found_rows: found,
                 is_select: true,
+                decimal_scales: Vec::new(),
             }))
         }
         CatalogProj::Literal(lit) => {
@@ -819,6 +821,7 @@ pub(crate) fn apply_catalog_projection(
                 last_insert_id: 0,
                 found_rows: found,
                 is_select: true,
+                decimal_scales: Vec::new(),
             }))
         }
         CatalogProj::Cols(names) => {
@@ -857,6 +860,7 @@ pub(crate) fn apply_catalog_projection(
                 last_insert_id: 0,
                 found_rows: found,
                 is_select: true,
+                decimal_scales: Vec::new(),
             }))
         }
     }

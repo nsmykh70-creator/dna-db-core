@@ -748,3 +748,115 @@ fn star_projections_use_declaration_order() {
         vec!["term_id", "name", "slug", "term_group", "new_col"]
     );
 }
+
+#[test]
+fn decimal_scale_display_parity() {
+    // MySQL transmits DECIMAL(p,s) as fixed-scale strings in both
+    // protocols: an inserted 250 into decimal(10,2) reads back "250.00"
+    // with MYSQL_TYPE_NEWDECIMAL/decimals=2 column metadata. The gate
+    // re-renders resolved output columns (decimal.rs) and records the
+    // per-column scale in CmsQueryResult::decimal_scales.
+    let g = gate("decimal_scale");
+    let s = g.open_session();
+    g.execute(
+        s,
+        "CREATE TABLE wp_totals (
+            id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+            label varchar(50) DEFAULT '',
+            total decimal(10,2) NOT NULL DEFAULT '0.00',
+            ratio decimal(12,8) DEFAULT NULL,
+            PRIMARY KEY  (id)
+        ) ENGINE=InnoDB",
+    )
+    .unwrap();
+
+    // Int / string / zero / NULL inserts all read back with scale 2.
+    g.execute(s, "INSERT INTO wp_totals (label, total) VALUES ('a', 250)").unwrap();
+    g.execute(s, "INSERT INTO wp_totals (label, total) VALUES ('b', '250.5')").unwrap();
+    g.execute(s, "INSERT INTO wp_totals (label, total) VALUES ('c', 0)").unwrap();
+    g.execute(s, "INSERT INTO wp_totals (label, total, ratio) VALUES ('d', 7, 0.125)").unwrap();
+
+    let r = g
+        .execute(s, "SELECT id, label, total, ratio FROM wp_totals ORDER BY id")
+        .unwrap();
+    assert_eq!(r.decimal_scales, vec![None, None, Some(2), Some(8)]);
+    assert_eq!(v(&r.rows[0], "total"), "250.00");
+    assert_eq!(v(&r.rows[1], "total"), "250.50");
+    assert_eq!(v(&r.rows[2], "total"), "0.00");
+    assert_eq!(v(&r.rows[3], "total"), "7.00");
+    assert_eq!(v(&r.rows[3], "ratio"), "0.12500000");
+    // Non-decimal columns keep their native rendering.
+    assert_eq!(v(&r.rows[0], "id"), "1");
+    assert_eq!(v(&r.rows[0], "label"), "a");
+
+    // SELECT * keeps the declared scale per column.
+    let r = g.execute(s, "SELECT * FROM wp_totals WHERE id = 1").unwrap();
+    assert_eq!(v(&r.rows[0], "total"), "250.00");
+    assert_eq!(r.decimal_scales, vec![None, None, Some(2), Some(8)]);
+
+    // Arithmetic stays numeric in WHERE; display is re-scaled on read.
+    let r = g
+        .execute(s, "SELECT total FROM wp_totals WHERE total > 300")
+        .unwrap();
+    assert_eq!(r.rows.len(), 0, "250.00 must not compare as 25000");
+    let r = g
+        .execute(s, "SELECT total FROM wp_totals WHERE total >= 250.50")
+        .unwrap();
+    assert_eq!(r.rows.len(), 1);
+
+    // UPDATE arithmetic round-trips through the scale.
+    g.execute(s, "UPDATE wp_totals SET total = total + 1 WHERE id = 1").unwrap();
+    let r = g.execute(s, "SELECT total FROM wp_totals WHERE id = 1").unwrap();
+    assert_eq!(v(&r.rows[0], "total"), "251.00");
+
+    // SUM aliased to the decimal column keeps the scale (MySQL: SUM over
+    // decimal(p,s) is decimal with scale s).
+    let r = g
+        .execute(s, "SELECT SUM(total) AS total FROM wp_totals")
+        .unwrap();
+    assert_eq!(r.decimal_scales, vec![Some(2)]);
+    assert_eq!(v(&r.rows[0], "total"), "508.50");
+
+    // Expressions without an overlay binding keep DOUBLE rendering —
+    // documented divergence (MySQL would size the decimal from the op).
+    let r = g
+        .execute(s, "SELECT total * 2 AS doubled FROM wp_totals WHERE id = 1")
+        .unwrap();
+    assert_eq!(r.decimal_scales, vec![None]);
+    assert_eq!(v(&r.rows[0], "doubled"), "502");
+
+    // Scale-0 decimals render without a fractional part.
+    g.execute(s, "CREATE TABLE wp_counts (id bigint(20) unsigned NOT NULL AUTO_INCREMENT, hits decimal(10) NOT NULL DEFAULT 0, PRIMARY KEY (id)) ENGINE=InnoDB").unwrap();
+    g.execute(s, "INSERT INTO wp_counts (hits) VALUES (5)").unwrap();
+    let r = g.execute(s, "SELECT hits FROM wp_counts").unwrap();
+    assert_eq!(r.decimal_scales, vec![Some(0)]);
+    assert_eq!(v(&r.rows[0], "hits"), "5");
+}
+
+#[test]
+fn decimal_scale_join_resolution() {
+    // Unqualified output names resolve across the FROM tables when every
+    // decimal match agrees on the scale; qualified names follow the alias.
+    let g = gate("decimal_join");
+    let s = g.open_session();
+    g.execute(s, "CREATE TABLE wp_a (id bigint(20) unsigned NOT NULL AUTO_INCREMENT, k int NOT NULL DEFAULT 0, amount decimal(10,2) NOT NULL DEFAULT 0.00, PRIMARY KEY (id)) ENGINE=InnoDB").unwrap();
+    g.execute(s, "CREATE TABLE wp_b (id bigint(20) unsigned NOT NULL AUTO_INCREMENT, k int NOT NULL DEFAULT 0, amount decimal(10,2) NOT NULL DEFAULT 0.00, name varchar(20) DEFAULT '', PRIMARY KEY (id)) ENGINE=InnoDB").unwrap();
+    g.execute(s, "INSERT INTO wp_a (k, amount) VALUES (1, 10.5)").unwrap();
+    g.execute(s, "INSERT INTO wp_b (k, amount, name) VALUES (1, 20.25, 'x')").unwrap();
+
+    let r = g
+        .execute(
+            s,
+            "SELECT a.amount, b.name FROM wp_a a JOIN wp_b b ON a.k = b.k",
+        )
+        .unwrap();
+    assert_eq!(r.decimal_scales, vec![Some(2), None]);
+    assert_eq!(v(&r.rows[0], "amount"), "10.50");
+    assert_eq!(v(&r.rows[0], "name"), "x");
+
+    // Unqualified `amount` matches both tables at scale 2 → applies.
+    let r = g
+        .execute(s, "SELECT amount FROM wp_a WHERE id = 1")
+        .unwrap();
+    assert_eq!(v(&r.rows[0], "amount"), "10.50");
+}

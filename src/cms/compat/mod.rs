@@ -29,6 +29,8 @@ use crate::cms::session::CmsSession;
 use crate::relational::Value;
 use crate::sql_engine::SqlEngine;
 
+pub(crate) mod decimal;
+
 /// Version string reported to CMS clients (wpdb::db_version gate checks the
 /// numeric prefix; the MariaDB form matches the reference engine used by the
 /// majority of WordPress hosting and the differential test corpus).
@@ -48,6 +50,11 @@ pub struct CmsQueryResult {
     /// FOUND_ROWS() after this statement (row count of SELECTs).
     pub found_rows: u64,
     pub is_select: bool,
+    /// Per output column: `Some(scale)` when the column resolves to a
+    /// decimal(p,s)-declared table column (values are pre-formatted with
+    /// that scale) — the wire layer reports MYSQL_TYPE_NEWDECIMAL with
+    /// `decimals=scale`. Empty for non-SELECT replies.
+    pub decimal_scales: Vec<Option<u8>>,
 }
 
 /// An error with a MySQL errno + SQLSTATE, as CMS clients expect.
@@ -508,7 +515,14 @@ impl CmsSqlGate {
             last_insert_id: 0,
             found_rows: 0,
             is_select,
+            decimal_scales: Vec::new(),
         };
+        // DECIMAL(p,s) display scale: re-render resolved output columns with
+        // the declared scale before DISTINCT dedupes on the rendered rows
+        // (MySQL transmits DECIMAL as fixed-scale strings, see decimal.rs).
+        if is_select {
+            decimal::apply_decimal_scale(self, &mut out, sql);
+        }
         // SELECT DISTINCT: MySQL returns the projection deduplicated; keep
         // the first occurrence so ORDER BY output stays stable.
         if want_distinct && is_select {

@@ -50,7 +50,7 @@ pub(crate) fn encode_gate_result(
 ) -> std::io::Result<()> {
     let status = SERVER_STATUS_AUTOCOMMIT | if more { SERVER_MORE_RESULTS_EXISTS } else { 0 };
     if res.is_select && !res.columns.is_empty() {
-        write_text_resultset(conn, &res.columns, &res.rows, status)
+        write_text_resultset(conn, &res.columns, &res.rows, &res.decimal_scales, status)
     } else {
         let info = res.message.clone().unwrap_or_default();
         conn.write_packet(&ok_packet(
@@ -68,23 +68,47 @@ pub(crate) fn write_text_resultset(
     conn: &mut Conn,
     columns: &[String],
     rows: &[BTreeMap<String, Value>],
+    scales: &[Option<u8>],
     status: u16,
 ) -> std::io::Result<()> {
-    let types: Vec<u8> = columns.iter().map(|c| infer_type(rows, c)).collect();
+    // Decimal-resolved columns carry their declared scale: MySQL reports
+    // MYSQL_TYPE_NEWDECIMAL with decimals=s and transmits fixed-scale
+    // strings (the gate has already rendered the values).
+    let types: Vec<(u8, u8)> = columns
+        .iter()
+        .enumerate()
+        .map(|(i, c)| match scales.get(i).copied().flatten() {
+            Some(scale) => (MYSQL_TYPE_NEWDECIMAL, scale),
+            None => (infer_type(rows, c), 0),
+        })
+        .collect();
     let mut head = Vec::with_capacity(8);
     write_lenenc_int(&mut head, columns.len() as u64);
     conn.write_packet(&head)?;
     for (i, col) in columns.iter().enumerate() {
-        conn.write_packet(&column_def_packet("", "", col, col, types[i], 0, false))?;
+        conn.write_packet(&column_def_packet(
+            "", "", col, col, types[i].0, 0, types[i].1, false,
+        ))?;
     }
     conn.write_packet(&eof_packet(status))?;
     for row in rows {
         let mut p = Vec::with_capacity(columns.len() * 8);
-        for col in columns {
+        for (i, col) in columns.iter().enumerate() {
             match row.get(col) {
                 None | Some(Value::Null) => p.push(0xfb),
                 Some(Value::Int(v)) => write_lenenc_bytes(&mut p, v.to_string().as_bytes()),
-                Some(Value::Float(v)) => write_lenenc_bytes(&mut p, fmt_float(*v).as_bytes()),
+                Some(Value::Float(v)) => {
+                    // Safety net: the gate formats decimal columns, but a
+                    // float value under a decimal column must not leak the
+                    // DOUBLE rendering into a NEWDECIMAL field.
+                    let text = match scales.get(i).copied().flatten() {
+                        Some(scale) => {
+                            crate::cms::compat::decimal::fixed_decimal(*v, scale)
+                        }
+                        None => fmt_float(*v),
+                    };
+                    write_lenenc_bytes(&mut p, text.as_bytes());
+                }
                 Some(Value::Text(s) | Value::Dna(s)) => write_lenenc_bytes(&mut p, s.as_bytes()),
             }
         }
@@ -119,16 +143,23 @@ pub(crate) fn handle_field_list(
                     Some(Value::Text(s) | Value::Dna(s)) => s.clone(),
                     other => other.map(|v| v.to_string()).unwrap_or_default(),
                 };
-                let ty = match row.get("Type") {
-                    Some(Value::Text(s) | Value::Dna(s)) => mysql_wire_type_of_decl(s),
-                    _ => MYSQL_TYPE_VAR_STRING,
-                };
+                let decl = row
+                    .get("Type")
+                    .map(|v| match v {
+                        Value::Text(s) | Value::Dna(s) => s.clone(),
+                        other => other.to_string(),
+                    })
+                    .unwrap_or_default();
+                let ty = mysql_wire_type_of_decl(&decl);
+                let decimals = crate::cms::ddl_meta::decimal_scale(&decl).unwrap_or(0);
                 let flags = if row.get("Key").and_then(key_flag).unwrap_or(false) {
                     COLUMN_FLAG_NOT_NULL
                 } else {
                     0
                 };
-                conn.write_packet(&column_def_packet("", &table, &name, &name, ty, flags, true))?;
+                conn.write_packet(&column_def_packet(
+                    "", &table, &name, &name, ty, flags, decimals, true,
+                ))?;
             }
             conn.write_packet(&eof_packet(SERVER_STATUS_AUTOCOMMIT))?;
             Ok(())
@@ -155,7 +186,8 @@ pub(crate) fn mysql_wire_type_of_decl(decl: &str) -> u8 {
         "tinyint" | "smallint" | "mediumint" | "int" | "integer" | "bigint" | "year" => {
             MYSQL_TYPE_LONGLONG
         }
-        "double" | "float" | "decimal" | "numeric" | "real" => MYSQL_TYPE_DOUBLE,
+        "double" | "float" | "real" => MYSQL_TYPE_DOUBLE,
+        "decimal" | "numeric" => MYSQL_TYPE_NEWDECIMAL,
         _ => MYSQL_TYPE_VAR_STRING,
     }
 }

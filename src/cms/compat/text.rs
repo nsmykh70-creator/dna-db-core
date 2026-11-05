@@ -20,6 +20,7 @@ pub(crate) fn empty_ok(message: impl Into<String>) -> CmsQueryResult {
         last_insert_id: 0,
         found_rows: 0,
         is_select: false,
+        decimal_scales: Vec::new(),
     }
 }
 
@@ -35,6 +36,7 @@ pub(crate) fn one_value_reply(column: &str, value: Value) -> CmsQueryResult {
         last_insert_id: 0,
         found_rows: 1,
         is_select: true,
+        decimal_scales: Vec::new(),
     }
 }
 

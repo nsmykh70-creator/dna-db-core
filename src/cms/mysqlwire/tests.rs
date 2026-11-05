@@ -169,7 +169,7 @@ mod tests {
 
     #[test]
     fn column_def_shape() {
-        let d = column_def_packet("", "wp_posts", "ID", "ID", MYSQL_TYPE_LONGLONG, 0, false);
+        let d = column_def_packet("", "wp_posts", "ID", "ID", MYSQL_TYPE_LONGLONG, 0, 0, false);
         let mut pos = 0usize;
         assert_eq!(read_lenenc_bytes(&d, &mut pos), Some(&b"def"[..]));
         assert_eq!(read_lenenc_bytes(&d, &mut pos), Some(&b""[..]));
@@ -224,6 +224,7 @@ mod tests {
     fn wire_type_from_decl() {
         assert_eq!(mysql_wire_type_of_decl("bigint(20) unsigned"), MYSQL_TYPE_LONGLONG);
         assert_eq!(mysql_wire_type_of_decl("varchar(191)"), MYSQL_TYPE_VAR_STRING);
-        assert_eq!(mysql_wire_type_of_decl("decimal(10,2)"), MYSQL_TYPE_DOUBLE);
+        assert_eq!(mysql_wire_type_of_decl("decimal(10,2)"), MYSQL_TYPE_NEWDECIMAL);
+        assert_eq!(mysql_wire_type_of_decl("numeric(12,4)"), MYSQL_TYPE_NEWDECIMAL);
     }
 }

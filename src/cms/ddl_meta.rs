@@ -131,6 +131,30 @@ fn engine_type_of(mysql_type: &str) -> ColumnType {
     }
 }
 
+/// Scale of a `decimal(p,s)` / `numeric(p,s)` declaration — the number of
+/// digits MySQL transmits after the decimal point ("250" in decimal(10,2)
+/// reads back as "250.00"). `decimal`/`numeric` without args is scale 0.
+/// `None` for every non-decimal type.
+pub(crate) fn decimal_scale(mysql_type: &str) -> Option<u8> {
+    let base = mysql_type
+        .split('(')
+        .next()
+        .unwrap_or(mysql_type)
+        .trim()
+        .to_ascii_lowercase();
+    if base != "decimal" && base != "numeric" {
+        return None;
+    }
+    let Some(inner) = mysql_type.split('(').nth(1) else {
+        return Some(0);
+    };
+    let args = inner.split(')').next().unwrap_or("");
+    match args.split(',').nth(1) {
+        Some(s) => s.trim().parse::<u8>().ok().map(|v| v.min(30)),
+        None => Some(0), // decimal(p) → scale 0
+    }
+}
+
 /// Extract `(args)` after a keyword: returns the trimmed inner text and
 /// strips the consumed parens from `rest`.
 fn take_paren_group(rest: &str) -> Option<String> {
@@ -363,6 +387,13 @@ impl CmsTableMeta {
                         } else if upper_rest.starts_with("AUTO_INCREMENT") {
                             col.auto_increment = true;
                             rest = rest["AUTO_INCREMENT".len()..].trim_start();
+                        } else if upper_rest.starts_with("PRIMARY KEY") {
+                            // Inline PRIMARY KEY column constraint — the
+                            // MySQL-standard single-column form plugins use
+                            // (`sku varchar(20) NOT NULL PRIMARY KEY`). Row
+                            // locking / PointGet need the overlay PK.
+                            meta.primary_key.push(col.field.clone());
+                            rest = rest["PRIMARY KEY".len()..].trim_start();
                         } else if upper_rest.starts_with("UNIQUE") {
                             // Inline UNIQUE — model as a unique index.
                             rest = rest["UNIQUE".len()..].trim_start();
@@ -702,6 +733,41 @@ mod tests {
         assert_eq!(m.columns[2].engine_type, ColumnType::Float64);
         assert_eq!(m.columns[3].engine_type, ColumnType::Timestamp);
         assert_eq!(m.columns[3].default.as_deref(), Some("0000-00-00 00:00:00"));
+    }
+
+    #[test]
+    fn decimal_scale_of_decl() {
+        assert_eq!(super::decimal_scale("decimal(10,2)"), Some(2));
+        assert_eq!(super::decimal_scale("numeric(12,4) unsigned"), Some(4));
+        assert_eq!(super::decimal_scale("DECIMAL(26,8)"), Some(8));
+        assert_eq!(super::decimal_scale("decimal(10)"), Some(0));
+        assert_eq!(super::decimal_scale("decimal"), Some(0));
+        assert_eq!(super::decimal_scale("varchar(191)"), None);
+        assert_eq!(super::decimal_scale("bigint(20) unsigned"), None);
+        assert_eq!(super::decimal_scale("double"), None);
+    }
+
+    #[test]
+    fn inline_primary_key_column_constraint() {
+        // MySQL-standard inline PK: row locks and PointGet resolve through
+        // the overlay PK, so the single-column form must register too.
+        let ddl = "CREATE TABLE wp_inventory (
+            sku varchar(20) NOT NULL PRIMARY KEY,
+            qty int(11) NOT NULL,
+            updated datetime DEFAULT NULL
+        ) ENGINE=InnoDB";
+        let m = CmsTableMeta::parse_create_table(ddl).unwrap();
+        assert_eq!(m.primary_key, vec!["sku"]);
+        let cols = m.show_full_columns_rows();
+        let sku = cols.iter().find(|r| r.get("Field").and_then(|v| match v {
+            Value::Text(s) | Value::Dna(s) => Some(s.as_str()),
+            _ => None,
+        }) == Some("sku")).expect("sku column");
+        assert_eq!(sku.get("Key"), Some(&Value::Text("PRI".into())));
+        // Table-level PK still wins when both forms appear.
+        let ddl2 = "CREATE TABLE t (id bigint(20) unsigned NOT NULL AUTO_INCREMENT PRIMARY KEY, name varchar(50), PRIMARY KEY (id))";
+        let m2 = CmsTableMeta::parse_create_table(ddl2).unwrap();
+        assert_eq!(m2.primary_key, vec!["id"]);
     }
 
     #[test]

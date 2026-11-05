@@ -152,22 +152,28 @@ cargo-сборка); в Docker/WSL без systemd — режим `nohup`+pidfile
    disconnect снимают блокировки сессии.
 3. **Коллации** `utf8mb4_unicode_ci`: сравнение без регистра, PAD SPACE,
    составные и префиксные индексы (meta_value 191) — префиксы сохраняются
-   в оверлее, сравнение — фаза 2.
+   в оверлее, сравнение — фаза 3.
 4. **`FOUND_ROWS()` / `SQL_CALC_FOUND_ROWS`** — ✅ готово в гейте
    (приближение: счёт по странице, не по запросу без LIMIT).
 5. **Каталог**: `SHOW TABLES LIKE`, `SHOW FULL COLUMNS`, `SHOW INDEX`
    (14 колонок, в форме MariaDB), `DESCRIBE`, `SHOW VARIABLES` — ✅ готово
    через оверлей (`cms::ddl_meta`: MySQL-точный `Type`, чтобы dbDelta не
    видел расхождений; CREATE TABLE через гейт регистрирует оверлей
-   автоматически) + fallback из схемы движка; `information_schema` — фаза 2.
+   автоматически) + fallback из схемы движка; `information_schema` — фаза 3.
 6. **ALTER TABLE**: ADD COLUMN (с NOT NULL/DEFAULT → эффективный дефолт),
    DROP COLUMN, CREATE/DROP INDEX — ✅ готово; изменение типа (онлайн) —
-   фаза 2.
+   фаза 3.
 7. **Именованные блокировки** — ✅ готово: реестр `cms::locks` + SQL-шимы
    `GET_LOCK/RELEASE_LOCK/IS_FREE_LOCK/IS_USED_LOCK` в гейте.
 8. **Типы**: BIGINT UNSIGNED/DECIMAL/DATETIME/ENUM — частично: имена
-   принимаются и маппятся на базовые типы (cms-грамматика), семантика
-   unsigned/decimal — фаза 2.
+   принимаются и маппятся на базовые типы (cms-грамматика); **DECIMAL по
+   scale — ✅ готово (2026-11-06)**: decimal(p,s) в SELECT-выдаче
+   пере-рендерится с заявленной шкалой ("250" → "250.00", "0.5" в
+   decimal(12,8) → "0.50000000"), metadata колонок — MYSQL_TYPE_NEWDECIMAL
+   с decimals=s в text- И binary-протоколах, `SUM(col)` под алиасом
+   decimal-колонки хранит scale (как MySQL); резолв — по FROM-таблицам
+   (`cms::compat::decimal`, квалифицированные имена, уникальность
+   шкалы при join); семантика unsigned — фаза 3.
 9. **SET-функции сессии**: `SET NAMES`, `USE db`, `SET autocommit`,
    `SET sql_mode` — ✅ готово в гейте; `CmsSession` хранит состояние.
 10. **Unix domain socket** для хостингов, persistent connections PHP-FPM —
@@ -201,8 +207,52 @@ affected = изменённые строки, `LAST_INSERT_ID()` = первый 
 `'250.00'+0 → 250` за `--features cms`) и порядок колонок `SELECT *` /
 `t.*, tt.*` — теперь в порядке декларации (`column_order` в схеме
 таблицы; ALTER ADD добавляет в конец, DROP убирает). Регистро-
-независимость WHERE/GROUP BY — фаза 2 (коллации); DECIMAL-форматирование
-по scale — фаза 2. Полный отчёт: `docs/cms/COMPARISON_MYSQL_REPORT.md`.
+независимость WHERE/GROUP BY — фаза 3 (коллации); ~~DECIMAL-форматирование
+по scale — фаза 2~~ — ✅ закрыто 2026-11-06 (`cms::compat::decimal`, см.
+§4 item 8 и E2E_DEADLOCK_RETRY_REPORT). Полный отчёт:
+docs/cms/COMPARISON_MYSQL_REPORT.md.
+
+### Deadlock-retry в живом заказе + DECIMAL по scale (2026-11-06)
+
+Закрыты последние два приёмочных пункта Фазы 2.
+
+**Deadlock-retry (errno 1213).** E2E `scripts/e2e_deadlock_retry.sh` →
+`scripts/e2e_deadlock_retry.php`: два конкурентных «живых заказа»
+(main + worker-процесс) в противоположном порядке берут `SELECT … FOR
+UPDATE`-холды двух складовых строк SKU-A/SKU-B (prepared-стейтменты,
+`innodb_lock_wait_timeout=5`), затем заказывают обе позиции — waits-for
+цикл A↔B, движок назначает жертву errno 1213 (SQLSTATE 40001), Woo-обвязка
+`tx_with_retry` ретраит всю транзакцию (до 10 попыток, случайный бэкофф,
+1213/1205/3572 — ретраятся, прочее — падает). Две фазы меняют роли:
+жертва №1 — worker, №2 — main; вердикты PASS/PASS: в каждой фазе 4 заказа
+(каждая сессия заказала каждый SKU ровно один раз), склад 10 → 8/8, 0
+неожиданных ошибок, счётчик 1213 у ожидаемой жертвы ≥ 1. Форма транзакции
+важна: **все холды — до первого DML** (гейт single-writer: отказ оператора
+не откатывает уже применённый DML — см. «read-your-writes» в execute()),
+поэтому дедлок бьёт в write-free фазу и retry не дублирует эффекты.
+Детали: `docs/cms/E2E_DEADLOCK_RETRY_REPORT.md`.
+
+Попутный фикс оверлея — **inline `PRIMARY KEY` в определении колонки**
+(`sku varchar(20) NOT NULL PRIMARY KEY`): парсер признавал только табличную
+форму `PRIMARY KEY (cols)`, из-за чего строковые локи/PointGet на таких
+таблицах молча отключались (PK пуст → lock_select_rows bail). Юнит-тест
+`inline_primary_key_column_constraint`.
+
+**DECIMAL по scale (§4 item 8).** Модуль `cms::compat::decimal`: SELECT-выдача
+пост-процессится — выходные колонки, разрешимые в decimal(p,s)-колонку
+оверлея (по FROM-таблицам: квалифицированные имена по алиасам, неквали-
+фицированные — по уникальности шкалы среди таблиц), пере-рендерятся с
+фиксированной шкалой (`250` → `"250.00"`, `0.125` в decimal(12,8) →
+`"0.12500000"`); `CmsQueryResult.decimal_scales` несёт per-column шкалу в
+wire-слой: ColumnDefinition41 теперь отдаёт **MYSQL_TYPE_NEWDECIMAL (246) с
+decimals=s** в text- и binary-протоколах (COM_FIELD_LIST — из точного Type
+оверлея). `SUM(col) AS col` хранит scale колонки (как MySQL для
+SUM(decimal(p,s))); выражения без привязки к оверлею (`total * 2`) остаются
+DOUBLE-рендером — документированное расхождение. Проверено живым mysqli:
+text-значения "250.00"/"0.00", prepared-метаданные type=246 decimals=2/8,
+`SUM(total)` = "250.00" (`scripts/decimal_wire_smoke.php`, вердикт
+DECIMAL_WIRE_OK). Тестов: 294 с `--features cms` (+9), 195 без фичи
+(4 известных cms-гейтованных отказа без изменений).
 
 ### Строчные блокировки `FOR UPDATE` (2026-11-02)
 
@@ -296,24 +346,32 @@ phpunit ядра WP, ALTER TABLE (частично готов), information_sche
 Приёмка: установка WP 6.x на DNA-DB ✅ (7.1.4, см. E2E-отчёт), wp-admin
 работает 🔶, phpunit ядра WP ⬜.
 
-**Фаза 2 — WooCommerce + Joomla (6–10 нед).** 🔶 В прогрессе: **e2e-заказ
-WooCommerce ✅ (11.2.1, HPOS, артефакты = MariaDB, см. E2E_WOO_REPORT)**,
-типы колонок при записи ✅, GET_LOCK/транзакции в корпусе ✅,
-**строчные блокировки FOR UPDATE ✅ (1205/1213/3572/SKIP LOCKED, §4 item 2,
-см. «Строчные блокировки»)**; остаётся: deadlock-retry в живом заказе
-(обвязка поверх 1213 в e2e), DECIMAL по scale, установка Joomla 5 ✅
-(5.4.10 через штатный mysqli → wire-адаптер: установщик, фронтенд и
-админка — см. E2E_JOOMLA_MYSQLWIRE_REPORT), **установка OpenCart ✅
-(4.1.0.4 официальным CLI-установщиком, storefront/admin 200, 159 таблиц —
-см. E2E_OPENCART_MYSQLWIRE_REPORT)**, **установка Drupal ✅ (11.4.10
-штатным web-установщиком через PDO MySQL → wire: batch standard-профиля,
-homepage 200, админ-сессия, фикс compound-ON outer joins — см.
-E2E_DRUPAL_MYSQLWIRE_REPORT)**, **установка MediaWiki ✅ (1.43.11
-официальным CLI-установщиком через mysqli → wire: рендер, правка через
-maintenance/edit.php, API, MCR-цепочка — см.
-E2E_MEDIAWIKI_MYSQLWIRE_REPORT)**. Приёмка: e2e-заказ ✅,
-установка Joomla ✅ (wire; pgwire для Joomla больше не нужен),
-**установки OpenCart/Drupal/MediaWiki ✅ — пять CMS зелёные на wire-адаптере**.
+**Фаза 2 — WooCommerce + Joomla (6–10 нед).** ✅ Приёмка выполнена:
+**e2e-заказ WooCommerce ✅ (11.2.1, HPOS, артефакты = MariaDB, см.
+E2E_WOO_REPORT)**, типы колонок при записи ✅, GET_LOCK/транзакции в
+корпусе ✅, **строчные блокировки FOR UPDATE ✅ (1205/1213/3572/SKIP
+LOCKED, §4 item 2, см. «Строчные блокировки»)**, **deadlock-retry в живом
+заказе ✅ (обвязка поверх 1213: два конкурентных заказа в противоположном
+порядке локов, жертва 1213 ретраит всю транзакцию, обе роли — см.
+E2E_DEADLOCK_RETRY_REPORT)**, **DECIMAL по scale ✅ (decimal(p,s) читается
+фиксированной шкалой "250" → "250.00", metadata MYSQL_TYPE_NEWDECIMAL +
+decimals=s в обоих протоколах, SUM хранит scale — §4 item 8)**,
+установка Joomla 5 ✅ (5.4.10 через штатный mysqli → wire-адаптер:
+установщик, фронтенд и админка — см. E2E_JOOMLA_MYSQLWIRE_REPORT),
+**установка OpenCart ✅ (4.1.0.4 официальным CLI-установщиком,
+storefront/admin 200, 159 таблиц — см. E2E_OPENCART_MYSQLWIRE_REPORT)**,
+**установка Drupal ✅ (11.4.10 штатным web-установщиком через PDO MySQL →
+wire: batch standard-профиля, homepage 200, админ-сессия, фикс
+compound-ON outer joins — см. E2E_DRUPAL_MYSQLWIRE_REPORT)**, **установка
+MediaWiki ✅ (1.43.11 официальным CLI-установщиком через mysqli → wire:
+рендер, правка через maintenance/edit.php, API, MCR-цепочка — см.
+E2E_MEDIAWIKI_MYSQLWIRE_REPORT)**. Итог приёмки: e2e-заказ ✅, установка
+Joomla ✅ (wire; pgwire для Joomla больше не нужен), установки
+OpenCart/Drupal/MediaWiki ✅ — **пять CMS зелёные на wire-адаптере,
+deadlock-retry и DECIMAL-шкала закрыты — Фаза 2 выполнена**. Остатки
+чек-листа §4 (сравнение коллаций, information_schema, онлайн-смена типа,
+unsigned-семантика) переносятся в Фазу 3 как инженерные задачи без
+приёмочных блокеров.
 
 **Фаза 3 — эксплуатация (2–4 нед).** mysqldump-совместимый импорт/экспорт,
 бэкап/рестор, docker-образ, гайд «миграция WP с MySQL за 3 шага»,

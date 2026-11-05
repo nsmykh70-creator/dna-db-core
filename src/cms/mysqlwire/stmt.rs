@@ -73,6 +73,7 @@ pub(crate) fn stmt_prepare(
     );
     let mut columns: Vec<String> = Vec::new();
     let mut types: Vec<u8> = Vec::new();
+    let mut decimals: Vec<u8> = Vec::new();
     if reads_rows {
         // Determine the result shape by executing the statement with every
         // parameter bound to NULL on a throwaway session (reads are
@@ -86,7 +87,18 @@ pub(crate) fn stmt_prepare(
         match probed {
             Ok(r) if r.is_select && !r.columns.is_empty() => {
                 columns = r.columns.clone();
-                types = r.columns.iter().map(|c| infer_type(&r.rows, c)).collect();
+                for (i, c) in r.columns.iter().enumerate() {
+                    match r.decimal_scales.get(i).copied().flatten() {
+                        Some(scale) => {
+                            types.push(MYSQL_TYPE_NEWDECIMAL);
+                            decimals.push(scale);
+                        }
+                        None => {
+                            types.push(infer_type(&r.rows, c));
+                            decimals.push(0);
+                        }
+                    }
+                }
             }
             Ok(_) => {}
             Err(ce) => {
@@ -129,6 +141,7 @@ pub(crate) fn stmt_prepare(
                 "?",
                 MYSQL_TYPE_NULL,
                 0,
+                0,
                 false,
             ))?;
         }
@@ -142,6 +155,7 @@ pub(crate) fn stmt_prepare(
             col,
             types[i],
             0,
+            decimals[i],
             false,
         ))?;
     }
@@ -252,7 +266,13 @@ pub(crate) fn stmt_execute(
     match gate.execute(sid, &sql) {
         Ok(res) => {
             if res.is_select && !res.columns.is_empty() {
-                write_binary_resultset(conn, &res.columns, &res.rows, SERVER_STATUS_AUTOCOMMIT)?;
+                write_binary_resultset(
+                    conn,
+                    &res.columns,
+                    &res.rows,
+                    &res.decimal_scales,
+                    SERVER_STATUS_AUTOCOMMIT,
+                )?;
             } else {
                 let info = res.message.clone().unwrap_or_default();
                 conn.write_packet(&ok_packet(
@@ -293,14 +313,24 @@ pub(crate) fn write_binary_resultset(
     conn: &mut Conn,
     columns: &[String],
     rows: &[BTreeMap<String, Value>],
+    scales: &[Option<u8>],
     status: u16,
 ) -> std::io::Result<()> {
-    let types: Vec<u8> = columns.iter().map(|c| infer_type(rows, c)).collect();
+    let types: Vec<(u8, u8)> = columns
+        .iter()
+        .enumerate()
+        .map(|(i, c)| match scales.get(i).copied().flatten() {
+            Some(scale) => (MYSQL_TYPE_NEWDECIMAL, scale),
+            None => (infer_type(rows, c), 0),
+        })
+        .collect();
     let mut head = Vec::with_capacity(8);
     write_lenenc_int(&mut head, columns.len() as u64);
     conn.write_packet(&head)?;
     for (i, col) in columns.iter().enumerate() {
-        conn.write_packet(&column_def_packet("", "", col, col, types[i], 0, false))?;
+        conn.write_packet(&column_def_packet(
+            "", "", col, col, types[i].0, 0, types[i].1, false,
+        ))?;
     }
     conn.write_packet(&eof_packet(status))?;
     for row in rows {

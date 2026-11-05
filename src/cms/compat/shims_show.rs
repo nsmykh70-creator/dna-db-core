@@ -55,6 +55,7 @@ impl CmsSqlGate {
                 last_insert_id: 0,
                 found_rows: found,
                 is_select: true,
+                decimal_scales: Vec::new(),
             }));
         }
 
@@ -96,6 +97,7 @@ impl CmsSqlGate {
                 last_insert_id: 0,
                 found_rows: found,
                 is_select: true,
+                decimal_scales: Vec::new(),
             }));
         }
 
@@ -137,6 +139,7 @@ impl CmsSqlGate {
                 last_insert_id: 0,
                 found_rows: found,
                 is_select: true,
+                decimal_scales: Vec::new(),
             }));
         }
 
@@ -185,6 +188,7 @@ impl CmsSqlGate {
                 last_insert_id: 0,
                 found_rows: found,
                 is_select: true,
+                decimal_scales: Vec::new(),
             }));
         }
 
@@ -233,6 +237,7 @@ impl CmsSqlGate {
                 last_insert_id: 0,
                 found_rows: found,
                 is_select: true,
+                decimal_scales: Vec::new(),
             }));
         }
 
@@ -268,6 +273,7 @@ impl CmsSqlGate {
                 last_insert_id: 0,
                 found_rows: found,
                 is_select: true,
+                decimal_scales: Vec::new(),
             }));
         }
 
@@ -303,6 +309,7 @@ impl CmsSqlGate {
                 last_insert_id: 0,
                 found_rows: found,
                 is_select: true,
+                decimal_scales: Vec::new(),
             }));
         }
 
@@ -346,6 +353,7 @@ impl CmsSqlGate {
                 last_insert_id: 0,
                 found_rows: found,
                 is_select: true,
+                decimal_scales: Vec::new(),
             }));
         }
         Ok(None)

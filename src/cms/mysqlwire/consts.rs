@@ -45,6 +45,7 @@ pub(crate) const SERVER_MORE_RESULTS_EXISTS: u16 = 0x0008;
 pub(crate) const MYSQL_TYPE_DOUBLE: u8 = 5;
 pub(crate) const MYSQL_TYPE_NULL: u8 = 6;
 pub(crate) const MYSQL_TYPE_LONGLONG: u8 = 8;
+pub(crate) const MYSQL_TYPE_NEWDECIMAL: u8 = 246;
 pub(crate) const MYSQL_TYPE_VAR_STRING: u8 = 253;
 
 /// Column definition flags.

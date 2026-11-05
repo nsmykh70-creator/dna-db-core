@@ -2,6 +2,52 @@
 
 ## Unreleased (CMS Edition — branch `cms-edition`)
 
+### Phase 2 acceptance closed — deadlock-retry e2e + DECIMAL scale (2026-11-06)
+
+The last two phase-2 items are done, closing the phase:
+
+**Deadlock-retry in the live order** — `scripts/e2e_deadlock_retry.sh`
+drives two concurrent checkout transactions (main + worker process, stock
+mysqli prepared statements) that take `SELECT … FOR UPDATE` holds on two
+inventory rows in OPPOSITE order and then order both items: the waits-for
+cycle fires errno 1213 (SQLSTATE 40001), a Woo-style `tx_with_retry`
+wrapper (1213/1205/3572 → randomized backoff, up to 10 attempts) re-runs
+the whole transaction. Two phases swap the roles so BOTH wrappers are
+proven as the deadlock victim: verdicts PASS/PASS — 4 orders per phase
+(each session ordered each SKU exactly once), stock 10 → 8/8, zero
+unexpected errors. Transaction shape matters on the CMS gate
+(single-writer: a failed statement does not un-apply earlier DML), so all
+holds precede any DML — the deadlock hits a write-free phase and the retry
+never duplicates effects. Report:
+`docs/cms/E2E_DEADLOCK_RETRY_REPORT.md`.
+
+Overlay fix found by the e2e — **inline PRIMARY KEY column constraints**
+(`sku varchar(20) NOT NULL PRIMARY KEY`): the overlay parser only knew the
+table-level `PRIMARY KEY (cols)` form, so row locks (and PointGet) were
+silently disabled on such tables (`lock_select_rows` bails on an empty PK).
+Unit test `inline_primary_key_column_constraint`.
+
+**DECIMAL(p,s) display scale** — new `cms::compat::decimal` module
+post-processes SELECT output: columns resolvable to a decimal-declared
+overlay column (via the FROM list — qualified names by alias, unqualified
+by unique scale across tables) are re-rendered with the declared scale
+(`250` → `"250.00"`, `0.125` in decimal(12,8) → `"0.12500000"`), and
+`CmsQueryResult.decimal_scales` now drives ColumnDefinition41 metadata:
+**MYSQL_TYPE_NEWDECIMAL (246) with decimals=s** in both the text and
+binary protocols (COM_FIELD_LIST derives both from the exact overlay
+Type). `SUM(col) AS col` keeps the column scale, matching MySQL's
+SUM over DECIMAL(p,s); expressions without an overlay binding (`total *
+2`) keep the DOUBLE rendering — documented divergence. Verified live over
+mysqli: text values, prepared metadata (type=246 decimals=2/8) and SUM
+scale (`scripts/decimal_wire_smoke.php` → DECIMAL_WIRE_OK). Gate tests
+`decimal_scale_display_parity` + `decimal_scale_join_resolution`.
+
+Tests: 294 with `--features cms` (+9), 195 without (4 pre-existing
+cms-gated battery failures unchanged). Docs: `docs/CMS_EDITION_RU.md`
+§4 item 8, §5 Phase 2 closed; leftovers (collation comparison,
+information_schema, online type change, unsigned semantics) move to
+phase 3.
+
 ### Drupal 11.4.10 installs end-to-end via the official web installer (2026-11-05)
 
 `core/install.php` driven over HTTP by `scripts/drupal_e2e.php` (stock PDO
