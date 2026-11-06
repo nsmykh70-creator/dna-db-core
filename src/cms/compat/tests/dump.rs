@@ -37,6 +37,19 @@ fn versioned_comments_unwrap_to_inner_statement() {
     );
     // Plain (non-versioned) comments are dropped outside strings.
     assert_eq!(dialect::unwrap_versioned_comments("SELECT /* noise */ 1"), "SELECT  1");
+    // MariaDB-specific `/*M!NNNNN … */`: the sandbox-mode marker that
+    // mariadb-dump (≥ 10.11.18) writes as the first line of every dump.
+    // 999999 is above any real server version — the body is dropped and the
+    // standalone statement collapses to a comment-only no-op (OK).
+    assert_eq!(
+        dialect::unwrap_versioned_comments("/*M!999999\\- enable the sandbox mode */"),
+        ""
+    );
+    // Real MariaDB directives in the M! form (≤ compat level) still execute.
+    assert_eq!(
+        dialect::unwrap_versioned_comments("/*M!100100 SET @mariadb_thing=1 */"),
+        " SET @mariadb_thing=1 "
+    );
 }
 
 #[test]
@@ -52,6 +65,13 @@ fn dump_flow_statements_answer_ok() {
     g.execute(s, "ALTER TABLE `t` DISABLE KEYS").unwrap();
     g.execute(s, "/*!40000 ALTER TABLE `t` ENABLE KEYS */").unwrap();
     g.execute(s, "FLUSH TABLES").unwrap();
+
+    // mariadb-dump ≥ 10.11.18 opens every dump with the sandbox-mode marker:
+    // a MariaDB `/*M!*/` comment as a standalone statement. Both the raw
+    // wire form (with the `\-` escape) and what the client sends after
+    // stripping it must answer OK, not errno 1064.
+    g.execute(s, "/*M!999999\\- enable the sandbox mode */").unwrap();
+    g.execute(s, "/*M!999999 enable the sandbox mode */").unwrap();
 
     // mysqldump's per-table copy query runs against the gate.
     g.execute(s, "INSERT INTO t (name, data) VALUES ('a', 'b')").unwrap();

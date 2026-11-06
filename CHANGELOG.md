@@ -2,6 +2,54 @@
 
 ## Unreleased (CMS Edition — branch `cms-edition`)
 
+### CMS database backup / restore — phase 3 item 2 (2026-11-06)
+
+Operational drill for a CMS site hosted on DNA-DB, verified end-to-end by
+`scripts/e2e_backup_restore.sh` against a **MariaDB 10.11.18 reference**
+(Debian 12 userland) with the real `mariadb-dump` / `mariadb` binaries:
+
+- **BACKUP** — `mariadb-dump` connects to `dna-db-core mysqld` and dumps a
+  provisioned WordPress-shaped database (overlay-rebuilt SHOW CREATE
+  TABLE, SQL_NO_CACHE probes, LOCK TABLES): the operator's backup
+  artifact.
+- **DISASTER** — `DROP DATABASE` on DNA-DB; production is gone.
+- **RESTORE** — the same artifact replays back into DNA-DB through the
+  stock `mariadb` client; content matches the reference byte-for-byte,
+  a mysqli smoke (`scripts/cms_restore_smoke.php`) reads the site like a
+  CMS page render, and auto-increment continues at max(id)+1
+  (99 → 100, LAST_INSERT_ID correct).
+- **IDEMPOTENCE** — replaying the same dump over the already-restored
+  database (the "restore over a half-wiped state" case) matches again.
+- **PORTABILITY** — the same artifact restores untouched into a vanilla
+  MariaDB database and matches the reference: DNA-DB backups are plain
+  SQL, no vendor lock-in.
+
+Verdict: `BACKUP_RESTORE_E2E_VERDICT: OK`. Report:
+`docs/cms/E2E_BACKUP_RESTORE_REPORT.md`.
+
+Gate fix (behind `--features cms`): mariadb-dump ≥ 10.11.18 opens every
+dump with the sandbox-mode marker `/*M!999999\- enable the sandbox mode
+*/` — a MariaDB-specific versioned comment the gate used to strip as a
+plain comment, leaving an empty statement that failed with errno 1064.
+`dialect::unwrap_versioned_comments` now routes both `/*!NNNNN … */` and
+`/*M!NNNNN … */` through the same version gate (999999 collapses to a
+comment-only statement → OK, as MySQL answers; real directives ≤ the
+compat level execute, as MariaDB 10.11 does). Both the raw wire form and
+the client-stripped form are covered by tests.
+
+Operator wrappers: `scripts/cms_backup.sh` (dump a CMS database to a
+timestamped artifact) and `scripts/cms_restore.sh [--create]` (replay a
+backup, create the database after a disaster; re-running is safe).
+
+Observation (engineering tail, not a regression): `SUM(price)` renders
+as `250.1` via the mariadb client where MariaDB shows `250.10` — the
+aggregate column carries no scale metadata; stored `decimal(10,2)`
+columns still read as `250.00`. Reproduces on the previous binary.
+
+Tests: 332 passed with `--features cms`, 195 without (+ the 4 known
+cms-gated battery failures). Release binary refreshed in
+`prebuilt/linux-x86_64/` (SHA256SUMS updated).
+
 ### mysqldump / mariadb-dump roundtrip — phase 3 opens (2026-11-06)
 
 First phase-3 acceptance item ("эксплуатация"): MySQL ⇄ DNA-DB migration

@@ -352,6 +352,27 @@ DDL (не-ASCII в DEFAULT безопасны). Детали:
 `docs/cms/E2E_MYSQLDUMP_ROUNDTRIP_REPORT.md`. Тестов: 316 с фичей (+4),
 195 без — main-сборка не тронута.
 
+### Прогон №10: бэкап/рестор CMS-базы — Фаза 3, пункт 2 (2026-11-06)
+
+Операторский цикл «сайт на DNA-DB»: бэкап штатным `mariadb-dump` →
+DROP DATABASE → рестор тем же дампом → сайт живой. Направление бэкапа —
+С DNA-DB (SHOW CREATE TABLE из оверлея), рестор — в DNA-DB и в ванильную
+MariaDB (no vendor lock-in). Идемпотентность: повторный рестор поверх
+восстановленного (DROP TABLE IF EXISTS в дампе) — содержимое совпадает;
+автоинкремент после рестора продолжает с max+1 (99 → 100, LAST_INSERT_ID
+корректен); CMS-смоук через mysqli после рестора — OK. Эталон — Debian-
+сборка **MariaDB 10.11.18** (в отличие от bintar 10.11.11 Прогона №9):
+дампер ≥ 10.11.18 открывает дамп sandbox-маркером `/*M!999999\- enable the
+sandbox mode */` — вскрыт и закрыт пробел гейта: `/*M!NNNNN … */`
+(MariaDB-форма versioned-комментария) теперь проходит единый версионный
+гейт с `/*!NNNNN … */` (999999 → comment-only → OK, реальные директивы
+≤ уровня — исполняются). Операторские обёртки `scripts/cms_backup.sh` /
+`scripts/cms_restore.sh [--create]`. Наблюдение: дисплейная шкала
+SUM-агрегатов через mariadb-клиент (`250.1` vs `250.10`; данные целы,
+колонка читается со scale) — не регрессия, ушло в хвосты Фазы 3. Детали:
+`docs/cms/E2E_BACKUP_RESTORE_REPORT.md`. Тестов: 332 с фичей, 195 без
+(+4 известных отказа cms-батарей — база не тронута).
+
 ## 5. Фазы
 
 **Фаза 0 — корпус запросов (1–2 нед).** ✅ Выполнено:
@@ -399,15 +420,21 @@ unsigned-семантика) переносятся в Фазу 3 как инж�
 дамп с эталона MariaDB проигрывается в DNA-DB штатным клиентом `mariadb`,
 дамп С DNA-DB проигрывается в чистую MariaDB; содержимое ref→imp→back
 совпадает побайтно, автоинкремент продолжается с max+1 — см.
-E2E_MYSQLDUMP_ROUNDTRIP_REPORT)**. Гейт дополнен: разворачивание
+E2E_MYSQLDUMP_ROUNDTRIP_REPORT)**, **бэкап/рестор CMS-базы ✅ (6.11: бэкап
+mariadb-dump с DNA-DB → DROP DATABASE → рестор в DNA-DB — включая
+идемпотентный повтор и автоинкремент с max+1, тот же бэкап встаёт и на
+ванильную MariaDB; sandbox-маркер `/*M!999999*/` дамперов ≥ 10.11.18;
+обёртки cms_backup.sh / cms_restore.sh — см.
+E2E_BACKUP_RESTORE_REPORT)**. Гейт дополнен: разворачивание
 условных комментариев `/*!NNNNN … */`, LOCK/UNLOCK TABLES + DISABLE/ENABLE
 KEYS + SQL_NO_CACHE как no-op/стриппинг, `SHOW CREATE TABLE` (реконструкция
 из оверлея с табличными опциями; идемпотентен parse→emit→parse),
 `SHOW CREATE DATABASE`, `SHOW TABLE STATUS`, пустые каталоги
 триггеров/рутин, `information_schema.FILES/TRIGGERS/EVENTS/ROUTINES`,
-`@@collation_database` и пр. Остаются: бэкап/рестор, docker-образ,
+`@@collation_database` и пр. Остаются: docker-образ,
 гайд «миграция WP с MySQL за 3 шага», Prometheus-дашборд для CMS-метик,
-инженерные хвосты Фазы 2 (коллации, online-смена типа, unsigned).
+инженерные хвосты Фазы 2 (коллации, online-смена типа, unsigned) плюс
+дисплейная шкала SUM-агрегатов через mariadb-клиент (Прогон №10).
 
 **Фаза 4 — MySQL wire protocol (8–16 нед).** Полный вход B: тогда и
 mysqli/PDO_mysql/phpMyAdmin работают сами. CMS-редакция становится

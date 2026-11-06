@@ -625,9 +625,15 @@ pub(crate) fn unwrap_versioned_comments(s: &str) -> String {
         }
         // Comment start?
         if c == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
-            if i + 2 < chars.len() && chars[i + 2] == '!' {
-                // Versioned: parse the digits after `/*!`.
-                let mut j = i + 3;
+            // `/*!NNNNN … */` (MySQL) and `/*M!NNNNN … */` (MariaDB-specific)
+            // share the versioned-comment machinery. The M! form matters for
+            // dumps: mariadb-dump ≥ 10.11.18 opens every dump with the
+            // sandbox-mode marker `/*M!999999\- enable the sandbox mode */`,
+            // which is a standalone statement for the replaying client.
+            let m_form = i + 3 < chars.len() && chars[i + 2] == 'M' && chars[i + 3] == '!';
+            if (i + 2 < chars.len() && chars[i + 2] == '!') || m_form {
+                // Versioned: parse the digits after `/*!` / `/*M!`.
+                let mut j = if m_form { i + 4 } else { i + 3 };
                 let mut ver: u64 = 0;
                 let mut has_digits = false;
                 while j < chars.len() && chars[j].is_ascii_digit() {
