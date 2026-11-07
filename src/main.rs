@@ -151,6 +151,8 @@ fn main() {
             users,
             trust,
             wordpress,
+            admin_port,
+            admin_bind,
             sync,
         } => cmd_mysqld::run_mysqld(
             data_dir,
@@ -159,6 +161,8 @@ fn main() {
             users,
             *trust,
             *wordpress,
+            *admin_port,
+            admin_bind,
             cli::sync_arg_to_mode(sync),
         ),
         cli::Command::Shell {

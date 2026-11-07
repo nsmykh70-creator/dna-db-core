@@ -2,6 +2,50 @@
 
 ## Unreleased (CMS Edition — branch `cms-edition`)
 
+### Per-database dual spirals + web panel + SUM scale fix (2026-11-07)
+
+Product request closed end-to-end (`scripts/e2e_spirals_panel.sh`,
+verdict `SPIRALS_PANEL_E2E_VERDICT: OK`; report:
+`docs/cms/E2E_SPIRALS_PANEL_REPORT.md`):
+
+- **Two new spirals per database.** `CREATE DATABASE` — over the MySQL
+  wire or from the panel — physically deploys a dual-spiral pair:
+  Strand A (primary) + Strand B, each a real engine-initialized data
+  directory with a `spiral_manifest.json` (pair_id, role, storage kind,
+  engine version). Default roots `local-a`/`local-b` under the data dir;
+  `DROP DATABASE` removes both spirals and the catalog entry
+  (`spirals.json`, atomic temp+rename).
+- **Databases managed from a web panel.** `mysqld --admin-port N
+  [--admin-bind …]` serves an embedded single-page panel (Russian UI,
+  zero new dependencies, `src/cms/panel.rs` + `panel.html`): list, create
+  (storage selector per spiral), delete, and relocate spirals of running
+  databases. Auth reuses the wire `--user` credentials (bearer token,
+  12 h TTL, 5 failures/min/IP → 429); SQL path and panel share one
+  catalog, so `SHOW DATABASES` sees both.
+- **Spiral storage: local disks or network storages.** The panel detects
+  real mountpoints from `/proc/mounts` (ext4/xfs/btrfs/zfs/… → local,
+  nfs/cifs/… → network) with a write probe and lets you register any
+  root; each spiral can be placed (and relocated on a live server:
+  copy → verify → swap → catalog update → delete old) on any root or an
+  explicit absolute path. Database names are validated to
+  `[A-Za-z0-9_$]` — path traversal is impossible.
+- **SUM/aggregate display scale fixed** (closes the observation recorded
+  by the backup/restore drill): unaliased `SUM(price)` used to render as
+  `250.1` through the mariadb client because the aggregate column
+  carried no scale. `decimal::resolve_scale` now binds `SUM/MIN/MAX` to
+  the argument column's scale and widens `AVG` by 4 (MySQL rule), so the
+  client shows `250.10` with `MYSQL_TYPE_NEWDECIMAL, decimals=2` in both
+  protocols. Test: `decimal_aggregate_scale_parity`.
+
+Honest limitation (documented in `spirals.rs`): table data of the active
+catalog still lives in the main engine data dir; the spiral pairs are the
+per-database storage layer that phase 4 per-database engines will mount.
+
+Tests: 341 with `--features cms` (+9), 195 without (4 known cms-gated
+battery failures). Regression: roundtrip + backup/restore E2Es stay green
+(their CREATE/DROP DATABASE now deploys/removes real spiral pairs).
+Release binary refreshed in `prebuilt/linux-x86_64/` (SHA256SUMS updated).
+
 ### CMS database backup / restore — phase 3 item 2 (2026-11-06)
 
 Operational drill for a CMS site hosted on DNA-DB, verified end-to-end by

@@ -32,17 +32,21 @@ pub mod ddl_meta;
 pub mod errno;
 pub mod locks;
 pub mod mysqlwire;
+pub mod panel;
 pub mod row_locks;
 pub mod sequence;
 pub mod session;
+pub mod spirals;
 pub mod wordpress;
 
 pub use compat::{CmsError, CmsQueryResult, CmsSqlGate};
 pub use ddl_meta::{CmsColumnMeta, CmsIndexMeta, CmsTableMeta};
 pub use locks::LockRegistry;
 pub use mysqlwire::{MySqlAuth, MySqlWireServer};
+pub use panel::CmsPanel;
 pub use row_locks::RowLockRegistry;
 pub use sequence::AutoIncrementRegistry;
+pub use spirals::{SpiralCatalog, SpiralPair, StorageKind, StorageRoot};
 pub use session::{CmsSession, Charset, SqlModeFlag};
 
 /// Human-readable edition banner for `--version` output and startup logs.

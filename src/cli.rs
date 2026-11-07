@@ -281,6 +281,14 @@ pub(crate) enum Command {
         /// Bootstrap the WordPress core schema (12 tables) on startup.
         #[arg(long, default_value_t = false)]
         wordpress: bool,
+        /// Embedded web panel (databases + spiral storage management) on
+        /// this TCP port. 0 = off. Login reuses the --user credentials.
+        #[arg(long, default_value_t = 0)]
+        admin_port: u16,
+        /// Panel bind address (default loopback; put TLS in front for
+        /// remote access).
+        #[arg(long, default_value = "127.0.0.1")]
+        admin_bind: String,
         /// Batched WAL sync (fast dev mode). Default keeps fsync-per-write.
         #[arg(long, default_value = "strict")]
         sync: SyncArg,

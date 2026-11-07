@@ -24,6 +24,8 @@ pub(crate) fn run_mysqld(
     users: &[String],
     trust: bool,
     wordpress: bool,
+    admin_port: u16,
+    admin_bind: &str,
     sync_mode: dna_db_core::wal::SyncMode,
 ) -> i32 {
     use dna_db_core::cms::compat::{CmsSqlGate, MYSQL_COMPAT_VERSION};
@@ -56,6 +58,17 @@ pub(crate) fn run_mysqld(
     };
     let sql = Arc::new(SqlEngine::new(engine));
     let gate = Arc::new(CmsSqlGate::new(sql));
+
+    // Per-database dual-spiral storage: every CREATE/DROP DATABASE (SQL or
+    // web panel) physically creates/removes the Strand A + Strand B pair.
+    if let Err(e) = gate.attach_spiral_catalog(data_path) {
+        eprintln!("[FATAL] {e}");
+        return 2;
+    }
+    let pairs = gate
+        .with_spirals(|c| c.pairs().count())
+        .unwrap_or(0);
+    eprintln!("[MYSQLD] spiral catalog: {pairs} database pair(s) on storage roots local-a/local-b");
 
     eprintln!("[MYSQLD] {}", dna_db_core::cms::edition_banner());
     eprintln!("[MYSQLD] server version {MYSQL_COMPAT_VERSION} (MySQL wire protocol 4.1)");
@@ -96,6 +109,39 @@ pub(crate) fn run_mysqld(
         eprintln!("[MYSQLD] auth: users {names:?} (mysql_native_password)");
         MySqlAuth::Users(map)
     };
+
+    // Web panel: databases + spiral storage management (admin_port > 0).
+    if admin_port > 0 {
+        let mut map = std::collections::HashMap::new();
+        for spec in users {
+            match spec.split_once(':') {
+                Some((u, p)) => {
+                    map.insert(u.to_string(), p.to_string());
+                }
+                None => {
+                    map.insert(spec.clone(), String::new());
+                }
+            }
+        }
+        match std::net::TcpListener::bind((admin_bind, admin_port)) {
+            Ok(listener) => {
+                eprintln!(
+                    "[MYSQLD] web panel: http://{admin_bind}:{admin_port} (databases, spirals, storage)"
+                );
+                let gate = gate.clone();
+                std::thread::spawn(move || {
+                    dna_db_core::cms::CmsPanel::run(
+                        listener,
+                        gate,
+                        Arc::new(map),
+                    );
+                });
+            }
+            Err(e) => {
+                eprintln!("[MYSQLD] WARNING: cannot bind panel {admin_bind}:{admin_port}: {e}");
+            }
+        }
+    }
 
     let listener = match std::net::TcpListener::bind((bind, port)) {
         Ok(l) => l,

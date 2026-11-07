@@ -17,10 +17,13 @@
 //!   decimal-declared match agrees on the scale (ambiguous or non-decimal
 //!   matches are left untouched);
 //! - aggregates aliased to a decimal column name (`SUM(total) AS total`)
-//!   keep the column scale, which matches MySQL's SUM over DECIMAL(p,s).
+//!   keep the column scale, which matches MySQL's SUM over DECIMAL(p,s);
+//! - unaliased aggregates (`SUM(price)`, `MIN(t.total)`, `MAX(t.total)`,
+//!   `AVG(price)`) resolve through the expression text itself: SUM/MIN/MAX
+//!   preserve the argument scale, AVG widens it by 4 (MySQL rule).
 //!
 //! Documented divergences: expressions without an overlay binding
-//! (`value * 2`, `AVG(value)`) keep the DOUBLE rendering; float storage
+//! (`value * 2`, `SUM(a + b)`) keep the DOUBLE rendering; float storage
 //! rounds at read time (`format!` half-away-from-zero on the binary
 //! representation) instead of MySQL's exact decimal rounding with notes.
 
@@ -240,6 +243,14 @@ fn resolve_scale(
     tables: &[(String, String)],
     name: &str,
 ) -> Option<u8> {
+    // Unaliased aggregates: the output column name IS the expression text
+    // (`SUM(price)`, `max(t.total)`), and MySQL keeps the argument's scale
+    // for SUM/MIN/MAX while AVG widens it by 4. Must run BEFORE the
+    // qualified-name rule — `SUM(t.price)` contains a dot that would
+    // otherwise be mistaken for a `qualifier.column` split.
+    if let Some(s) = aggregate_inner_scale(gate, tables, name) {
+        return Some(s);
+    }
     if let Some((qual, col)) = name.rsplit_once('.') {
         let qual = qual.trim_matches('`');
         let col = col.trim_matches('`');
@@ -254,6 +265,46 @@ fn resolve_scale(
         return unqualified_scale(gate, tables, col);
     }
     unqualified_scale(gate, tables, name)
+}
+
+/// MySQL scale rules for aggregates over a decimal column: SUM/MIN/MAX
+/// preserve the argument scale, AVG widens it by 4
+/// (`AVG(decimal(p,s)) → decimal(…, s+4)`). `SUM(DISTINCT col)` shares the
+/// column's scale. Only plain-column arguments are bound (documented
+/// scope); expressions (`SUM(a+b)`) stay DOUBLE.
+fn aggregate_inner_scale(
+    gate: &super::CmsSqlGate,
+    tables: &[(String, String)],
+    name: &str,
+) -> Option<u8> {
+    for (word, delta) in [("SUM(", 0u8), ("MIN(", 0), ("MAX(", 0), ("AVG(", 4)] {
+        let Some(pos) = super::text::find_ci(name, word) else {
+            continue;
+        };
+        let rest = &name[pos + word.len()..];
+        let close = rest.find(')')?;
+        let inner = rest[..close].trim();
+        let inner = inner
+            .strip_prefix("DISTINCT")
+            .map(|r| r.trim())
+            .unwrap_or(inner);
+        let (qual, col) = match inner.rsplit_once('.') {
+            Some((q, c)) => (q.trim_matches('`'), c.trim_matches('`')),
+            None => ("", inner.trim_matches('`')),
+        };
+        let scale = if qual.is_empty() {
+            unqualified_scale(gate, tables, col)
+        } else if let Some((_, table)) = tables
+            .iter()
+            .find(|(al, _)| al.eq_ignore_ascii_case(qual))
+        {
+            column_scale(gate, table, col)
+        } else {
+            unqualified_scale(gate, tables, col)
+        };
+        return scale.map(|s| s.saturating_add(delta));
+    }
+    None
 }
 
 fn column_scale(gate: &super::CmsSqlGate, table: &str, col: &str) -> Option<u8> {

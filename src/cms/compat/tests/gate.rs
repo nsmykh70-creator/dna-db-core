@@ -834,6 +834,114 @@ fn decimal_scale_display_parity() {
 }
 
 #[test]
+fn decimal_aggregate_scale_parity() {
+    // Unaliased aggregates resolve through the expression text itself
+    // (MySQL: SUM/MIN/MAX over decimal(p,s) keep scale s, AVG widens it by
+    // 4). Regression for the mariadb-client rendering "250.1" instead of
+    // "250.10" reported in E2E_BACKUP_RESTORE_REPORT.md.
+    let g = gate("decimal_agg");
+    let s = g.open_session();
+    g.execute(
+        s,
+        "CREATE TABLE items (id bigint(20) unsigned NOT NULL AUTO_INCREMENT, name varchar(50) NOT NULL DEFAULT '', price decimal(10,2) NOT NULL DEFAULT '0.00', PRIMARY KEY (id)) ENGINE=InnoDB",
+    )
+    .unwrap();
+    g.execute(s, "INSERT INTO items (name, price) VALUES ('кружка', 250.00)").unwrap();
+    g.execute(s, "INSERT INTO items (name, price) VALUES ('tea', 0.10)").unwrap();
+
+    let r = g.execute(s, "SELECT SUM(price) FROM items").unwrap();
+    assert_eq!(r.columns, vec!["SUM(price)"]);
+    assert_eq!(r.decimal_scales, vec![Some(2)]);
+    assert_eq!(v(&r.rows[0], "SUM(price)"), "250.10");
+
+    let r = g.execute(s, "SELECT MIN(price), MAX(price) FROM items").unwrap();
+    assert_eq!(r.decimal_scales, vec![Some(2), Some(2)]);
+    assert_eq!(v(&r.rows[0], "MIN(price)"), "0.10");
+    assert_eq!(v(&r.rows[0], "MAX(price)"), "250.00");
+
+    let r = g.execute(s, "SELECT AVG(price) FROM items").unwrap();
+    assert_eq!(r.decimal_scales, vec![Some(6)], "AVG widens scale by 4");
+    assert_eq!(v(&r.rows[0], "AVG(price)"), "125.050000");
+
+    // Qualified argument still resolves.
+    let r = g.execute(s, "SELECT SUM(items.price) FROM items").unwrap();
+    assert_eq!(r.decimal_scales, vec![Some(2)]);
+
+    // Expressions without a plain-column binding stay DOUBLE.
+    let r = g.execute(s, "SELECT SUM(price * 2) FROM items").unwrap();
+    assert_eq!(r.decimal_scales, vec![None]);
+
+    // COUNT stays integer (no scale metadata).
+    let r = g.execute(s, "SELECT COUNT(*) FROM items").unwrap();
+    assert_eq!(r.decimal_scales, vec![None]);
+}
+
+#[test]
+fn create_database_builds_dual_spiral_pair() {
+    // CREATE DATABASE (SQL or web panel) must physically deploy TWO
+    // spirals — Strand A + Strand B — on the chosen storage, each a real
+    // engine-initialized directory with a manifest; DROP DATABASE removes
+    // both; the panel API can relocate a strand to another storage.
+    let g = gate("spirals_gate");
+    let dir = std::env::temp_dir().join(format!(
+        "dnadb_spirals_gate_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    g.attach_spiral_catalog(&dir).unwrap();
+
+    let s = g.open_session();
+    let r = g.execute(s, "CREATE DATABASE shop").unwrap();
+    assert!(r.message.as_deref().unwrap().contains("2 spirals"));
+    let a = dir.join("spirals-a").join("shop.spiral");
+    let b = dir.join("spirals-b").join("shop.spiral");
+    assert!(a.is_dir() && b.is_dir(), "two physical spirals must appear");
+    assert!(a.join("spiral_manifest.json").is_file());
+    assert!(b.join("spiral_manifest.json").is_file());
+    // Real engine layouts, not empty dirs.
+    assert!(std::fs::read_dir(&a).unwrap().count() > 1);
+
+    // Visible over the wire catalog (SHOW DATABASES).
+    let r = g.execute(s, "SHOW DATABASES").unwrap();
+    let names: Vec<String> = r.rows.iter().map(|row| v(row, "Database")).collect();
+    assert!(names.contains(&"shop".to_string()));
+
+    // Panel-side view agrees; panel can create its own pair too.
+    let pairs: Vec<_> = g.with_spirals(|c| c.pairs().cloned().collect()).unwrap();
+    assert_eq!(pairs.len(), 1);
+    let pair = g
+        .panel_create_database("wiki", (None, None, None), (None, None, None))
+        .unwrap();
+    assert!(std::path::Path::new(&pair.strand_a.path).is_dir());
+    assert!(std::path::Path::new(&pair.strand_b.path).is_dir());
+
+    // Panel relocation: Strand B of "shop" moves to an explicit path
+    // (simulated network storage — any absolute directory).
+    let root2 = dir.join("nas-storage");
+    let moved = g
+        .panel_relocate_spiral("shop", 'B', None, Some(root2.to_str().unwrap()), None)
+        .unwrap();
+    assert!(std::path::Path::new(&moved.path)
+        .join("spiral_manifest.json")
+        .is_file());
+    assert!(!b.exists(), "old copy removed after the swap");
+
+    // DROP DATABASE removes both spirals + catalog entries (SQL path).
+    g.execute(s, "DROP DATABASE shop").unwrap();
+    assert!(!a.exists());
+    assert!(g.with_spirals(|c| c.pair("shop").is_some()) == Some(false));
+
+    // Panel drop removes the wiki pair as well.
+    g.panel_drop_database("wiki").unwrap();
+    assert!(!std::path::Path::new(&pair.strand_a.path).exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn decimal_scale_join_resolution() {
     // Unqualified output names resolve across the FROM tables when every
     // decimal match agrees on the scale; qualified names follow the alias.

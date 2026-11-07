@@ -114,6 +114,11 @@ pub struct CmsSqlGate {
     /// generic MySQL clients (phpMyAdmin, mysqldump --databases, CMS
     /// installers that pre-create the DB) keep working.
     databases: Mutex<BTreeSet<String>>,
+    /// Per-database dual-spiral storage pairs (см. `cms::spirals`). Attached
+    /// by the server modes that know the data dir (`attach_spiral_catalog`);
+    /// when absent (unit tests), CREATE/DROP DATABASE keep the legacy
+    /// catalog-only behaviour.
+    spirals: std::sync::Mutex<Option<crate::cms::spirals::SpiralCatalog>>,
 }
 
 impl CmsSqlGate {
@@ -127,7 +132,87 @@ impl CmsSqlGate {
             meta: RwLock::new(HashMap::new()),
             txs: Mutex::new(HashMap::new()),
             databases: Mutex::new(BTreeSet::new()),
+            spirals: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Attaches the spiral catalog rooted at `data_dir` (server modes call
+    /// this at startup; every CREATE/DROP DATABASE then physically creates
+    /// / removes a dual-spiral pair — see `cms::spirals`). Idempotent: the
+    /// first attachment wins.
+    pub fn attach_spiral_catalog(&self, data_dir: &std::path::Path) -> Result<(), String> {
+        let mut slot = self.spirals.lock().expect("spirals poisoned");
+        if slot.is_some() {
+            return Ok(());
+        }
+        let cat = crate::cms::spirals::SpiralCatalog::open(data_dir)
+            .map_err(|e| format!("spiral catalog: {e}"))?;
+        *slot = Some(cat);
+        Ok(())
+    }
+
+    /// Runs `f` against the attached spiral catalog, if any.
+    pub fn with_spirals<R>(
+        &self,
+        f: impl FnOnce(&mut crate::cms::spirals::SpiralCatalog) -> R,
+    ) -> Option<R> {
+        let mut slot = self.spirals.lock().expect("spirals poisoned");
+        slot.as_mut().map(f)
+    }
+
+    // ------------------------- web panel API -------------------------
+    // The embedded panel (cms::panel) drives databases and spiral storage
+    // through these methods; the SQL path (CREATE/DROP DATABASE above)
+    // shares the same catalog, so both views never diverge.
+
+    /// Panel: creates a database with its dual-spiral pair on the requested
+    /// storage roots (`Some(label)` / `Some(path)` per strand; None = the
+    /// default roots). Registers the name in the SQL-visible catalog.
+    pub fn panel_create_database(
+        &self,
+        db: &str,
+        a: (Option<&str>, Option<&str>, Option<crate::cms::spirals::StorageKind>),
+        b: (Option<&str>, Option<&str>, Option<crate::cms::spirals::StorageKind>),
+    ) -> Result<crate::cms::spirals::SpiralPair, String> {
+        let pair = self
+            .with_spirals(|c| c.create_pair(db, a, b))
+            .ok_or_else(|| "spiral catalog is not attached".to_string())??;
+        self.databases
+            .lock()
+            .expect("database set poisoned")
+            .insert(db.to_string());
+        Ok(pair)
+    }
+
+    /// Panel: drops a database — both spirals and the catalog record.
+    pub fn panel_drop_database(&self, db: &str) -> Result<(), String> {
+        self.with_spirals(|c| {
+            if c.pair(db).is_some() {
+                c.drop_pair(db)
+            } else {
+                Ok(())
+            }
+        })
+        .ok_or_else(|| "spiral catalog is not attached".to_string())??;
+        self.databases
+            .lock()
+            .expect("database set poisoned")
+            .remove(db);
+        Ok(())
+    }
+
+    /// Panel: relocates one strand of a pair to another storage root
+    /// (copy → verify → swap → update catalog → delete old).
+    pub fn panel_relocate_spiral(
+        &self,
+        db: &str,
+        role: char,
+        root_label: Option<&str>,
+        path: Option<&str>,
+        kind: Option<crate::cms::spirals::StorageKind>,
+    ) -> Result<crate::cms::spirals::SpiralPlacement, String> {
+        self.with_spirals(|c| c.relocate(db, role, root_label, path, kind))
+            .ok_or_else(|| "spiral catalog is not attached".to_string())?
     }
 
     /// Opens (or returns) a per-connection session. CMS hosting is
@@ -258,16 +343,36 @@ impl CmsSqlGate {
                     message: "CREATE DATABASE: missing name".into(),
                 });
             }
+            // Physical dual-spiral pair (Strand A + Strand B) on the
+            // configured storage roots — created FIRST, so a failing disk
+            // aborts the CREATE before the catalog learns the name. Default
+            // placement: the "local-a" / "local-b" roots. When no catalog
+            // is attached (unit tests) the legacy catalog-only path runs.
+            if let Some(Err(e)) = self.with_spirals(|c| {
+                c.create_pair(&db, (None, None, None), (None, None, None))
+                    .map(|_| ())
+                    .map_err(|e| e)
+            }) {
+                return Err(CmsError {
+                    errno: 1030, // ER_GET_ERRNO: storage refused the create
+                    message: format!("CREATE DATABASE '{}': {}", db, e),
+                });
+            }
             self.databases
                 .lock()
                 .expect("database set poisoned")
                 .insert(db.clone());
             self.with_session(session, |s| s.database = Some(db.clone()));
-            return Ok(empty_ok(format!("database created: '{}'", db)));
+            return Ok(empty_ok(format!(
+                "database created: '{}' (2 spirals)",
+                db
+            )));
         }
 
-        // DROP DATABASE [IF EXISTS] name — removes the gate's record; the
-        // engine's single catalog is untouched (tables live under it).
+        // DROP DATABASE [IF EXISTS] name — removes the physical dual-spiral
+        // pair (both strands + catalog entry) and the gate's catalog record.
+        // A name without a spiral pair (legacy fake-catalog entries, unit
+        // tests) keeps the old record-only path.
         if upper.starts_with("DROP DATABASE") {
             let tail = sql["DROP DATABASE".len()..].trim();
             let tail = tail.strip_prefix("IF EXISTS").unwrap_or(tail).trim();
@@ -277,6 +382,18 @@ impl CmsSqlGate {
                 .trim_matches('\'')
                 .trim()
                 .to_string();
+            if let Some(Err(e)) = self.with_spirals(|c| {
+                if c.pair(&db).is_some() {
+                    c.drop_pair(&db).map(|_| ())
+                } else {
+                    Ok(())
+                }
+            }) {
+                return Err(CmsError {
+                    errno: 1030,
+                    message: format!("DROP DATABASE '{}': {}", db, e),
+                });
+            }
             self.databases
                 .lock()
                 .expect("database set poisoned")

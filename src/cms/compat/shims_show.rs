@@ -32,6 +32,13 @@ impl CmsSqlGate {
                 .iter()
                 .cloned()
                 .collect();
+            // Databases with physical spiral pairs (created via SQL or the
+            // web panel) are part of the visible catalog too.
+            if let Some(pairs) =
+                self.with_spirals(|c| c.pairs().map(|p| p.database.clone()).collect::<Vec<_>>())
+            {
+                names.extend(pairs);
+            }
             names.insert("information_schema".into());
             names.insert(current);
             let mut rows = Vec::new();
