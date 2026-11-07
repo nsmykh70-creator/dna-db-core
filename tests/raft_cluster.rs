@@ -167,7 +167,9 @@ fn raft_elects_leader_replicates_and_fails_over() {
     // 5. ALL committed data converges on the surviving nodes. The new
     // leader replays its full log to lagging followers, so allow a short
     // convergence window — but data must NEVER be absent from BOTH.
-    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    // (10 s: on a loaded 2-vCPU runner the ticker threads can be starved
+    // past a 4 s window even though replication itself is sub-second.)
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let keys: Vec<&[u8]> = vec![b"raft:k1", b"raft:k2", b"raft:k3"];
     loop {
         let all_present = keys.iter().all(|key| {

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (v4.1)
+## v4.1.0 (2026-11) — transparent storage & panel ops
 
 - **Transparent storage for SQL operators** — the operator writes plain SQL
   and never has to read A/C/G/T chains:
@@ -55,6 +55,57 @@
   - Tests: `admin::tests::panel_explain_compact_and_disk_size` (real
     HTTP round-trips: ACL 403s for viewers, JOIN rejection, TX transpile,
     `/api/compactions`, `/metrics` compaction gauges).
+
+## Unreleased — DnaQL v2.2 «SQL parity» + SQL engine fixes
+
+**DnaQL v2.2** (`src/dna_ql.rs`, `src/sql_to_dnaql.rs`) closes the last
+dialect gaps: every SQL command now has a native DnaQL spelling and the
+`sql_to_dnaql` transpiler converts SQL → DnaQL without losing semantics.
+
+- New pipeline stages mirroring the SQL engine: `JOIN` / `LEFT` / `RIGHT` /
+  `FULL [OUTER] JOIN` (hash join, `joined_` conflict naming, NULL-extension),
+  `GROUP [BY …] AGG name = COUNT/SUM/AVG/MIN/MAX(col)` (NULL-skipping, Int-sum
+  preservation, HAVING = `WHERE` after `GROUP`), `OFFSET`; computed
+  `EMIT expr AS alias`; `NOT` in `WHERE` expressions (the manual promised it,
+  the parser now delivers).
+- `UNION [ALL]` compound pipelines with a SORT/LIMIT/OFFSET tail applied to
+  the compound result (SQL semantics; column names from the left side,
+  DISTINCT dedup).
+- DDL & introspection: `SHOW CHROMOSOMES` (alias `SHOW TABLES`),
+  `ALTER CHROMOSOME … ADD COLUMN`, `CREATE [UNIQUE] INDEX` / `DROP INDEX`,
+  `EXPLAIN FROM … | FIND …` (plan instead of rows; writes rejected).
+- Row-set statements: top-level / in-TX `UPDATE chr SET … [WHERE …]` and
+  `DELETE FROM chr [WHERE …]` (atomic one-WAL-batch TX, FK CASCADE /
+  honest RESTRICT), and the `?=` insert-if-absent operator — the DnaQL
+  spelling of `INSERT … ON CONFLICT DO NOTHING`.
+- Transpiler now translates the full SQL surface (previously JOIN, GROUP BY,
+  OFFSET, computed projections, UNION, SHOW/ALTER/INDEX/EXPLAIN were
+  rejected); fixed the UPSERT translation bug where the `ON CONFLICT` tail
+  was silently ignored — `DO NOTHING` → `?=`, full non-PK `DO UPDATE SET` →
+  exact `+=` upsert, partial `DO UPDATE SET` → explicit error.
+
+**SQL engine fixes** (`src/sql_engine.rs`):
+- `UNION` renamed right-hand rows positionally over BTreeMap iteration
+  order, drifting values between slots whenever a right row carried a
+  different key set than the first row (e.g. after a partial INSERT);
+  the rename now goes by field name (regression test:
+  `union_rename_is_by_field_name_not_row_order`).
+- `FULL OUTER JOIN` silently overwrote conflicting columns instead of
+  using the `joined_` prefix like INNER/LEFT JOIN, and its unmatched-right
+  branch NULL-padding was dead code — both fixed
+  (`full_join_conflict_columns_use_joined_prefix`).
+- Conformance matrix in `scripts/sql_feature_test.py` updated: DNA-DB is
+  32/32 (the v3.0 gaps are closed); only MySQL's FULL OUTER JOIN remains
+  in `GAPS`.
+
+**Test robustness:** the Raft failover test's convergence window widened
+from 4 s to 10 s (ticker threads can be starved on loaded 2-vCPU runners;
+correctness assertions unchanged).
+
+Verification: `cargo test --release` **230 PASS** (199 lib + 31
+integration, incl. 8 new DnaQL v2.2 feature tests and the SQL↔DnaQL
+parity test); canonical SQL conformance run: **32/32 ok, 0 mismatch,
+0 error**; protocol smoke suite 15/15.
 
 ## v4.0.0-GA (2026-10-31) — Enterprise production release
 

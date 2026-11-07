@@ -363,21 +363,29 @@ DROP INDEX idx_orders_total ON chr_orders;
 
 ### 3.5. Ограничения (честно)
 
-- подзапросы материализуются (коррелированных подзапросов нет) — `IN (SELECT …)`;
-- нет `RIGHT JOIN`, `FULL JOIN`, `UNION`, `GROUP BY ROLLUP`;
-- нет `JOIN`-планов на индексах (JOIN — hash-join по FK);
-- нет транзакций в SQL (атомарность — через batch WAL/DnaQL `TX {}`);
-- нет TLS на TCP/HTTP — для удалённого доступа SSH/stunnel/VPN
-  (см. README, раздел «Ограничения»).
+- нет `GROUP BY ROLLUP`/`CUBE`, нет оконных рамок (frames) — из оконных
+  функций только `ROW_NUMBER`/`RANK`/`DENSE_RANK`, и они не сочетаются
+  с `GROUP BY`/агрегатами;
+- JOIN-планы всегда hash-join — индексные JOIN-планы не строятся
+  (точечные `WHERE pk = …` и диапазоны по индексам планируются);
+- `ALTER TABLE` — только `ADD COLUMN` (metadata-only, мгновенно);
+  DROP/RENAME колонки и смена типа не поддерживаются;
+- скалярные/коррелированные подзапросы, `EXISTS` и CTE (`WITH`)
+  поддерживаются (с v3.6), но `LATERAL` и рекурсивные CTE — нет;
+- `RIGHT/FULL JOIN`, `UNION [ALL]` и SQL-транзакции
+  (`BEGIN/COMMIT/ROLLBACK`) реализованы с v3.6.
+
+Актуальный список честных ограничений платформы — в
+[RELEASE_NOTES_v4.0.0.md](RELEASE_NOTES_v4.0.0.md).
 
 ---
 
 ## Глава 4. Тесты — как воспроизвести
 
 ```bash
-cargo test --release              # 152 теста: 139 lib + 13 integration
-python3 scripts/kill9_test.py     # kill -9: 99 091 записей, 0 потеряно
-python3 scripts/chaos_test.py     # порча 80 секторов -> doctor --fix -> 100%
+cargo test --release              # 230 тестов: 199 lib + 31 integration
+python3 scripts/kill9_test.py     # kill -9: записи не теряются
+python3 scripts/chaos_test.py     # порча секторов -> самовосстановление
 ./target/release/dna-db-core bench # реальные замеры CPU/диска
 ```
 

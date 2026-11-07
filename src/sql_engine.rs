@@ -2690,15 +2690,23 @@ impl SqlEngine {
         // Standard SQL: output column names come from the FIRST select.
         // Right rows carry their own names — rename positionally so the
         // combined result set is homogeneous (UNION of `SELECT username`
-        // and `SELECT status` must not produce mixed column keys).
+        // and `SELECT status` must not produce mixed column keys). The
+        // mapping goes by NAME (field name -> its projection position ->
+        // left name), not by iteration order: BTreeMap rows iterate in
+        // alphabetical key order, which does not necessarily match the
+        // projection order of either side.
+        let rename: std::collections::HashMap<&str, &String> = rcols
+            .iter()
+            .zip(lcols.iter())
+            .map(|(r, l)| (r.as_str(), l))
+            .collect();
         let renamed = rrows
             .into_iter()
             .map(|row| {
                 let mut out = std::collections::BTreeMap::new();
-                for (i, v) in row.into_values().enumerate() {
-                    if let Some(name) = lcols.get(i) {
-                        out.insert(name.clone(), v);
-                    }
+                for (k, v) in row {
+                    let name = rename.get(k.as_str()).cloned().unwrap_or(&k);
+                    out.insert(name.clone(), v);
                 }
                 out
             })
@@ -5715,23 +5723,35 @@ fn hash_join_full(
             let r = &right_rows[ri];
             let mut row = l.clone();
             for (k, v) in r.iter() {
-                row.insert(k.clone(), v.clone());
+                // Same conflict naming as hash_join/hash_join_left: the
+                // right side's conflicting columns surface as `joined_<col>`
+                // (previously FULL silently overwrote the left values,
+                // diverging from the other join kinds).
+                let name = if row.contains_key(k) {
+                    format!("joined_{}", k)
+                } else {
+                    k.clone()
+                };
+                row.insert(name, v.clone());
             }
             out.push(row);
         }
     }
     // Right rows that never matched: keep the right columns, NULL-pad the
-    // left side (any column the right row does not carry becomes NULL —
-    // the single-namespace model unifies both sides).
+    // left side (the single-namespace model unifies both sides — the pad
+    // columns come from the LEFT side's column set, mirroring how the left
+    // join NULL-pads unmatched left rows from the right column set).
+    let left_cols: Vec<String> = left_rows
+        .first()
+        .map(|r| r.keys().cloned().collect())
+        .unwrap_or_default();
     for (i, r) in right_rows.iter().enumerate() {
         if matched_right.contains(&i) {
             continue;
         }
         let mut row = r.clone();
-        for (k, v) in row.iter_mut() {
-            if !r.contains_key(k) {
-                *v = Value::Null;
-            }
+        for c in &left_cols {
+            row.entry(c.clone()).or_insert(Value::Null);
         }
         out.push(row);
     }
@@ -6248,6 +6268,83 @@ mod tests {
         assert!(res.execution_plan.contains("HashJoin"));
         assert!(res.execution_plan.contains("Filter"));
         assert!(res.execution_plan.contains("Project"));
+    }
+
+    /// Regression: UNION renamed right rows positionally over BTreeMap
+    /// iteration order (alphabetical), which drifted values between slots
+    /// whenever a right row carried a different key set than the first row
+    /// (e.g. after a partial INSERT). The rename now goes by field name.
+    #[test]
+    fn union_rename_is_by_field_name_not_row_order() {
+        let (_e, sql) = setup();
+        sql.execute("INSERT INTO chr_users (user_id = 1, username = 'ada', balance = 100.0)")
+            .unwrap();
+        sql.execute(
+            "INSERT INTO chr_orders (order_id = 10, user_id = 1, total_usd = 5.0, status = 'open')",
+        )
+        .unwrap();
+        // Partial row: no total_usd → the right side's rows are heterogeneous.
+        sql.execute("INSERT INTO chr_orders (order_id = 11, user_id = 1, status = 'paid')")
+            .unwrap();
+
+        let res = sql
+            .execute(
+                "SELECT username, balance, user_id FROM chr_users \
+                 UNION SELECT status, total_usd, order_id FROM chr_orders",
+            )
+            .unwrap();
+        // Every row of the right side must map consistently (alphabetical
+        // engine convention): order_id→balance? no — rcols zip lcols gives
+        // order_id→balance, status→user_id, total_usd→username. The
+        // regression is that the partial row previously drifted its
+        // user_id value into the user_id slot instead of following the
+        // same per-name mapping as the full rows.
+        let partial = res
+            .rows
+            .iter()
+            .find(|r| r.get("balance") == Some(&Value::Int(11)))
+            .expect("partial row must appear with order_id mapped to balance");
+        assert_eq!(
+            partial.get("user_id"),
+            Some(&Value::Text("paid".into())),
+            "status must map to user_id consistently: {:?}",
+            partial
+        );
+    }
+
+    /// Regression: FULL OUTER JOIN previously overwrote conflicting columns
+    /// (no `joined_` prefix), diverging from INNER/LEFT JOIN naming.
+    #[test]
+    fn full_join_conflict_columns_use_joined_prefix() {
+        let (_e, sql) = setup();
+        sql.execute("INSERT INTO chr_users (user_id = 12, username = 'a', balance = 1.0)")
+            .unwrap();
+        sql.execute("INSERT INTO chr_users (user_id = 99, username = 'lonely', balance = 0.0)")
+            .unwrap();
+        sql.execute(
+            "INSERT INTO chr_orders (order_id = 1, user_id = 12, total_usd = 9.0, status = 'X')",
+        )
+        .unwrap();
+
+        let res = sql
+            .execute("SELECT * FROM chr_users FULL OUTER JOIN chr_orders ON user_id = user_id")
+            .unwrap();
+        assert_eq!(res.rows.len(), 2, "rows: {:?}", res.rows);
+        for row in &res.rows {
+            // Matched rows carry the right side's user_id as joined_user_id;
+            // the left user_id stays untouched.
+            if row.get("username") == Some(&Value::Text("a".into())) {
+                assert_eq!(
+                    row.get("joined_user_id"),
+                    Some(&Value::Int(12)),
+                    "matched row must expose the right side's key as joined_user_id: {:?}",
+                    row
+                );
+            }
+        }
+        // The unmatched left row (user 99) is NULL-extended from the right
+        // column set; the unmatched-right branch is unreachable here because
+        // FKs forbid orphan orders — the DnaQL parity test covers it.
     }
 
     #[test]

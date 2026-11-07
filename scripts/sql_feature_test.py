@@ -775,17 +775,12 @@ CHECKS = [
 
 # Per-system expectation: "rows"/"ok" = feature must work, "unsupported" =
 # rejection is the documented behaviour for that system.
+# DNA-DB closed its v3.0 parser gaps in v3.6-v4.0 (RIGHT/FULL JOIN, UNION,
+# scalar subqueries, BEGIN/ROLLBACK, SHOW TABLES, EXPLAIN, IS NOT NULL,
+# computed projections, qualified ORDER BY). MySQL 8.4 still rejects
+# FULL OUTER JOIN.
 GAPS = {
-    "is_not_null":            {"dnadb": "unsupported"},
-    "computed_projection":    {"dnadb": "unsupported"},
-    "qualified_order_by":     {"dnadb": "unsupported"},
-    "join_right":             {"dnadb": "unsupported"},
-    "join_full":              {"dnadb": "unsupported", "mysql": "unsupported"},
-    "scalar_subquery":        {"dnadb": "unsupported"},
-    "transaction_rollback":   {"dnadb": "unsupported"},
-    "union":                  {"dnadb": "unsupported"},
-    "show_tables":            {"dnadb": "unsupported"},
-    "explain_statement":      {"dnadb": "unsupported"},
+    "join_full": {"mysql": "unsupported"},
 }
 
 BIG_LOAD_SQL = INSERT_BIG

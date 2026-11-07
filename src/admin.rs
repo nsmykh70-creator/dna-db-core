@@ -1540,8 +1540,10 @@ mod tests {
         );
         assert!(storage.contains("stored:"));
 
-        // Explain: SELECT — no DnaQL TX needed for this projection? The
-        // transpiler supports plain SELECT; JOIN is the rejected one.
+        // Explain: SELECT — the /api/explain endpoint returns the transpiled
+        // DnaQL. Since DnaQL v2.2 a JOIN has a native form (the JOIN stage),
+        // so the panel shows the translation; the storage map still names
+        // the locus.
         let (status, body) = http(
             port,
             "POST",
@@ -1551,8 +1553,10 @@ mod tests {
         );
         assert_eq!(status, 200);
         let v: J = serde_json::from_str(&body).unwrap();
-        assert!(v["dnaql"].is_null(), "JOIN must have no DnaQL form");
-        assert!(v["dnaql_error"].as_str().unwrap().contains("JOIN"));
+        assert!(
+            v["dnaql"].as_str().unwrap_or("").contains("JOIN"),
+            "JOIN must now transpile to the v2.2 JOIN stage: {body}"
+        );
         assert!(v["storage"].as_str().unwrap().contains("chr_t"));
 
         // Explain: garbage query -> 400 with both errors reported.

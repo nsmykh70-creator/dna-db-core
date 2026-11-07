@@ -7,9 +7,31 @@
 
 ---
 
-## 0. v3.5.0 verification run — 2026-10-31 (native Linux, latest)
+## 0a. v4.0.0 verification run — SQL conformance 32/32
 
-> This is the current release. The sections below are the historical v3.0–v3.4 runs.
+The canonical run (`python scripts/sql_feature_test.py --skip-mysql --skip-postgres`,
+same SQL text, independent Python oracle) reports for DNA-DB v4.0.0:
+
+```json
+{"dnadb": {"ok": 32, "unsupported": 0, "mismatch": 0, "error": 0, "n/a": 0}}
+```
+
+All ten v3.0 parser gaps are closed (v3.6–v4.0): `IS NOT NULL`, computed
+projections, qualified `ORDER BY`, `RIGHT JOIN`, `FULL [OUTER] JOIN`,
+scalar subqueries, `BEGIN/ROLLBACK`, `UNION`, `SHOW TABLES`, `EXPLAIN`.
+The expectation matrix in the test has been updated (`GAPS`); the
+"documentation vs binary" divergence no longer exists — current
+limitations are documented in [SQL_MANUAL.md §3.5](SQL_MANUAL.md).
+
+Moreover, since **DnaQL v2.2** every one of these commands has a native
+DnaQL form (JOIN/GROUP/UNION/OFFSET/computed EMIT, SHOW/ALTER/INDEX DDL,
+predicate `UPDATE`/`DELETE`, `?=`), and the built-in transpiler
+`SqlEngine::sql_to_dnaql` converts SQL → DnaQL without losing semantics —
+parity is pinned by the `sql_and_dnaql_v22_parity` test.
+
+## 0. v3.5.0 verification run — 2026-10-31 (native Linux, v3.5 release)
+
+> The sections below are the historical v3.0–v3.5 runs.
 
 * **Platform:** Debian 13 (trixie) sandbox, x86_64, 2 vCPU, 4 GB RAM, release profile (`panic = "unwind"`)
 * **Toolchain:** rustc/cargo 1.99.1, Python 3.12.16
@@ -140,7 +162,10 @@ Legend: ✅ statement executed and every returned value matched the reference mo
 
 ---
 
-## 4. DNA-DB — the 10 rejected statements (with real error text)
+## 4. DNA-DB — the 10 rejected statements (v3.0.0 — historical)
+
+> **Status:** all ten gaps are closed in v3.6–v4.0 — see §0a.
+> Kept as the historical v3.0.0 run protocol.
 
 | Feature | Actual response of `dna-db-core 3.0.0` |
 |---|---|
@@ -156,16 +181,21 @@ Legend: ✅ statement executed and every returned value matched the reference mo
 | EXPLAIN \<query\> | `ERR: SQL: unsupported statement starting at Ident("EXPLAIN")` |
 
 These are **parser-level gaps**, not silent wrong behaviour: DNA-DB never fabricates a result.
-Most of them are already declared in [SQL_MANUAL.md §3.5](SQL_MANUAL.md) (no RIGHT/FULL JOIN,
-no UNION, no SQL transactions, materialized-only subqueries).
+(Historically declared in the v3.0 SQL_MANUAL §3.5; all ten were closed in
+v3.6–v4.0 — see §0a; current limitations live in [SQL_MANUAL.md §3.5](SQL_MANUAL.md).)
 
-### Documentation vs. binary — a known discrepancy worth flagging
+### Documentation vs. binary — a known discrepancy worth flagging (CLOSED in v3.6–v4.0)
 
-The binary under test is `dna-db-core 3.0.0` (`Cargo.toml`), while [SQL_MANUAL.md](SQL_MANUAL.md)
-documents the **v3.1** SQL surface. Four documented statements are not in the binary yet:
+> **Status:** this section described the `dna-db-core 3.0.0` binary and is
+> kept for history. All four mentioned statements (`EXPLAIN`,
+> `total_usd * 2` projections, `IS NOT NULL`, `DROP INDEX name ON tbl`)
+> are implemented; SQL conformance is 32/32 (see §0a).
+
+Historical text: the binary under test was `dna-db-core 3.0.0` (`Cargo.toml`), while
+[SQL_MANUAL.md](SQL_MANUAL.md)
+documented the **v3.1** SQL surface. Four documented statements were not in that binary:
 `EXPLAIN`, `total_usd * 2` projections, `IS NOT NULL`, and `DROP INDEX name ON tbl`
-(the binary takes `DROP INDEX name` — that form is what the test uses, so row 28 passes).
-Until v3.1 ships, treat those manual examples as roadmap, not behaviour.
+(the binary took `DROP INDEX name`).
 
 Note also what **does** work and is unusual for a v3 engine: `ORDER BY` on an aggregate alias,
 `HAVING COUNT(*) > 2`, LEFT JOIN NULL extension, aggregates skipping NULLs, PK/FK enforcement, and

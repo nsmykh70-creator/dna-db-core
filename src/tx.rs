@@ -128,6 +128,24 @@ impl TransactionSession {
     pub fn write_set_len(&self) -> usize {
         self.write_set.len()
     }
+
+    /// Buffered (uncommitted) keys carrying this byte prefix, newest-wins
+    /// deduplicated. Used by row-set statements (`UPDATE ... WHERE`,
+    /// `DELETE ... WHERE`) so read-your-writes covers rows an earlier
+    /// statement of the same transaction created or removed.
+    pub fn pending_keys_with_prefix(&self, prefix: &[u8]) -> Vec<Vec<u8>> {
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        for m in self.write_set.iter().rev() {
+            let k = match m {
+                Mutation::PutRow { key, .. } => key,
+                Mutation::Delete { key } => key,
+            };
+            if k.starts_with(prefix) && !out.contains(k) {
+                out.push(k.clone());
+            }
+        }
+        out
+    }
 }
 
 pub struct TransactionCoordinator {

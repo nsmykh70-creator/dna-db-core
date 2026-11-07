@@ -1,7 +1,7 @@
-# Complete guide: SQL and the DNA-DB web panel v3.1
+# Complete guide: SQL and the DNA-DB web panel v4.0
 
 **Official DNA-DB Core documentation.** All examples were verified on a
-built engine (see `cargo test --release`: 152 tests, 0 warnings).
+built engine (see `cargo test --release`: 230 tests).
 
 > **Russian:** [SQL_MANUAL_RU.md](SQL_MANUAL_RU.md)
 
@@ -366,21 +366,29 @@ How it works:
 
 ### 3.5. Limitations (honest list)
 
-- subqueries are materialized (no correlated subqueries) — `IN (SELECT …)`;
-- no `RIGHT JOIN`, `FULL JOIN`, `UNION`, `GROUP BY ROLLUP`;
-- no index-based JOIN plans (JOIN is a hash join on the FK);
-- no transactions in SQL (atomicity goes through batched WAL / DnaQL `TX {}`);
-- no TLS on TCP/HTTP — for remote access use SSH/stunnel/VPN
-  (see README, "Limitations").
+- no `GROUP BY ROLLUP`/`CUBE`, no window frames — the only window
+  functions are `ROW_NUMBER`/`RANK`/`DENSE_RANK`, and they cannot be
+  combined with `GROUP BY`/aggregates;
+- JOIN plans are always hash joins — index-based JOIN plans are not
+  built (point `WHERE pk = …` lookups and index ranges are planned);
+- `ALTER TABLE` supports only `ADD COLUMN` (metadata-only, instant);
+  DROP/RENAME column and type changes are not supported;
+- scalar/correlated subqueries, `EXISTS` and CTEs (`WITH`) are
+  supported (since v3.6), but `LATERAL` and recursive CTEs are not;
+- `RIGHT/FULL JOIN`, `UNION [ALL]` and SQL transactions
+  (`BEGIN/COMMIT/ROLLBACK`) shipped in v3.6.
+
+The current list of honest platform-level limitations lives in
+[RELEASE_NOTES_v4.0.0.md](RELEASE_NOTES_v4.0.0.md).
 
 ---
 
 ## Chapter 4. Tests — how to reproduce
 
 ```bash
-cargo test --release              # 152 tests: 139 lib + 13 integration
-python3 scripts/kill9_test.py     # kill -9: 99 091 records, 0 lost
-python3 scripts/chaos_test.py     # corrupt 80 sectors -> doctor --fix -> 100%
+cargo test --release              # 230 tests: 199 lib + 31 integration
+python3 scripts/kill9_test.py     # kill -9: no records lost
+python3 scripts/chaos_test.py     # sector corruption -> self-healing
 ./target/release/dna-db-core bench # real CPU/disk measurements
 ```
 

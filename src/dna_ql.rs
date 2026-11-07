@@ -1,28 +1,47 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! DnaQL (DNA Query Language) v2.1 — REAL tokenizer, parser and executor.
+//! DnaQL (DNA Query Language) v2.2 — REAL tokenizer, parser and executor.
 //!
 //! Implemented grammar (subset of DNAQL_SPEC.md, fully functional):
 //!
 //!   Query      ::= PatternSearch | PipelineQuery | TxBlock | BioAnalysis
+//!               |  HealthCheck | CreateChromosome | DropChromosome
+//!               |  AlterChromosome | CreateIndex | DropIndex
+//!               |  ShowChromosomes | Explain
 //!   QuickSearch::= Ident '?' StringLit ['~' Int | '*' Int]
 //!                  ['->' Ident ['(' Ident ')']] ['=>' 'emit' Projection] [';']
 //!   StdSearch  ::= 'FIND' ['PATTERN'] StringLit 'IN' ['CHROMOSOME'] Ident
 //!                  ['WHERE' ('HAMMING_DISTANCE'|'LEVENSHTEIN_DISTANCE') '<=' Int]
 //!                  ['LINK' Ident 'VIA' 'COMPLEMENT' '(' Ident ')']
 //!                  ['EMIT' Projection] [';']
-//!   Pipeline   ::= 'FROM' Ident ( '|>' Stage )*
+//!   Pipeline   ::= 'FROM' Ident ( '|>' Stage )* ['UNION' ['ALL'] Pipeline Tail]*
 //!   Stage      ::= 'LINK' Ident ['VIA' 'COMPLEMENT' '(' Ident ')']
 //!               |  'WHERE' Expr
-//!               |  'EMIT' Projection
+//!               |  'EMIT' EmitList
+//!               |  'SORT' Ident ['ASC'|'DESC']
+//!               |  'LIMIT' Int | 'OFFSET' Int
+//!               |  'GROUP' ['BY' IdentList] 'AGG' Name '=' Fn '(' [Ident] ')' (',' ...)*
+//!               |  Join
+//!   Join       ::= ['INNER'] JOIN Ident 'ON' Ident '=' Ident
+//!               |  (LEFT|RIGHT|FULL) ['OUTER'] JOIN Ident 'ON' Ident '=' Ident
 //!   TxBlock    ::= 'TX' '{' Stmt (';' Stmt)* '}'
 //!               |  'SYNTHESIZE' 'INTO' IdentList 'BEGIN' StmtList ('LIGATE'|'HYDROLYZE')
 //!   Stmt       ::= Ident ':' Int '.' Ident ('='|'+='|'-=') Literal
-//!               |  Ident ':' Int '+=' '{' KVList '}'
+//!               |  Ident ':' Int ('+='|'?=') '{' KVList '}'
+//!               |  Ident '?=' '{' KVList '}'        (insert-if-absent)
 //!               |  'DROP' 'LOCUS' Ident ':' Int ['CASCADE']
-//!   Bio        ::= 'ANALYZE' ('SEQUENCE' StringLit | 'LOCUS' Ident ':' Int)
-//!                  ( '|>' BioFn )*
-//!   BioFn      ::= 'GC_CONTENT()' | 'MELTING_TEMP()' | 'REV_COMP()'
-//!               |  'TRANSCRIBE()' | 'TRANSLATE()'
+//!   DDL        ::= 'CREATE' ['UNIQUE'] 'INDEX' Ident 'ON' Ident '(' Ident ')'
+//!               |  'DROP' 'INDEX' Ident ['ON' Ident]
+//!               |  'ALTER' 'CHROMOSOME' Ident 'ADD' 'COLUMN' Ident Type
+//!               |  'SHOW' ('CHROMOSOMES'|'TABLES')
+//!   Explain    ::= 'EXPLAIN' (Pipeline|PatternSearch)
+//!
+//! The v2.2 extension brings DnaQL to full surface parity with the SQL
+//! engine (JOIN, GROUP BY + aggregates, OFFSET, computed EMIT, UNION,
+//! SHOW / ALTER / CREATE INDEX / DROP INDEX), so every SQL statement has a
+//! native DnaQL spelling and `sql_to_dnaql` can translate losslessly.
+//! Join and aggregate semantics mirror sql_engine exactly (hash join with
+//! `joined_` conflict renaming, NULL-extension for outer joins, aggregates
+//! skipping NULLs).
 //!
 //! Execution reads/writes the REAL Engine storage:
 //!   rows: '<table>:<pk>' -> RowCodec payloads (field 'sequence' = Value::Dna)
@@ -91,13 +110,51 @@ pub enum DnaQlAst {
         table: String,
         if_exists: bool,
     },
+    /// `ALTER CHROMOSOME name ADD COLUMN col TYPE` (v2.2) — rendered through
+    /// the SQL engine's metadata-only online DDL.
+    AlterChromosome {
+        table: String,
+        column: String,
+        /// Raw type spelling (INT, FLOAT, TEXT, DNA, TIMESTAMP, ...).
+        col_type: String,
+    },
+    /// `CREATE [UNIQUE] INDEX name ON chromosome (col)` (v2.2) — rendered
+    /// through the SQL engine so both dialects share one index registry.
+    CreateIndex {
+        name: String,
+        table: String,
+        column: String,
+        unique: bool,
+        if_not_exists: bool,
+    },
+    /// `DROP INDEX name [ON chromosome]` (v2.2).
+    DropIndex {
+        name: String,
+        table: Option<String>,
+        if_exists: bool,
+    },
+    /// `SHOW CHROMOSOMES` (alias `SHOW TABLES`) — table introspection.
+    ShowChromosomes,
+    /// `EXPLAIN <read-only query>` (v2.2): executes the query (reads are
+    /// side-effect free) and reports the plan instead of the rows. Write
+    /// queries are rejected without executing.
+    Explain(Box<DnaQlAst>),
+    /// `Pipeline UNION [ALL] Pipeline [SORT/LIMIT/OFFSET tail]` (v2.2).
+    /// Mirrors SQL: column names come from the left side, DISTINCT (default)
+    /// dedups full rows, tail stages apply to the compound result.
+    Union {
+        left: Box<DnaQlAst>,
+        right: Box<DnaQlAst>,
+        all: bool,
+        tail: Vec<PipelineStage>,
+    },
 }
 
 #[derive(Debug, Clone)]
 pub enum PipelineStage {
     Link(Option<LinkSpec>),
     Filter(Expr),
-    Emit(Vec<String>),
+    Emit(Vec<EmitItem>),
     /// `|> SORT column [ASC|DESC]` — order the rows (was SQL-only before).
     Sort {
         column: String,
@@ -105,6 +162,83 @@ pub enum PipelineStage {
     },
     /// `|> LIMIT n` — keep the first n rows after the previous stage.
     Limit(usize),
+    /// `|> OFFSET n` (v2.2) — skip the first n rows (SQL OFFSET semantics;
+    /// applies before LIMIT).
+    Offset(usize),
+    /// `|> JOIN / LEFT / RIGHT / FULL [OUTER] JOIN t ON l = r` (v2.2) —
+    /// hash equi-join mirroring the SQL engine (single-namespace rows,
+    /// `joined_` conflict renaming, NULL-extension for outer sides).
+    Join(JoinSpec),
+    /// `|> GROUP [BY cols] AGG name = FN(col), ...` (v2.2) — aggregation
+    /// mirroring the SQL engine (NULLs skipped, Int sum stays Int, AVG is
+    /// Float, empty input + no GROUP BY yields one row). Without AGG the
+    /// stage projects only the group columns (DISTINCT semantics).
+    Group {
+        by: Vec<String>,
+        aggs: Vec<(String, AggFunc, Option<String>)>,
+    },
+}
+
+/// SQL surface join kinds (v2.2). DnaQL spells INNER as bare `JOIN`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    Inner,
+    Left,
+    Right,
+    Full,
+}
+
+/// One equi-join stage: `JOIN <chromosome> ON <left_col> = <right_col>`.
+/// `left_col` addresses the accumulated stream, `right_col` the joined
+/// chromosome (bare names — DnaQL rows are single-namespace).
+#[derive(Debug, Clone)]
+pub struct JoinSpec {
+    pub kind: JoinKind,
+    pub chromosome: String,
+    pub left_col: String,
+    pub right_col: String,
+}
+
+/// Aggregate functions available in `|> GROUP ... AGG name = FN(col)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggFunc {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+impl AggFunc {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AggFunc::Count => "COUNT",
+            AggFunc::Sum => "SUM",
+            AggFunc::Avg => "AVG",
+            AggFunc::Min => "MIN",
+            AggFunc::Max => "MAX",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_uppercase().as_str() {
+            "COUNT" => Some(AggFunc::Count),
+            "SUM" => Some(AggFunc::Sum),
+            "AVG" => Some(AggFunc::Avg),
+            "MIN" => Some(AggFunc::Min),
+            "MAX" => Some(AggFunc::Max),
+            _ => None,
+        }
+    }
+}
+
+/// One EMIT item (v2.2): a bare column, `*`, or a computed expression with
+/// an optional `AS alias` (`|> EMIT total_usd * 2 AS double`).
+#[derive(Debug, Clone)]
+pub enum EmitItem {
+    Star,
+    Col(String),
+    Computed { expr: Expr, alias: String },
 }
 
 #[derive(Debug, Clone)]
@@ -123,11 +257,33 @@ pub enum TxStmt {
         locus: i64,
         fields: Vec<(String, Value)>,
     },
+    /// chr:locus ?= { k: v, ... } (v2.2) — insert ONLY when the locus is
+    /// absent; an existing locus is left untouched. This is the DnaQL
+    /// spelling of SQL `INSERT ... ON CONFLICT DO NOTHING`.
+    InsertIfAbsent {
+        table: String,
+        locus: i64,
+        fields: Vec<(String, Value)>,
+    },
     /// DROP LOCUS chr:locus [CASCADE]
     DropLocus {
         table: String,
         locus: i64,
         cascade: bool,
+    },
+    /// `UPDATE chr SET f = v, ... [WHERE expr]` (v2.2) — row-set update
+    /// mirroring SQL UPDATE (no WHERE = every row). Literal assignments only
+    /// (same as the SQL engine's UPDATE grammar).
+    UpdateRows {
+        table: String,
+        assignments: Vec<(String, Value)>,
+        where_clause: Option<Expr>,
+    },
+    /// `DELETE FROM chr [WHERE expr]` (v2.2) — row-set delete mirroring SQL
+    /// DELETE, including one-level FK CASCADE and honest RESTRICT errors.
+    DeleteRows {
+        table: String,
+        where_clause: Option<Expr>,
     },
 }
 
@@ -162,6 +318,7 @@ enum Tok {
     Float(f64),
     Str(String),
     Question,  // ?
+    QuestionEq, // ?= (insert-if-absent)
     Tilde,     // ~
     Arrow,     // ->
     Pipe,      // |>
@@ -231,6 +388,10 @@ fn tokenize(input: &str) -> Result<Vec<Tok>, String> {
             }
             '!' if i + 1 < b.len() && b[i + 1] == '=' => {
                 toks.push(Tok::Ne);
+                i += 2;
+            }
+            '?' if i + 1 < b.len() && b[i + 1] == '=' => {
+                toks.push(Tok::QuestionEq);
                 i += 2;
             }
             '?' => {
@@ -371,6 +532,10 @@ struct Parser {
     /// recursion cycles go through `parse_or`, so guarding it bounds the
     /// whole grammar.
     depth: usize,
+    /// v2.2: while parsing the RIGHT side of a UNION, SORT/LIMIT/OFFSET
+    /// stages belong to the compound result (SQL semantics) — the pipeline
+    /// stage loop stops and leaves them for the UNION tail.
+    hold_tail: bool,
 }
 
 /// Maximum expression nesting accepted by the DnaQL parser.
@@ -382,6 +547,7 @@ impl Parser {
             toks,
             pos: 0,
             depth: 0,
+            hold_tail: false,
         }
     }
 
@@ -462,7 +628,7 @@ impl Parser {
     }
 
     fn parse_query(&mut self) -> Result<DnaQlAst, String> {
-        match self.peek().clone() {
+        let query = match self.peek().clone() {
             Tok::Ident(s) if s.eq_ignore_ascii_case("FIND") => self.parse_standard_search(),
             Tok::Ident(s) if s.eq_ignore_ascii_case("FROM") => self.parse_pipeline(),
             Tok::Ident(s) if s.eq_ignore_ascii_case("TX") => self.parse_tx(),
@@ -470,10 +636,112 @@ impl Parser {
             Tok::Ident(s) if s.eq_ignore_ascii_case("ANALYZE") => self.parse_bio(),
             Tok::Ident(s) if s.eq_ignore_ascii_case("VERIFY") => self.parse_health_check(false),
             Tok::Ident(s) if s.eq_ignore_ascii_case("REPAIR") => self.parse_health_check(true),
-            Tok::Ident(s) if s.eq_ignore_ascii_case("CREATE") => self.parse_create_chromosome(),
-            Tok::Ident(s) if s.eq_ignore_ascii_case("DROP") => self.parse_drop_chromosome(),
+            Tok::Ident(s) if s.eq_ignore_ascii_case("CREATE") => self.parse_create(),
+            Tok::Ident(s) if s.eq_ignore_ascii_case("DROP") => self.parse_drop(),
+            Tok::Ident(s) if s.eq_ignore_ascii_case("ALTER") => self.parse_alter_chromosome(),
+            Tok::Ident(s) if s.eq_ignore_ascii_case("SHOW") => self.parse_show(),
+            Tok::Ident(s) if s.eq_ignore_ascii_case("EXPLAIN") => self.parse_explain(),
+            Tok::Ident(s) if s.eq_ignore_ascii_case("UPDATE") => {
+                // Top-level row-set update: auto-wrapped in one atomic TX
+                // (single-statement autocommit, same as SQL). The UPDATE
+                // keyword is consumed here; parse_update_rows starts at the
+                // table name (the same helper serves TX blocks).
+                self.next();
+                let stmt = self.parse_update_rows()?;
+                if matches!(self.peek(), Tok::Semicolon) {
+                    self.next();
+                }
+                Ok(DnaQlAst::Tx {
+                    statements: vec![stmt],
+                })
+            }
+            Tok::Ident(s) if s.eq_ignore_ascii_case("DELETE") => {
+                self.next();
+                let stmt = self.parse_delete_rows()?;
+                if matches!(self.peek(), Tok::Semicolon) {
+                    self.next();
+                }
+                Ok(DnaQlAst::Tx {
+                    statements: vec![stmt],
+                })
+            }
             Tok::Ident(_) => self.parse_quick_search(),
             t => Err(format!("DnaQL: unexpected token {:?}", t)),
+        }?;
+        // v2.2: `pipeline UNION [ALL] pipeline [tail stages]` — compound set
+        // operation mirroring SQL. The tail accepts SORT/LIMIT/OFFSET only
+        // (same restriction as the SQL engine's UNION).
+        if matches!(query, DnaQlAst::PipelineQuery { .. }) && self.kw("UNION") {
+            let all = if self.kw("ALL") {
+                true
+            } else {
+                self.kw("DISTINCT");
+                false
+            };
+            self.hold_tail = true;
+            let right = self.parse_pipeline()?;
+            self.hold_tail = false;
+            let mut tail = Vec::new();
+            while matches!(self.peek(), Tok::Pipe) {
+                tail.push(self.parse_tail_stage()?);
+            }
+            if matches!(self.peek(), Tok::Semicolon) {
+                self.next();
+            }
+            return Ok(DnaQlAst::Union {
+                left: Box::new(query),
+                right: Box::new(right),
+                all,
+                tail,
+            });
+        }
+        // Strict tail check (same discipline as the SQL parser): anything
+        // that is not EOF after the query is a parse error, never silence.
+        match self.peek() {
+            Tok::Eof => {}
+            Tok::Semicolon => {
+                self.next();
+            }
+            other => {
+                return Err(format!(
+                    "DnaQL: unexpected trailing tokens starting at {:?}",
+                    other
+                ))
+            }
+        }
+        Ok(query)
+    }
+
+    /// Tail stages after UNION: SORT / LIMIT / OFFSET (applied to the
+    /// compound result — same as the SQL engine's top-level ORDER BY/LIMIT).
+    fn parse_tail_stage(&mut self) -> Result<PipelineStage, String> {
+        self.next(); // |>
+        if self.kw("SORT") {
+            let column = self.ident()?;
+            let asc = if self.kw("DESC") {
+                false
+            } else {
+                self.kw("ASC");
+                true
+            };
+            Ok(PipelineStage::Sort { column, asc })
+        } else if self.kw("LIMIT") {
+            let n = self.int()?;
+            if n < 0 {
+                return Err("DnaQL: LIMIT expects a non-negative integer".into());
+            }
+            Ok(PipelineStage::Limit(n as usize))
+        } else if self.kw("OFFSET") {
+            let n = self.int()?;
+            if n < 0 {
+                return Err("DnaQL: OFFSET expects a non-negative integer".into());
+            }
+            Ok(PipelineStage::Offset(n as usize))
+        } else {
+            Err(format!(
+                "DnaQL: UNION tail accepts SORT/LIMIT/OFFSET, got {:?}",
+                self.peek()
+            ))
         }
     }
 
@@ -497,21 +765,14 @@ impl Parser {
         Ok(DnaQlAst::HealthCheck { chromosome, fix })
     }
 
-    /// CREATE CHROMOSOME <name> [IF NOT EXISTS] (col TYPE, ...);
-    /// The parenthesis body is collected as raw definition clauses at top
-    /// comma level: "id INT", "PRIMARY KEY (id)", "FOREIGN KEY ...
-    /// REFERENCES ..." with nested parens kept intact. Types and constraints
-    /// are validated when the rendered CREATE TABLE runs through the SQL
-    /// engine. Without an explicit PRIMARY KEY the first column is the locus.
-    fn parse_create_chromosome(&mut self) -> Result<DnaQlAst, String> {
-        self.next(); // CREATE
-        let kw = self.ident()?;
-        if !kw.eq_ignore_ascii_case("CHROMOSOME") {
-            return Err(format!(
-                "DnaQL: expected CHROMOSOME after CREATE, got {:?}",
-                kw
-            ));
-        }
+    /// CREATE CHROMOSOME body after the `CREATE CHROMOSOME` keyword pair:
+    /// name, [IF NOT EXISTS], (col TYPE, ..., PRIMARY KEY (...), FOREIGN KEY
+    /// ... REFERENCES ...). The parenthesis body is collected as raw
+    /// definition clauses at top comma level, with nested parens kept
+    /// intact. Types and constraints are validated when the rendered CREATE
+    /// TABLE runs through the SQL engine. Without an explicit PRIMARY KEY
+    /// the first column is the locus.
+    fn parse_chromosome_body(&mut self) -> Result<DnaQlAst, String> {
         let table = self.ident()?;
         let if_not_exists = if self.kw("IF") {
             self.expect_kw("NOT")?;
@@ -601,16 +862,9 @@ impl Parser {
         })
     }
 
-    /// DROP CHROMOSOME <name> [IF EXISTS];
-    fn parse_drop_chromosome(&mut self) -> Result<DnaQlAst, String> {
-        self.next(); // DROP
-        let kw = self.ident()?;
-        if !kw.eq_ignore_ascii_case("CHROMOSOME") {
-            return Err(format!(
-                "DnaQL: expected CHROMOSOME after DROP, got {:?}",
-                kw
-            ));
-        }
+    /// DROP CHROMOSOME body after the `DROP CHROMOSOME` keyword pair:
+    /// name [IF EXISTS];
+    fn parse_chromosome_drop_tail(&mut self) -> Result<DnaQlAst, String> {
         let table = self.ident()?;
         let if_exists = if self.kw("IF") {
             self.expect_kw("EXISTS")?;
@@ -622,6 +876,131 @@ impl Parser {
             self.next();
         }
         Ok(DnaQlAst::DropChromosome { table, if_exists })
+    }
+
+    /// CREATE dispatch: CHROMOSOME (existing DDL) or [UNIQUE] INDEX (v2.2).
+    fn parse_create(&mut self) -> Result<DnaQlAst, String> {
+        self.next(); // CREATE
+        if self.kw("UNIQUE") {
+            self.expect_kw("INDEX")?;
+            return self.parse_index_tail(true);
+        }
+        if self.kw("INDEX") {
+            return self.parse_index_tail(false);
+        }
+        self.expect_kw("CHROMOSOME")?;
+        self.parse_chromosome_body()
+    }
+
+    /// `CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON chromosome (col);`
+    /// (IF NOT EXISTS in the SQL position — before the name.)
+    fn parse_index_tail(&mut self, unique: bool) -> Result<DnaQlAst, String> {
+        let if_not_exists = if self.kw("IF") {
+            self.expect_kw("NOT")?;
+            self.expect_kw("EXISTS")?;
+            true
+        } else {
+            false
+        };
+        let name = self.ident()?;
+        self.expect_kw("ON")?;
+        let table = self.ident()?;
+        self.expect(Tok::LParen)?;
+        let column = self.ident()?;
+        self.expect(Tok::RParen)?;
+        if matches!(self.peek(), Tok::Semicolon) {
+            self.next();
+        }
+        Ok(DnaQlAst::CreateIndex {
+            name,
+            table,
+            column,
+            unique,
+            if_not_exists,
+        })
+    }
+
+    /// DROP dispatch: CHROMOSOME (existing DDL) or INDEX (v2.2).
+    /// `DROP INDEX [IF EXISTS] name [ON chromosome];`
+    fn parse_drop(&mut self) -> Result<DnaQlAst, String> {
+        self.next(); // DROP
+        if self.kw("INDEX") {
+            let if_exists = if self.kw("IF") {
+                self.expect_kw("EXISTS")?;
+                true
+            } else {
+                false
+            };
+            let name = self.ident()?;
+            let table = if self.kw("ON") {
+                Some(self.ident()?)
+            } else {
+                None
+            };
+            if matches!(self.peek(), Tok::Semicolon) {
+                self.next();
+            }
+            return Ok(DnaQlAst::DropIndex {
+                name,
+                table,
+                if_exists,
+            });
+        }
+        self.expect_kw("CHROMOSOME")?;
+        self.parse_chromosome_drop_tail()
+    }
+
+    /// `ALTER CHROMOSOME t ADD COLUMN c TYPE;` (v2.2) — metadata-only online
+    /// DDL rendered through the SQL engine.
+    fn parse_alter_chromosome(&mut self) -> Result<DnaQlAst, String> {
+        self.next(); // ALTER
+        self.expect_kw("CHROMOSOME")?;
+        let table = self.ident()?;
+        self.expect_kw("ADD")?;
+        self.expect_kw("COLUMN")?;
+        let column = self.ident()?;
+        let col_type = self.ident()?;
+        if matches!(self.peek(), Tok::Semicolon) {
+            self.next();
+        }
+        Ok(DnaQlAst::AlterChromosome {
+            table,
+            column,
+            col_type,
+        })
+    }
+
+    /// `SHOW CHROMOSOMES;` (alias `SHOW TABLES;`) — v2.2.
+    fn parse_show(&mut self) -> Result<DnaQlAst, String> {
+        self.next(); // SHOW
+        if self.kw("CHROMOSOMES") || self.kw("TABLES") {
+            if matches!(self.peek(), Tok::Semicolon) {
+                self.next();
+            }
+            return Ok(DnaQlAst::ShowChromosomes);
+        }
+        Err(format!(
+            "DnaQL: expected CHROMOSOMES or TABLES after SHOW, got {:?}",
+            self.peek()
+        ))
+    }
+
+    /// `EXPLAIN <read-only query>;` (v2.2) — report the execution plan
+    /// instead of the rows. Only reads (pipeline/pattern search) are
+    /// accepted; writes would execute, so they are rejected up front.
+    fn parse_explain(&mut self) -> Result<DnaQlAst, String> {
+        self.next(); // EXPLAIN
+        let inner = match self.peek().clone() {
+            Tok::Ident(s) if s.eq_ignore_ascii_case("FROM") => self.parse_pipeline()?,
+            Tok::Ident(s) if s.eq_ignore_ascii_case("FIND") => self.parse_standard_search()?,
+            t => {
+                return Err(format!(
+                    "DnaQL: EXPLAIN accepts FROM-pipelines and FIND-searches, got {:?}",
+                    t
+                ))
+            }
+        };
+        Ok(DnaQlAst::Explain(Box::new(inner)))
     }
 
     // Quick: chr ? 'PAT' ~K -> chr2(col) => emit a,b ;
@@ -747,6 +1126,7 @@ impl Parser {
     }
 
     // FROM chr |> LINK chr2 VIA COMPLEMENT(col) |> WHERE expr |> EMIT a,b
+    //    |> JOIN t2 ON a = b |> GROUP BY g AGG n = COUNT(*) |> SORT x |> OFFSET n |> LIMIT n
     fn parse_pipeline(&mut self) -> Result<DnaQlAst, String> {
         self.expect_kw("FROM")?;
         let source = self.ident()?;
@@ -770,9 +1150,14 @@ impl Parser {
                 let e = self.parse_expr()?;
                 stages.push(PipelineStage::Filter(e));
             } else if self.kw("EMIT") {
-                let p = self.parse_projection()?;
+                let p = self.parse_emit_items()?;
                 stages.push(PipelineStage::Emit(p));
             } else if self.kw("SORT") {
+                if self.hold_tail {
+                    // rewind keyword + pipe: SORT belongs to the UNION tail
+                    self.pos -= 2;
+                    break;
+                }
                 let column = self.ident()?;
                 let asc = if self.kw("DESC") {
                     false
@@ -782,11 +1167,44 @@ impl Parser {
                 };
                 stages.push(PipelineStage::Sort { column, asc });
             } else if self.kw("LIMIT") {
+                if self.hold_tail {
+                    self.pos -= 2; // keyword + pipe
+                    break;
+                }
                 let n = self.int()?;
                 if n < 0 {
                     return Err("DnaQL: LIMIT expects a non-negative integer".into());
                 }
                 stages.push(PipelineStage::Limit(n as usize));
+            } else if self.kw("OFFSET") {
+                if self.hold_tail {
+                    self.pos -= 2; // keyword + pipe
+                    break;
+                }
+                let n = self.int()?;
+                if n < 0 {
+                    return Err("DnaQL: OFFSET expects a non-negative integer".into());
+                }
+                stages.push(PipelineStage::Offset(n as usize));
+            } else if self.kw("GROUP") {
+                stages.push(self.parse_group_stage()?);
+            } else if self.kw("JOIN") {
+                stages.push(self.parse_join_tail(JoinKind::Inner)?);
+            } else if self.kw("INNER") {
+                self.expect_kw("JOIN")?;
+                stages.push(self.parse_join_tail(JoinKind::Inner)?);
+            } else if self.kw("LEFT") {
+                self.kw("OUTER");
+                self.expect_kw("JOIN")?;
+                stages.push(self.parse_join_tail(JoinKind::Left)?);
+            } else if self.kw("RIGHT") {
+                self.kw("OUTER");
+                self.expect_kw("JOIN")?;
+                stages.push(self.parse_join_tail(JoinKind::Right)?);
+            } else if self.kw("FULL") {
+                self.kw("OUTER");
+                self.expect_kw("JOIN")?;
+                stages.push(self.parse_join_tail(JoinKind::Full)?);
             } else {
                 return Err(format!("DnaQL: unknown pipeline stage {:?}", self.peek()));
             }
@@ -795,6 +1213,165 @@ impl Parser {
             self.next();
         }
         Ok(DnaQlAst::PipelineQuery { source, stages })
+    }
+
+    /// JOIN tail after the JOIN keyword: `chr ON left_col = right_col`.
+    /// Qualified names (`t.col`) are accepted and stripped — DnaQL rows are
+    /// single-namespace, mirroring the SQL engine's row model.
+    fn parse_join_tail(&mut self, kind: JoinKind) -> Result<PipelineStage, String> {
+        let chromosome = self.ident()?;
+        self.expect_kw("ON")?;
+        let left_col = self.parse_join_column()?;
+        self.expect(Tok::Eq)?;
+        let right_col = self.parse_join_column()?;
+        Ok(PipelineStage::Join(JoinSpec {
+            kind,
+            chromosome,
+            left_col,
+            right_col,
+        }))
+    }
+
+    /// One side of an ON clause: bare identifier, optionally qualified
+    /// (`t.col` / `alias.col`) — the qualifier is stripped.
+    fn parse_join_column(&mut self) -> Result<String, String> {
+        let mut col = self.ident()?;
+        if matches!(self.peek(), Tok::Dot) {
+            self.next();
+            col = self.ident()?;
+        }
+        Ok(col)
+    }
+
+    /// `|> GROUP [BY col, ...] AGG name = FN(col), ...`
+    /// AGG is required only when BY is omitted (otherwise the stage is a
+    /// DISTINCT-style projection of the group columns).
+    fn parse_group_stage(&mut self) -> Result<PipelineStage, String> {
+        let mut by = Vec::new();
+        if self.kw("BY") {
+            loop {
+                by.push(self.ident()?);
+                if matches!(self.peek(), Tok::Comma) {
+                    self.next();
+                } else {
+                    break;
+                }
+            }
+        }
+        let mut aggs = Vec::new();
+        if self.kw("AGG") {
+            loop {
+                let name = self.ident()?;
+                self.expect(Tok::Eq)?;
+                let func_name = self.ident()?;
+                let func = AggFunc::from_name(&func_name)
+                    .ok_or_else(|| format!("DnaQL: unknown aggregate function '{}'", func_name))?;
+                self.expect(Tok::LParen)?;
+                let arg = if matches!(self.peek(), Tok::Star) {
+                    self.next();
+                    if func != AggFunc::Count {
+                        return Err("DnaQL: only COUNT accepts (*)".into());
+                    }
+                    None
+                } else if matches!(self.peek(), Tok::RParen) {
+                    if func == AggFunc::Count {
+                        // COUNT() == COUNT(*) — accepted for convenience.
+                        None
+                    } else {
+                        return Err(format!(
+                            "DnaQL: {} requires a column argument",
+                            func.as_str()
+                        ));
+                    }
+                } else {
+                    Some(self.ident()?)
+                };
+                self.expect(Tok::RParen)?;
+                aggs.push((name, func, arg));
+                if matches!(self.peek(), Tok::Comma) {
+                    self.next();
+                } else {
+                    break;
+                }
+            }
+        }
+        if by.is_empty() && aggs.is_empty() {
+            return Err("DnaQL: GROUP needs BY columns and/or AGG items".into());
+        }
+        Ok(PipelineStage::Group { by, aggs })
+    }
+
+    /// EMIT list (v2.2): `*`, bare columns, and computed expressions with
+    /// optional aliases — `EMIT user_id, total_usd * 2 AS double`.
+    fn parse_emit_items(&mut self) -> Result<Vec<EmitItem>, String> {
+        let mut out = Vec::new();
+        if matches!(self.peek(), Tok::Star) {
+            self.next();
+            return Ok(vec![EmitItem::Star]);
+        }
+        loop {
+            // Bare column when the item is a single identifier (no AS tail,
+            // no arithmetic that would make it a computed expression).
+            let start = self.pos;
+            if let Tok::Ident(name) = self.peek().clone() {
+                self.next();
+                let qualified = matches!(self.peek(), Tok::Dot);
+                let aliased = self.kw("AS");
+                // An arithmetic operator right after the identifier means
+                // this item is a computed expression (`balance * 2 AS x`).
+                let arithmetic = matches!(
+                    self.peek(),
+                    Tok::Plus | Tok::Minus | Tok::Star | Tok::Slash
+                );
+                if !qualified && !aliased && !arithmetic {
+                    out.push(EmitItem::Col(name));
+                    if matches!(self.peek(), Tok::Comma) {
+                        self.next();
+                        continue;
+                    }
+                    break;
+                }
+                if arithmetic || (qualified && aliased) {
+                    // Rewind and parse the full expression.
+                    self.pos = start;
+                    let expr = self.parse_expr()?;
+                    self.expect_kw("AS")?;
+                    let alias = self.ident()?;
+                    out.push(EmitItem::Computed { expr, alias });
+                } else if aliased {
+                    if qualified {
+                        return Err("DnaQL: alias a bare column, not a qualified name".into());
+                    }
+                    let alias = self.ident()?;
+                    out.push(EmitItem::Computed {
+                        expr: Expr::Column(name),
+                        alias,
+                    });
+                } else {
+                    // Qualified column reference: strip the qualifier.
+                    self.expect(Tok::Dot)?;
+                    let bare = self.ident()?;
+                    out.push(EmitItem::Col(bare));
+                }
+                if matches!(self.peek(), Tok::Comma) {
+                    self.next();
+                    continue;
+                }
+                break;
+            }
+            self.pos = start;
+            // Computed expression: `expr AS alias`.
+            let expr = self.parse_expr()?;
+            self.expect_kw("AS")?;
+            let alias = self.ident()?;
+            out.push(EmitItem::Computed { expr, alias });
+            if matches!(self.peek(), Tok::Comma) {
+                self.next();
+                continue;
+            }
+            break;
+        }
+        Ok(out)
     }
 
     // TX { stmt; stmt; ... }
@@ -857,34 +1434,49 @@ impl Parser {
                 cascade,
             });
         }
+        // v2.2: row-set statements inside TX blocks.
+        if self.kw("UPDATE") {
+            return self.parse_update_rows();
+        }
+        if self.kw("DELETE") {
+            return self.parse_delete_rows();
+        }
         let table = self.ident()?;
 
-        if matches!(self.peek(), Tok::PlusEq) {
-            // chr += { k: v, ... } — auto-locus from the PK-like field (*_id / id)
+        // Explicit locus: `chr:locus (+= { ... } | ?= { ... } | .field = v)`.
+        let explicit_locus = if matches!(self.peek(), Tok::Colon) {
+            self.next();
+            Some(self.int()?)
+        } else {
+            None
+        };
+
+        // v2.2: `?=` — insert-if-absent (SQL ON CONFLICT DO NOTHING spelling).
+        if matches!(self.peek(), Tok::QuestionEq) {
             self.next();
             self.expect(Tok::LBrace)?;
-            let mut fields = Vec::new();
-            loop {
-                if matches!(self.peek(), Tok::RBrace) {
-                    self.next();
-                    break;
-                }
-                let k = self.ident()?;
-                self.expect(Tok::Colon)?;
-                let v = self.parse_value()?;
-                fields.push((k, v));
-                if matches!(self.peek(), Tok::Comma) {
-                    self.next();
-                }
-            }
-            let locus = fields
-                .iter()
-                .find(|(k, v)| (k == "id" || k.ends_with("_id")) && matches!(v, Value::Int(_)))
-                .and_then(|(_, v)| match v {
-                    Value::Int(i) => Some(*i),
-                    _ => None,
-                })
-                .ok_or("DnaQL: append without explicit locus needs an integer '<...>_id' field")?;
+            let fields = self.parse_kv_fields()?;
+            let locus = match explicit_locus {
+                Some(l) => l,
+                None => auto_locus(&fields)?,
+            };
+            return Ok(TxStmt::InsertIfAbsent {
+                table,
+                locus,
+                fields,
+            });
+        }
+
+        if matches!(self.peek(), Tok::PlusEq) {
+            // chr += { k: v, ... } (auto-locus from the PK-like field) or
+            // chr:locus += { k: v, ... }.
+            self.next();
+            self.expect(Tok::LBrace)?;
+            let fields = self.parse_kv_fields()?;
+            let locus = match explicit_locus {
+                Some(l) => l,
+                None => auto_locus(&fields)?,
+            };
             return Ok(TxStmt::Append {
                 table,
                 locus,
@@ -892,33 +1484,13 @@ impl Parser {
             });
         }
 
-        self.expect(Tok::Colon)?;
-        let locus = self.int()?;
-
-        if matches!(self.peek(), Tok::PlusEq) {
-            // chr:locus += { k: v, ... }
-            self.next();
-            self.expect(Tok::LBrace)?;
-            let mut fields = Vec::new();
-            loop {
-                if matches!(self.peek(), Tok::RBrace) {
-                    self.next();
-                    break;
-                }
-                let k = self.ident()?;
-                self.expect(Tok::Colon)?;
-                let v = self.parse_value()?;
-                fields.push((k, v));
-                if matches!(self.peek(), Tok::Comma) {
-                    self.next();
-                }
-            }
-            return Ok(TxStmt::Append {
+        let locus = explicit_locus.ok_or_else(|| {
+            format!(
+                "DnaQL: expected ':', '+=' or '?=' after chromosome '{}', got {:?}",
                 table,
-                locus,
-                fields,
-            });
-        }
+                self.peek()
+            )
+        })?;
 
         // field path: .field
         self.expect(Tok::Dot)?;
@@ -937,6 +1509,69 @@ impl Parser {
             op,
             value,
         })
+    }
+
+    /// `UPDATE chr SET f = v, ... [WHERE expr]` (v2.2). Shared by the
+    /// top-level dispatch (auto-wrapped in a one-statement TX) and TX blocks.
+    fn parse_update_rows(&mut self) -> Result<TxStmt, String> {
+        let table = self.ident()?;
+        self.expect_kw("SET")?;
+        let mut assignments = Vec::new();
+        loop {
+            let field = self.ident()?;
+            self.expect(Tok::Eq)?;
+            let value = self.parse_value()?;
+            assignments.push((field, value));
+            if matches!(self.peek(), Tok::Comma) {
+                self.next();
+            } else {
+                break;
+            }
+        }
+        let where_clause = if self.kw("WHERE") {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        Ok(TxStmt::UpdateRows {
+            table,
+            assignments,
+            where_clause,
+        })
+    }
+
+    /// `DELETE FROM chr [WHERE expr]` (v2.2).
+    fn parse_delete_rows(&mut self) -> Result<TxStmt, String> {
+        self.expect_kw("FROM")?;
+        let table = self.ident()?;
+        let where_clause = if self.kw("WHERE") {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        Ok(TxStmt::DeleteRows {
+            table,
+            where_clause,
+        })
+    }
+
+    /// KV list after `+=` / `?=`: `{ k: v, k2: v2 }`.
+    fn parse_kv_fields(&mut self) -> Result<Vec<(String, Value)>, String> {
+        let mut fields = Vec::new();
+        loop {
+            if matches!(self.peek(), Tok::RBrace) {
+                self.next();
+                break;
+            }
+            let k = self.ident()?;
+            self.expect(Tok::Colon)?;
+            let v = self.parse_value()?;
+            fields.push((k, v));
+            if matches!(self.peek(), Tok::Comma) {
+                self.next();
+            }
+        }
+        Ok(fields)
     }
 
     fn parse_value(&mut self) -> Result<Value, String> {
@@ -1020,12 +1655,22 @@ impl Parser {
     }
 
     fn parse_and(&mut self) -> Result<Expr, String> {
-        let mut left = self.parse_cmp()?;
+        let mut left = self.parse_not()?;
         while self.kw("AND") {
-            let right = self.parse_cmp()?;
+            let right = self.parse_not()?;
             left = Expr::And(Box::new(left), Box::new(right));
         }
         Ok(left)
+    }
+
+    /// `NOT <cmp>` — v2.2: the shared Expr::Not AST (same as SQL); the
+    /// manual promised NOT support, the parser now delivers it.
+    fn parse_not(&mut self) -> Result<Expr, String> {
+        if self.kw("NOT") {
+            let inner = self.parse_not()?;
+            return Ok(Expr::Not(Box::new(inner)));
+        }
+        self.parse_cmp()
     }
 
     fn parse_cmp(&mut self) -> Result<Expr, String> {
@@ -1178,6 +1823,18 @@ impl Parser {
     }
 }
 
+/// Auto-locus from the PK-like integer field (`id` / `*_id`) of a KV list.
+fn auto_locus(fields: &[(String, Value)]) -> Result<i64, String> {
+    fields
+        .iter()
+        .find(|(k, v)| (k == "id" || k.ends_with("_id")) && matches!(v, Value::Int(_)))
+        .and_then(|(_, v)| match v {
+            Value::Int(i) => Some(*i),
+            _ => None,
+        })
+        .ok_or_else(|| "DnaQL: statement without explicit locus needs an integer '<...>_id' field".to_string())
+}
+
 /// Append one raw token to a CREATE CHROMOSOME definition clause buffer,
 /// separating tokens with a single space (whitespace is irrelevant to the
 /// SQL engine that re-parses these clauses).
@@ -1228,8 +1885,10 @@ fn collect_ast_tables(ast: &DnaQlAst, out: &mut Vec<String>) {
         DnaQlAst::PipelineQuery { source, stages } => {
             out.push(source.clone());
             for stage in stages {
-                if let PipelineStage::Link(Some(link)) = stage {
-                    out.push(link.chromosome.clone());
+                match stage {
+                    PipelineStage::Link(Some(link)) => out.push(link.chromosome.clone()),
+                    PipelineStage::Join(spec) => out.push(spec.chromosome.clone()),
+                    _ => {}
                 }
             }
         }
@@ -1238,7 +1897,10 @@ fn collect_ast_tables(ast: &DnaQlAst, out: &mut Vec<String>) {
                 match statement {
                     TxStmt::Mutate { table, .. }
                     | TxStmt::Append { table, .. }
-                    | TxStmt::DropLocus { table, .. } => out.push(table.clone()),
+                    | TxStmt::InsertIfAbsent { table, .. }
+                    | TxStmt::DropLocus { table, .. }
+                    | TxStmt::UpdateRows { table, .. }
+                    | TxStmt::DeleteRows { table, .. } => out.push(table.clone()),
                 }
             }
         }
@@ -1252,7 +1914,22 @@ fn collect_ast_tables(ast: &DnaQlAst, out: &mut Vec<String>) {
         }
         DnaQlAst::HealthCheck { chromosome, .. } => out.push(chromosome.clone()),
         DnaQlAst::CreateChromosome { table, .. }
-        | DnaQlAst::DropChromosome { table, .. } => out.push(table.clone()),
+        | DnaQlAst::DropChromosome { table, .. }
+        | DnaQlAst::AlterChromosome { table, .. }
+        | DnaQlAst::CreateIndex { table, .. } => out.push(table.clone()),
+        DnaQlAst::DropIndex { table, .. } => {
+            if let Some(t) = table {
+                out.push(t.clone());
+            }
+        }
+        // SHOW CHROMOSOMES lists every table; the ACL allows it through and
+        // the executor filters by the caller's grants.
+        DnaQlAst::ShowChromosomes => {}
+        DnaQlAst::Explain(inner) => collect_ast_tables(inner, out),
+        DnaQlAst::Union { left, right, .. } => {
+            collect_ast_tables(left, out);
+            collect_ast_tables(right, out);
+        }
     }
 }
 
@@ -1313,6 +1990,41 @@ impl DnaQlEngine {
             DnaQlAst::DropChromosome { table, if_exists } => {
                 self.exec_drop_chromosome(table, *if_exists)?
             }
+            DnaQlAst::AlterChromosome {
+                table,
+                column,
+                col_type,
+            } => self.exec_alter_chromosome(table, column, col_type)?,
+            DnaQlAst::CreateIndex {
+                name,
+                table,
+                column,
+                unique,
+                if_not_exists,
+            } => self.exec_create_index(name, table, column, *unique, *if_not_exists)?,
+            DnaQlAst::DropIndex {
+                name,
+                table,
+                if_exists,
+            } => self.exec_drop_index(name, table.as_deref(), *if_exists)?,
+            DnaQlAst::ShowChromosomes => self.exec_show_chromosomes()?,
+            DnaQlAst::Explain(inner) => {
+                // Reads are side-effect free, so EXPLAIN executes the query
+                // and reports the plan instead of the rows.
+                let (_, note) = self.exec_readonly(inner)?;
+                return Ok(DnaQlResult {
+                    ast_summary: format!("Explain({:?})", ast_summary(inner)),
+                    rows: Vec::new(),
+                    engine_note: format!("plan: {}", note),
+                    execution_time_us: start.elapsed().as_micros() as u64,
+                });
+            }
+            DnaQlAst::Union {
+                left,
+                right,
+                all,
+                tail,
+            } => self.exec_union(left, right, *all, tail)?,
         };
 
         Ok(DnaQlResult {
@@ -1511,19 +2223,126 @@ impl DnaQlEngine {
         ))
     }
 
+    /// `ALTER CHROMOSOME t ADD COLUMN c TYPE` — rendered through the SQL
+    /// engine's metadata-only online DDL (one schema-row rewrite, instant).
+    fn exec_alter_chromosome(
+        &self,
+        table: &str,
+        column: &str,
+        col_type: &str,
+    ) -> Result<(Vec<DnaQlRow>, String), String> {
+        let sql = format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, col_type);
+        let res = self
+            .sql
+            .execute(&sql)
+            .map_err(|e| format!("DnaQL DDL: {}", e))?;
+        Ok((
+            vec![],
+            res.message
+                .unwrap_or_else(|| format!("column '{}' added to chromosome '{}'", column, table)),
+        ))
+    }
+
+    /// `CREATE [UNIQUE] INDEX name ON chromosome (col)` — rendered through
+    /// the SQL engine so both dialects share one index registry.
+    fn exec_create_index(
+        &self,
+        name: &str,
+        table: &str,
+        column: &str,
+        unique: bool,
+        if_not_exists: bool,
+    ) -> Result<(Vec<DnaQlRow>, String), String> {
+        let uniq = if unique { "UNIQUE " } else { "" };
+        let nie = if if_not_exists { "IF NOT EXISTS " } else { "" };
+        let sql = format!(
+            "CREATE {}INDEX {}{} ON {} ({})",
+            uniq, nie, name, table, column
+        );
+        let res = self
+            .sql
+            .execute(&sql)
+            .map_err(|e| format!("DnaQL DDL: {}", e))?;
+        Ok((
+            vec![],
+            res.message
+                .unwrap_or_else(|| format!("index '{}' created on '{}'", name, table)),
+        ))
+    }
+
+    /// `DROP INDEX name [ON chromosome]` — rendered through the SQL engine.
+    fn exec_drop_index(
+        &self,
+        name: &str,
+        table: Option<&str>,
+        if_exists: bool,
+    ) -> Result<(Vec<DnaQlRow>, String), String> {
+        let on = table
+            .map(|t| format!(" ON {}", t))
+            .unwrap_or_default();
+        // SQL parser's DROP INDEX grammar takes IF EXISTS before the name.
+        let sql = if if_exists {
+            format!("DROP INDEX IF EXISTS {}{}", name, on)
+        } else {
+            format!("DROP INDEX {}{}", name, on)
+        };
+        let res = self
+            .sql
+            .execute(&sql)
+            .map_err(|e| format!("DnaQL DDL: {}", e))?;
+        Ok((
+            vec![],
+            res.message
+                .unwrap_or_else(|| format!("index '{}' dropped", name)),
+        ))
+    }
+
+    /// `SHOW CHROMOSOMES` — one row per table registered in the schema
+    /// registry (the same registry the SQL engine's SHOW TABLES reads).
+    fn exec_show_chromosomes(&self) -> Result<(Vec<DnaQlRow>, String), String> {
+        let mut tables = self.sql.list_tables();
+        tables.sort();
+        let rows = tables
+            .into_iter()
+            .map(|t| {
+                let mut f = BTreeMap::new();
+                f.insert(
+                    "chromosome".to_string(),
+                    Value::Text(t.clone()),
+                );
+                DnaQlRow { fields: f }
+            })
+            .collect();
+        Ok((rows, "real table introspection via the shared schema registry".into()))
+    }
+
     fn exec_pipeline(
         &self,
         source: &str,
         stages: &[PipelineStage],
     ) -> Result<(Vec<DnaQlRow>, String), String> {
+        let (mut rows, mut plan) = self.scan_rows(source, "SeqScan")?;
+        for stage in stages {
+            self.apply_stage(stage, &mut rows, &mut plan)?;
+        }
+        let note = format!("real pipeline: {}", plan.join(" -> "));
+        Ok((rows, note))
+    }
+
+    /// Scan one chromosome's rows and insert the synthetic `locus` field,
+    /// mirroring the SQL engine's `read_table_rows` (schema meta-rows and
+    /// index keys never leak into results).
+    fn scan_rows(&self, source: &str, plan_label: &str) -> Result<(Vec<DnaQlRow>, Vec<String>), String> {
         let prefix = format!("{}:", source);
         let raw_rows = self
             .engine
             .scan_prefix(prefix.as_bytes())
             .map_err(|e| format!("DnaQL storage error: {}", e))?;
-
         let mut rows: Vec<DnaQlRow> = Vec::new();
         for (key, payload) in raw_rows {
+            if String::from_utf8_lossy(&key).ends_with(":schema") {
+                continue; // legacy meta-row visibility rule (same as SQL)
+            }
             let fields =
                 RowCodec::decode(&payload).map_err(|e| format!("DnaQL: row unreadable: {}", e))?;
             let mut row_map: BTreeMap<String, Value> = fields.into_iter().collect();
@@ -1533,75 +2352,471 @@ impl DnaQlEngine {
             );
             rows.push(DnaQlRow { fields: row_map });
         }
+        Ok((rows, vec![format!("{}({})", plan_label, source)]))
+    }
 
-        let mut plan = vec![format!("SeqScan({})", source)];
-        for stage in stages {
-            match stage {
-                PipelineStage::Link(spec) => {
-                    let spec = spec.clone().ok_or("DnaQL: LINK requires a target")?;
-                    plan.push(format!("KeySeek({}.{})", spec.chromosome, spec.column));
-                    for row in rows.iter_mut() {
-                        let fk_val = row.fields.get(&spec.column).cloned().unwrap_or(Value::Null);
-                        let target_key = format!("{}:{}", spec.chromosome, fk_val);
-                        if let Some(target_bytes) = self
-                            .engine
-                            .get(target_key.as_bytes())
-                            .map_err(|e| format!("DnaQL storage error: {}", e))?
-                        {
-                            let target_fields = RowCodec::decode(&target_bytes)
-                                .map_err(|e| format!("DnaQL: link target unreadable: {}", e))?;
-                            for (k, v) in target_fields {
-                                let mut name = format!("{}.{}", spec.chromosome, k);
-                                if row.fields.contains_key(&name) {
-                                    name = format!("link_{}", k);
+    /// Apply one pipeline stage to the row stream (used by exec_pipeline and
+    /// the UNION tail).
+    fn apply_stage(
+        &self,
+        stage: &PipelineStage,
+        rows: &mut Vec<DnaQlRow>,
+        plan: &mut Vec<String>,
+    ) -> Result<(), String> {
+        match stage {
+            PipelineStage::Link(spec) => {
+                let spec = spec.clone().ok_or("DnaQL: LINK requires a target")?;
+                plan.push(format!("KeySeek({}.{})", spec.chromosome, spec.column));
+                for row in rows.iter_mut() {
+                    let fk_val = row.fields.get(&spec.column).cloned().unwrap_or(Value::Null);
+                    let target_key = format!("{}:{}", spec.chromosome, fk_val);
+                    if let Some(target_bytes) = self
+                        .engine
+                        .get(target_key.as_bytes())
+                        .map_err(|e| format!("DnaQL storage error: {}", e))?
+                    {
+                        let target_fields = RowCodec::decode(&target_bytes)
+                            .map_err(|e| format!("DnaQL: link target unreadable: {}", e))?;
+                        for (k, v) in target_fields {
+                            let mut name = format!("{}.{}", spec.chromosome, k);
+                            if row.fields.contains_key(&name) {
+                                name = format!("link_{}", k);
+                            }
+                            row.fields.insert(name, v);
+                        }
+                    }
+                }
+            }
+            PipelineStage::Filter(e) => {
+                plan.push(format!("Filter({})", e.describe()));
+                rows.retain(|r| e.eval_bool(&r.fields));
+            }
+            PipelineStage::Emit(projection) => {
+                plan.push(format!("Project({:?})", projection));
+                for row in rows.iter_mut() {
+                    let mut filtered = BTreeMap::new();
+                    for item in projection {
+                        match item {
+                            EmitItem::Star => {
+                                for (k, v) in row.fields.clone() {
+                                    filtered.insert(k, v);
                                 }
-                                row.fields.insert(name, v);
+                            }
+                            EmitItem::Col(name) => {
+                                if let Some(v) = row.fields.get(name.as_str()) {
+                                    filtered.insert(name.clone(), v.clone());
+                                }
+                            }
+                            EmitItem::Computed { expr, alias } => {
+                                let v = expr.eval(&row.fields).unwrap_or(Value::Null);
+                                filtered.insert(alias.clone(), v);
                             }
                         }
                     }
+                    row.fields = filtered;
                 }
-                PipelineStage::Filter(e) => {
-                    plan.push(format!("Filter({})", e.describe()));
-                    rows.retain(|r| e.eval_bool(&r.fields));
-                }
-                PipelineStage::Emit(projection) => {
-                    plan.push(format!("Project({:?})", projection));
-                    for row in rows.iter_mut() {
-                        let mut filtered = BTreeMap::new();
-                        for p in projection {
-                            if let Some(v) = row.fields.get(p.as_str()) {
-                                filtered.insert(p.clone(), v.clone());
-                            }
-                        }
-                        row.fields = filtered;
+            }
+            PipelineStage::Sort { column, asc } => {
+                plan.push(format!(
+                    "Sort({} {})",
+                    column,
+                    if *asc { "ASC" } else { "DESC" }
+                ));
+                rows.sort_by(|a, b| {
+                    let va = a.fields.get(column).cloned().unwrap_or(Value::Null);
+                    let vb = b.fields.get(column).cloned().unwrap_or(Value::Null);
+                    let ord = va.compare(&vb);
+                    if *asc {
+                        ord
+                    } else {
+                        ord.reverse()
                     }
+                });
+            }
+            PipelineStage::Limit(n) => {
+                plan.push(format!("Limit({})", n));
+                rows.truncate(*n);
+            }
+            PipelineStage::Offset(n) => {
+                plan.push(format!("Offset({})", n));
+                rows.drain(0..(*n).min(rows.len()));
+            }
+            PipelineStage::Join(spec) => {
+                let (right, _) = self.scan_rows(&spec.chromosome, "SeqScan")?;
+                let joined = self.hash_join_stage(rows, right, spec, plan)?;
+                *rows = joined;
+            }
+            PipelineStage::Group { by, aggs } => {
+                self.apply_group(by, aggs, rows, plan)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Hash equi-join mirroring the SQL engine (`sql_engine::hash_join`
+    /// family): single-namespace rows, `joined_` prefix on conflicting field
+    /// names, NULL keys never match, outer sides NULL-extended from the
+    /// other side's column set. RIGHT is LEFT with the sides swapped.
+    fn hash_join_stage(
+        &self,
+        left: &[DnaQlRow],
+        right: Vec<DnaQlRow>,
+        spec: &JoinSpec,
+        plan: &mut Vec<String>,
+    ) -> Result<Vec<DnaQlRow>, String> {
+        use std::collections::HashMap;
+        let label = match spec.kind {
+            JoinKind::Inner => "HashJoin",
+            JoinKind::Left => "LeftHashJoin",
+            JoinKind::Right => "RightHashJoin",
+            JoinKind::Full => "FullHashJoin",
+        };
+        plan.push(format!(
+            "{}({}.{}, {}.{})",
+            label, spec.chromosome, spec.left_col, spec.chromosome, spec.right_col
+        ));
+
+        // RIGHT == LEFT with sides swapped (identical row semantics).
+        let (probe_rows, build_rows) = match spec.kind {
+            JoinKind::Right => (right, left.to_vec()),
+            _ => (left.to_vec(), right),
+        };
+        let (probe_col, build_col) = match spec.kind {
+            JoinKind::Right => (&spec.right_col, &spec.left_col),
+            _ => (&spec.left_col, &spec.right_col),
+        };
+        let kind = match spec.kind {
+            JoinKind::Right => JoinKind::Left,
+            other => other,
+        };
+
+        let join_key = |v: Option<&Value>| -> Option<Vec<u8>> {
+            let v = v?;
+            if v.is_null() {
+                None
+            } else {
+                Some(crate::relational::encode_index_value(v))
+            }
+        };
+
+        // Build phase: key -> indices into build_rows.
+        let mut index: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
+        for (i, r) in build_rows.iter().enumerate() {
+            if let Some(key) = join_key(r.fields.get(build_col)) {
+                index.entry(key).or_default().push(i);
+            }
+        }
+        let build_cols: Vec<String> = build_rows
+            .first()
+            .map(|r| r.fields.keys().cloned().collect())
+            .unwrap_or_default();
+        let probe_cols: Vec<String> = probe_rows
+            .first()
+            .map(|r| r.fields.keys().cloned().collect())
+            .unwrap_or_default();
+
+        let mut out: Vec<DnaQlRow> = Vec::new();
+        let mut matched_build: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+        for l in &probe_rows {
+            let key = join_key(l.fields.get(probe_col));
+            let matches: &[usize] = match &key {
+                Some(k) => index.get(k).map(|v| v.as_slice()).unwrap_or(&[]),
+                None => &[],
+            };
+            if matches.is_empty() {
+                if kind == JoinKind::Left || kind == JoinKind::Full {
+                    let mut row = l.fields.clone();
+                    for c in &build_cols {
+                        row.entry(c.clone()).or_insert(Value::Null);
+                    }
+                    out.push(DnaQlRow { fields: row });
                 }
-                PipelineStage::Sort { column, asc } => {
-                    plan.push(format!(
-                        "Sort({} {})",
-                        column,
-                        if *asc { "ASC" } else { "DESC" }
-                    ));
-                    rows.sort_by(|a, b| {
-                        let va = a.fields.get(column).cloned().unwrap_or(Value::Null);
-                        let vb = b.fields.get(column).cloned().unwrap_or(Value::Null);
-                        let ord = va.compare(&vb);
-                        if *asc {
-                            ord
-                        } else {
-                            ord.reverse()
+                continue;
+            }
+            for &bi in matches {
+                matched_build.insert(bi);
+                let r = &build_rows[bi];
+                let mut merged = l.fields.clone();
+                for (k, val) in r.fields.iter() {
+                    let name = if merged.contains_key(k) {
+                        format!("joined_{}", k)
+                    } else {
+                        k.clone()
+                    };
+                    merged.insert(name, val.clone());
+                }
+                out.push(DnaQlRow { fields: merged });
+            }
+        }
+
+        if kind == JoinKind::Full {
+            for (i, r) in build_rows.iter().enumerate() {
+                if matched_build.contains(&i) {
+                    continue;
+                }
+                let mut row = r.fields.clone();
+                for c in &probe_cols {
+                    row.entry(c.clone()).or_insert(Value::Null);
+                }
+                out.push(DnaQlRow { fields: row });
+            }
+        }
+        Ok(out)
+    }
+
+    /// `|> GROUP [BY cols] AGG name = FN(col)` — aggregation mirroring the
+    /// SQL engine's `aggregate_rows` (NULLs skipped; Int sum stays Int when
+    /// no Float was seen; AVG always Float; SUM of an all-NULL group is
+    /// NULL; empty input with no GROUP BY yields one row, COUNT = 0).
+    fn apply_group(
+        &self,
+        by: &[String],
+        aggs: &[(String, AggFunc, Option<String>)],
+        rows: &mut Vec<DnaQlRow>,
+        plan: &mut Vec<String>,
+    ) -> Result<(), String> {
+        plan.push(format!(
+            "Aggregate(group_by={:?}, aggs={:?})",
+            by,
+            aggs.iter().map(|(n, f, a)| format!("{}={}{:?}", n, f.as_str(), a)).collect::<Vec<_>>()
+        ));
+        struct GroupState {
+            sample: BTreeMap<String, Value>,
+            counts: Vec<u64>,
+            non_null: Vec<u64>,
+            sums: Vec<f64>,
+            saw_float: Vec<bool>,
+            mins: Vec<Option<Value>>,
+            maxs: Vec<Option<Value>>,
+        }
+        let n_agg = aggs.len();
+        let mut groups: BTreeMap<Vec<u8>, GroupState> = BTreeMap::new();
+        for row in rows.iter() {
+            let mut key: Vec<u8> = Vec::new();
+            for col in by {
+                let v = row.fields.get(col).cloned().unwrap_or(Value::Null);
+                key.extend_from_slice(&crate::relational::encode_index_value(&v));
+                key.push(0);
+            }
+            let state = groups.entry(key).or_insert_with(|| GroupState {
+                sample: {
+                    let mut m = BTreeMap::new();
+                    for col in by {
+                        m.insert(col.clone(), row.fields.get(col).cloned().unwrap_or(Value::Null));
+                    }
+                    m
+                },
+                counts: vec![0; n_agg],
+                non_null: vec![0; n_agg],
+                sums: vec![0.0; n_agg],
+                saw_float: vec![false; n_agg],
+                mins: vec![None; n_agg],
+                maxs: vec![None; n_agg],
+            });
+            for (i, (_, func, arg)) in aggs.iter().enumerate() {
+                state.counts[i] += 1;
+                let value = match arg {
+                    // COUNT(*): every group member counts, no column read.
+                    None => {
+                        state.non_null[i] += 1;
+                        None
+                    }
+                    Some(col) => row.fields.get(col),
+                };
+                if let Some(v) = value {
+                    if !v.is_null() {
+                        state.non_null[i] += 1;
+                        match (func, v) {
+                            (AggFunc::Sum | AggFunc::Avg, Value::Int(n)) => {
+                                state.sums[i] += *n as f64;
+                            }
+                            (AggFunc::Sum | AggFunc::Avg, Value::Float(f)) => {
+                                state.sums[i] += *f;
+                                state.saw_float[i] = true;
+                            }
+                            (AggFunc::Min, val) => {
+                                let cur = state.mins[i].take();
+                                state.mins[i] = Some(match cur {
+                                    Some(c) if c.compare(val) == std::cmp::Ordering::Less => c,
+                                    _ => val.clone(),
+                                });
+                            }
+                            (AggFunc::Max, val) => {
+                                let cur = state.maxs[i].take();
+                                state.maxs[i] = Some(match cur {
+                                    Some(c) if c.compare(val) == std::cmp::Ordering::Greater => c,
+                                    _ => val.clone(),
+                                });
+                            }
+                            _ => {}
                         }
-                    });
-                }
-                PipelineStage::Limit(n) => {
-                    plan.push(format!("Limit({})", n));
-                    rows.truncate(*n);
+                    }
                 }
             }
         }
 
-        let note = format!("real pipeline: {}", plan.join(" -> "));
-        Ok((rows, note))
+        // No GROUP BY over an empty set still yields one row (COUNT = 0).
+        if groups.is_empty() && by.is_empty() {
+            groups.insert(
+                Vec::new(),
+                GroupState {
+                    sample: BTreeMap::new(),
+                    counts: vec![0; n_agg],
+                    non_null: vec![0; n_agg],
+                    sums: vec![0.0; n_agg],
+                    saw_float: vec![false; n_agg],
+                    mins: vec![None; n_agg],
+                    maxs: vec![None; n_agg],
+                },
+            );
+        }
+
+        let mut out = Vec::with_capacity(groups.len());
+        for (_, state) in groups {
+            let mut fields = state.sample;
+            for (i, (name, func, _)) in aggs.iter().enumerate() {
+                let v = match func {
+                    AggFunc::Count => Value::Int(state.non_null[i] as i64),
+                    AggFunc::Sum => {
+                        if state.non_null[i] == 0 {
+                            Value::Null
+                        } else if state.saw_float[i] {
+                            Value::Float(state.sums[i])
+                        } else {
+                            Value::Int(state.sums[i] as i64)
+                        }
+                    }
+                    AggFunc::Avg => {
+                        if state.non_null[i] == 0 {
+                            Value::Null
+                        } else {
+                            Value::Float(state.sums[i] / state.non_null[i] as f64)
+                        }
+                    }
+                    AggFunc::Min => state.mins[i].clone().unwrap_or(Value::Null),
+                    AggFunc::Max => state.maxs[i].clone().unwrap_or(Value::Null),
+                };
+                fields.insert(name.clone(), v);
+            }
+            out.push(DnaQlRow { fields });
+        }
+        *rows = out;
+        Ok(())
+    }
+
+    /// Execute a read-only query and return only its plan note (EXPLAIN).
+    fn exec_readonly(&self, ast: &DnaQlAst) -> Result<(Vec<DnaQlRow>, String), String> {
+        match ast {
+            DnaQlAst::PipelineQuery { source, stages } => {
+                let (mut rows, mut plan) = self.scan_rows(source, "SeqScan")?;
+                for stage in stages {
+                    self.apply_stage(stage, &mut rows, &mut plan)?;
+                }
+                Ok((Vec::new(), format!("real pipeline: {}", plan.join(" -> "))))
+            }
+            DnaQlAst::PatternSearch { .. } => {
+                // Pattern search runs its own executor; reuse it read-only.
+                let res = self.exec_pattern_search_ast(ast)?;
+                Ok((Vec::new(), res.1))
+            }
+            other => Err(format!(
+                "DnaQL: EXPLAIN supports read-only queries, got {:?}",
+                ast_summary(other)
+            )),
+        }
+    }
+
+    /// Re-execute a PatternSearch AST node through the public executor.
+    fn exec_pattern_search_ast(&self, ast: &DnaQlAst) -> Result<(Vec<DnaQlRow>, String), String> {
+        if let DnaQlAst::PatternSearch {
+            chromosome,
+            pattern,
+            mode,
+            max_distance,
+            link,
+            projection,
+        } = ast
+        {
+            self.exec_pattern_search(
+                chromosome,
+                pattern,
+                mode.clone(),
+                *max_distance,
+                link.clone(),
+                projection.clone(),
+            )
+        } else {
+            Err("DnaQL: internal error: not a pattern search".into())
+        }
+    }
+
+    /// `Pipeline UNION [ALL] Pipeline [SORT/LIMIT/OFFSET tail]` — mirrors
+    /// the SQL engine's exec_union: output field names come from the left
+    /// side, DISTINCT (default) dedups full rows, tail stages apply to the
+    /// compound result (OFFSET before LIMIT).
+    fn exec_union(
+        &self,
+        left: &DnaQlAst,
+        right: &DnaQlAst,
+        all: bool,
+        tail: &[PipelineStage],
+    ) -> Result<(Vec<DnaQlRow>, String), String> {
+        let mut lrows = self.exec_readonly_rows(left)?;
+        let rrows = self.exec_readonly_rows(right)?;
+        lrows.extend(rrows);
+        if !all {
+            let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+            lrows.retain(|row| {
+                let mut key = Vec::new();
+                for (k, v) in row.fields.iter() {
+                    key.extend_from_slice(k.as_bytes());
+                    key.push(0);
+                    key.extend_from_slice(&crate::relational::encode_index_value(v));
+                    key.push(0);
+                }
+                seen.insert(key)
+            });
+        }
+        // Tail stages: SORT / LIMIT / OFFSET applied to the compound result.
+        let mut plan = format!(
+            "Union({})",
+            if all { "ALL" } else { "DISTINCT" }
+        );
+        let mut rows = lrows;
+        for stage in tail {
+            let mut p = Vec::new();
+            self.apply_stage(stage, &mut rows, &mut p)?;
+            plan.push_str(&format!(" -> {}", p.join(" -> ")));
+        }
+        let n = rows.len();
+        Ok((
+            rows,
+            format!(
+                "real pipeline: {} ({} row(s) after UNION {})",
+                plan,
+                n,
+                if all { "ALL" } else { "DISTINCT" }
+            ),
+        ))
+    }
+
+    /// Full row materialisation for UNION sides (rows + empty note).
+    fn exec_readonly_rows(&self, ast: &DnaQlAst) -> Result<Vec<DnaQlRow>, String> {
+        match ast {
+            DnaQlAst::PipelineQuery { source, stages } => {
+                let (mut rows, mut plan) = self.scan_rows(source, "SeqScan")?;
+                for stage in stages {
+                    self.apply_stage(stage, &mut rows, &mut plan)?;
+                }
+                Ok(rows)
+            }
+            DnaQlAst::PatternSearch { .. } => Ok(self.exec_pattern_search_ast(ast)?.0),
+            other => Err(format!(
+                "DnaQL: UNION sides must be FROM-pipelines or FIND-searches, got {:?}",
+                ast_summary(other)
+            )),
+        }
     }
 
     fn exec_tx(&self, statements: &[TxStmt]) -> Result<(Vec<DnaQlRow>, String), String> {
@@ -1609,6 +2824,36 @@ impl DnaQlEngine {
         // the session (read-your-writes: a statement sees earlier statements'
         // buffered effects) and record Serializable validation baselines.
         let mut session = self.tx.begin(crate::tx::TxIsolationLevel::Serializable);
+        let mut skipped = 0usize;
+        let mut skipped_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut updated_keys: Vec<String> = Vec::new();
+        let mut deleted_keys: Vec<String> = Vec::new();
+        let mut cascaded = 0usize;
+
+        /// All candidate keys of one chromosome: committed storage rows plus
+        /// rows buffered earlier in this same transaction (read-your-writes).
+        fn candidate_keys(
+            engine: &Engine,
+            session: &crate::tx::TransactionSession,
+            table: &str,
+        ) -> Result<Vec<String>, String> {
+            let prefix = format!("{}:", table);
+            let mut keys: Vec<String> = engine
+                .scan_prefix(prefix.as_bytes())
+                .map_err(|e| format!("DnaQL storage error: {}", e))?
+                .into_iter()
+                .map(|(k, _)| String::from_utf8_lossy(&k).to_string())
+                .collect();
+            for k in session.pending_keys_with_prefix(prefix.as_bytes()) {
+                let ks = String::from_utf8_lossy(&k).to_string();
+                if !keys.contains(&ks) {
+                    keys.push(ks);
+                }
+            }
+            keys.sort();
+            keys.dedup();
+            Ok(keys)
+        }
 
         for stmt in statements {
             match stmt {
@@ -1640,6 +2885,25 @@ impl DnaQlEngine {
                     }
                     session.put_row(key.into_bytes(), row);
                 }
+                TxStmt::InsertIfAbsent {
+                    table,
+                    locus,
+                    fields,
+                } => {
+                    let key = format!("{}:{}", table, locus);
+                    if session.read_row(&key)?.is_some() {
+                        // Locus already present: ON CONFLICT DO NOTHING —
+                        // the existing row stays untouched.
+                        skipped += 1;
+                        skipped_keys.insert(key);
+                        continue;
+                    }
+                    let mut row = BTreeMap::new();
+                    for (k, v) in fields {
+                        row.insert(k.clone(), v.clone());
+                    }
+                    session.put_row(key.into_bytes(), row);
+                }
                 TxStmt::DropLocus {
                     table,
                     locus,
@@ -1647,6 +2911,132 @@ impl DnaQlEngine {
                 } => {
                     let key = format!("{}:{}", table, locus);
                     session.delete(key.into_bytes());
+                }
+                TxStmt::UpdateRows {
+                    table,
+                    assignments,
+                    where_clause,
+                } => {
+                    // Validate assignments against the schema when present.
+                    if let Some(schema) = self.sql.get_schema(table) {
+                        for (col, _) in assignments {
+                            if !schema.columns.contains_key(col) {
+                                return Err(format!(
+                                    "DnaQL: unknown column '{}' in UPDATE of '{}'",
+                                    col, table
+                                ));
+                            }
+                        }
+                    }
+                    let keys = candidate_keys(&self.engine, &session, table)?;
+                    for key in keys {
+                        let fields = match session.read_row(&key)? {
+                            Some(f) => f,
+                            None => continue,
+                        };
+                        if let Some(e) = where_clause {
+                            if !e.eval_bool(&fields) {
+                                continue;
+                            }
+                        }
+                        let mut row = fields;
+                        for (col, v) in assignments {
+                            row.insert(col.clone(), v.clone());
+                        }
+                        session.put_row(key.clone().into_bytes(), row);
+                        updated_keys.push(key);
+                    }
+                }
+                TxStmt::DeleteRows {
+                    table,
+                    where_clause,
+                } => {
+                    let schema = self
+                        .sql
+                        .get_schema(table)
+                        .ok_or_else(|| format!("DnaQL: table '{}' not registered", table))?;
+                    let keys = candidate_keys(&self.engine, &session, table)?;
+                    let mut selected: Vec<(String, Value)> = Vec::new();
+                    for key in keys {
+                        let fields = match session.read_row(&key)? {
+                            Some(f) => f,
+                            None => continue,
+                        };
+                        if let Some(e) = where_clause {
+                            if !e.eval_bool(&fields) {
+                                continue;
+                            }
+                        }
+                        let pk = fields
+                            .get(&schema.primary_locus_column)
+                            .cloned()
+                            .ok_or_else(|| {
+                                format!(
+                                    "DnaQL: row {} is missing the primary key column '{}'",
+                                    key, schema.primary_locus_column
+                                )
+                            })?;
+                        selected.push((key, pk));
+                    }
+                    // FK handling, mirroring the SQL engine: RESTRICT refuses
+                    // when a referencing row is not itself being deleted;
+                    // CASCADE removes the child row (one level, like SQL).
+                    let selected_keys: std::collections::HashSet<String> =
+                        selected.iter().map(|(k, _)| k.clone()).collect();
+                    let referencing: Vec<(String, crate::relational::ForeignKeyConstraint)> = {
+                        let mut refs = Vec::new();
+                        for t in self.sql.list_tables() {
+                            if let Some(ts) = self.sql.get_schema(&t) {
+                                for fk in &ts.foreign_keys {
+                                    if fk.target_chromosome == *table {
+                                        refs.push((t.clone(), fk.clone()));
+                                    }
+                                }
+                            }
+                        }
+                        refs
+                    };
+                    let mut deletions: Vec<String> = selected
+                        .iter()
+                        .map(|(k, _)| k.clone())
+                        .collect();
+                    for (_, parent_pk) in &selected {
+                        for (child_table, fk) in &referencing {
+                            let child_keys =
+                                candidate_keys(&self.engine, &session, child_table)?;
+                            for child_key in child_keys {
+                                if selected_keys.contains(&child_key)
+                                    || deletions.contains(&child_key)
+                                {
+                                    continue;
+                                }
+                                let child_fields = match session.read_row(&child_key)? {
+                                    Some(f) => f,
+                                    None => continue,
+                                };
+                                let refers = child_fields
+                                    .get(&fk.column)
+                                    .map(|v| v.compare(parent_pk) == std::cmp::Ordering::Equal)
+                                    .unwrap_or(false);
+                                if !refers {
+                                    continue;
+                                }
+                                if fk.on_delete_cascade {
+                                    deletions.push(child_key);
+                                } else {
+                                    return Err(format!(
+                                        "DnaQL: RESTRICT violation: {} row {} is referenced by {}",
+                                        table, parent_pk, child_table
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    cascaded += deletions.len().saturating_sub(selected.len());
+                    for key in &deletions {
+                        session.delete(key.clone().into_bytes());
+                        deleted_keys.push(key.clone());
+                    }
                 }
             }
         }
@@ -1665,6 +3055,17 @@ impl DnaQlEngine {
                     fields.insert("locus".to_string(), Value::Text(key.clone()));
                     out.push(DnaQlRow { fields });
                 }
+                TxStmt::InsertIfAbsent { table, locus, .. } => {
+                    let key = format!("{}:{}", table, locus);
+                    let mut fields = self.read_row(&key)?.unwrap_or_default();
+                    let inserted = !skipped_keys.contains(&key);
+                    fields.insert("locus".to_string(), Value::Text(key.clone()));
+                    fields.insert(
+                        "inserted".to_string(),
+                        Value::Int(inserted as i64),
+                    );
+                    out.push(DnaQlRow { fields });
+                }
                 TxStmt::DropLocus { table, locus, .. } => {
                     let mut f = BTreeMap::new();
                     f.insert(
@@ -1673,15 +3074,41 @@ impl DnaQlEngine {
                     );
                     out.push(DnaQlRow { fields: f });
                 }
+                TxStmt::UpdateRows { .. } => {
+                    for key in &updated_keys {
+                        let mut fields = self.read_row(key)?.unwrap_or_default();
+                        fields.insert("locus".to_string(), Value::Text(key.clone()));
+                        out.push(DnaQlRow { fields });
+                    }
+                }
+                TxStmt::DeleteRows { .. } => {
+                    for key in &deleted_keys {
+                        let mut f = BTreeMap::new();
+                        f.insert("dropped".to_string(), Value::Text(key.clone()));
+                        out.push(DnaQlRow { fields: f });
+                    }
+                }
             }
         }
 
+        let skipped_note = if skipped > 0 {
+            format!(", {} conflict(s) skipped (DO NOTHING)", skipped)
+        } else {
+            String::new()
+        };
+        let cascade_note = if cascaded > 0 {
+            format!(", {} row(s) cascaded", cascaded)
+        } else {
+            String::new()
+        };
         Ok((
             out,
             format!(
-                "real TX: {} statements committed atomically at LSN {}",
+                "real TX: {} statements committed atomically at LSN {}{}{}",
                 statements.len(),
-                lsn
+                lsn,
+                skipped_note,
+                cascade_note
             ),
         ))
     }
@@ -1989,6 +3416,41 @@ fn ast_summary(ast: &DnaQlAst) -> String {
                 table, if_exists
             )
         }
+        DnaQlAst::AlterChromosome {
+            table,
+            column,
+            col_type,
+        } => format!(
+            "AlterChromosome {{ table: '{}', column: '{}', type: '{}' }}",
+            table, column, col_type
+        ),
+        DnaQlAst::CreateIndex {
+            name,
+            table,
+            column,
+            unique,
+            if_not_exists,
+        } => format!(
+            "CreateIndex {{ name: '{}', table: '{}', column: '{}', unique: {}, if_not_exists: {} }}",
+            name, table, column, unique, if_not_exists
+        ),
+        DnaQlAst::DropIndex {
+            name,
+            table,
+            if_exists,
+        } => format!(
+            "DropIndex {{ name: '{}', table: {:?}, if_exists: {} }}",
+            name, table, if_exists
+        ),
+        DnaQlAst::ShowChromosomes => "ShowChromosomes".to_string(),
+        DnaQlAst::Explain(inner) => format!("Explain {{ {} }}", ast_summary(inner)),
+        DnaQlAst::Union { left, right, all, tail } => format!(
+            "Union {{ all: {}, tail: {}, left: ({}), right: ({}) }}",
+            all,
+            tail.len(),
+            ast_summary(left),
+            ast_summary(right)
+        ),
     }
 }
 
@@ -2274,7 +3736,368 @@ mod tests {
         assert!(e2.get(b"chr_variants:3").unwrap().is_none());
         assert!(e2.get(b"chr_variants:1").unwrap().is_some());
     }
+
+    // ------------------------------------------------------------------
+    // v2.2 — SQL parity features
+    // ------------------------------------------------------------------
+
+    /// A small relational fixture registered through SQL DDL so schemas and
+    /// FKs exist: chr_users(1..3) ← chr_orders(10..13, one orphan-free set
+    /// plus one user with no orders).
+    fn setup_relational() -> (Arc<Engine>, DnaQlEngine) {
+        let (engine, _ql) = setup();
+        let sql = Arc::new(SqlEngine::new(engine.clone()));
+        sql.execute(
+            "CREATE TABLE chr_users (user_id INT, username TEXT, balance FLOAT, \
+             PRIMARY KEY (user_id))",
+        )
+        .unwrap();
+        sql.execute(
+            "CREATE TABLE chr_orders (order_id INT, user_id INT, total_usd FLOAT, status TEXT, \
+             PRIMARY KEY (order_id), FOREIGN KEY (user_id) REFERENCES chr_users(user_id) \
+             ON DELETE CASCADE)",
+        )
+        .unwrap();
+        for (id, name, bal) in [
+            (1, "ada", 100.0),
+            (2, "grace", 250.5),
+            (3, "alan", 75.0),
+        ] {
+            sql.execute(&format!(
+                "INSERT INTO chr_users (user_id, username, balance) VALUES ({}, '{}', {:?})",
+                id, name, bal
+            ))
+            .unwrap();
+        }
+        for (oid, uid, total, status) in [
+            (10, 1, 50.0, "paid"),
+            (11, 1, 70.0, "open"),
+            (12, 2, 200.0, "paid"),
+        ] {
+            sql.execute(&format!(
+                "INSERT INTO chr_orders (order_id, user_id, total_usd, status) VALUES \
+                 ({}, {}, {:?}, '{}')",
+                oid, uid, total, status
+            ))
+            .unwrap();
+        }
+        let ql = DnaQlEngine::new(engine.clone(), sql);
+        (engine, ql)
+    }
+
+    #[test]
+    fn not_and_in_and_is_not_null_filter_rows() {
+        let (_e, ql) = setup_relational();
+        let r = ql
+            .execute("FROM chr_users |> WHERE NOT (balance > 80.0) |> EMIT user_id;")
+            .unwrap();
+        assert_eq!(r.rows.len(), 1, "{:?}", r.rows);
+        assert_eq!(
+            r.rows[0].fields.get("user_id"),
+            Some(&Value::Int(3)),
+            "NOT keeps only user 3 (75.0)"
+        );
+
+        let r = ql
+            .execute("FROM chr_users |> WHERE user_id IN (1, 3) |> EMIT user_id;")
+            .unwrap();
+        assert_eq!(r.rows.len(), 2);
+
+        let r = ql
+            .execute("FROM chr_users |> WHERE balance IS NOT NULL |> EMIT user_id;")
+            .unwrap();
+        assert_eq!(r.rows.len(), 3);
+    }
+
+    #[test]
+    fn join_stages_mirror_sql_semantics() {
+        let (engine, ql) = setup_relational();
+        let sql = ql.sql.clone();
+
+        // INNER JOIN: matched rows only; conflicting user_id surfaces as
+        // joined_user_id (single-namespace naming identical to SQL).
+        let got = ql
+            .execute(
+                "FROM chr_users |> JOIN chr_orders ON user_id = user_id \
+                 |> WHERE status = 'paid' |> EMIT username, total_usd;",
+            )
+            .unwrap();
+        let want = sql
+            .execute(
+                "SELECT username, total_usd FROM chr_users u \
+                 INNER JOIN chr_orders o ON u.user_id = o.user_id WHERE status = 'paid'",
+            )
+            .unwrap();
+        assert_eq!(got.rows.len(), 2);
+        for (w, g) in want.rows.iter().zip(got.rows.iter()) {
+            for col in ["username", "total_usd"] {
+                assert_eq!(w.get(col), g.fields.get(col), "INNER JOIN {}", col);
+            }
+        }
+
+        // LEFT JOIN NULL-extension: user 3 has no orders.
+        let got = ql
+            .execute(
+                "FROM chr_users |> LEFT JOIN chr_orders ON user_id = user_id \
+                 |> SORT user_id ASC |> EMIT username, order_id;",
+            )
+            .unwrap();
+        assert_eq!(got.rows.len(), 4, "3 users, 1 with two orders");
+        let alan = got
+            .rows
+            .iter()
+            .find(|r| r.fields.get("username") == Some(&Value::Text("alan".into())))
+            .unwrap();
+        assert_eq!(alan.fields.get("order_id"), Some(&Value::Null));
+
+        // RIGHT JOIN == LEFT with sides swapped: orphan-free orders cover
+        // users 1 and 2; user 3 drops out.
+        let got = ql
+            .execute(
+                "FROM chr_users |> RIGHT JOIN chr_orders ON user_id = user_id |> EMIT user_id;",
+            )
+            .unwrap();
+        assert_eq!(got.rows.len(), 3, "3 orders");
+
+        // FULL OUTER JOIN: every user + every order (no orphans here, so
+        // exactly the 4-row left-join set).
+        let got = ql
+            .execute(
+                "FROM chr_users |> FULL JOIN chr_orders ON user_id = user_id |> EMIT username;",
+            )
+            .unwrap();
+        assert_eq!(got.rows.len(), 4);
+        let _ = engine;
+    }
+
+    #[test]
+    fn group_stage_aggregates_and_having() {
+        let (_e, ql) = setup_relational();
+        // GROUP BY + named aggregates + HAVING (WHERE after GROUP).
+        let r = ql
+            .execute(
+                "FROM chr_orders |> GROUP BY user_id AGG cnt = COUNT(*), total = SUM(total_usd) \
+                 |> WHERE cnt >= 1 |> SORT cnt DESC |> EMIT user_id, cnt, total;",
+            )
+            .unwrap();
+        assert_eq!(r.rows.len(), 2, "two groups: user 1 (2 orders), user 2 (1)");
+        let user1 = r
+            .rows
+            .iter()
+            .find(|r| r.fields.get("user_id") == Some(&Value::Int(1)))
+            .unwrap();
+        assert_eq!(user1.fields.get("cnt"), Some(&Value::Int(2)));
+        assert_eq!(user1.fields.get("total"), Some(&Value::Float(120.0)));
+
+        // Whole-table aggregate (no GROUP BY): one row, COUNT = 3.
+        let r = ql
+            .execute("FROM chr_orders |> GROUP AGG n = COUNT(*) |> EMIT n;")
+            .unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0].fields.get("n"), Some(&Value::Int(3)));
+
+        // Aggregates skip NULLs; SUM of an all-NULL group is NULL.
+        let sql = ql.sql.clone();
+        sql.execute(
+            "INSERT INTO chr_orders (order_id, user_id, total_usd, status) VALUES (13, 3, 0.0, 'nullish')",
+        )
+        .unwrap();
+        sql.execute("UPDATE chr_orders SET total_usd = NULL WHERE order_id = 13")
+            .unwrap();
+        let r = ql
+            .execute(
+                "FROM chr_orders |> GROUP BY user_id AGG s = SUM(total_usd), c = COUNT(total_usd) \
+                 |> WHERE user_id = 3 |> EMIT s, c;",
+            )
+            .unwrap();
+        assert_eq!(r.rows[0].fields.get("s"), Some(&Value::Null));
+        assert_eq!(r.rows[0].fields.get("c"), Some(&Value::Int(0)));
+
+        // Pure GROUP BY (no AGG) = DISTINCT-style projection.
+        let r = ql
+            .execute("FROM chr_orders |> GROUP BY status |> EMIT status;")
+            .unwrap();
+        assert_eq!(r.rows.len(), 3, "paid, open, nullish");
+    }
+
+    #[test]
+    fn offset_computed_emit_and_union() {
+        let (_e, ql) = setup_relational();
+        // OFFSET before LIMIT.
+        let r = ql
+            .execute(
+                "FROM chr_users |> SORT user_id ASC |> OFFSET 1 |> LIMIT 2 |> EMIT user_id;",
+            )
+            .unwrap();
+        let ids: Vec<i64> = r
+            .rows
+            .iter()
+            .filter_map(|r| match r.fields.get("user_id") {
+                Some(Value::Int(i)) => Some(*i),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec![2, 3]);
+
+        // Computed EMIT with an alias.
+        let r = ql
+            .execute("FROM chr_users |> EMIT user_id, balance * 2 AS double_balance;")
+            .unwrap();
+        let ada = r
+            .rows
+            .iter()
+            .find(|r| r.fields.get("user_id") == Some(&Value::Int(1)))
+            .unwrap();
+        assert_eq!(
+            ada.fields.get("double_balance"),
+            Some(&Value::Float(200.0))
+        );
+
+        // UNION dedups; UNION ALL keeps both; tail stages hit the compound.
+        let r = ql
+            .execute("FROM chr_users |> EMIT user_id UNION FROM chr_orders |> EMIT user_id;")
+            .unwrap();
+        assert_eq!(r.rows.len(), 3, "dedup: users 1,2,3");
+        let r = ql
+            .execute(
+                "FROM chr_users |> EMIT user_id UNION ALL FROM chr_orders |> EMIT user_id;",
+            )
+            .unwrap();
+        assert_eq!(r.rows.len(), 6, "3 users + 3 orders");
+
+        // FIND search can be a UNION side too.
+        let r = ql
+            .execute("FROM chr_users |> EMIT user_id UNION ALL FROM chr_variants |> EMIT variant_id;")
+            .unwrap();
+        assert_eq!(r.rows.len(), 6);
+    }
+
+    #[test]
+    fn show_alter_and_index_ddl() {
+        let (_e, ql) = setup_relational();
+        // SHOW CHROMOSOMES (and the TABLES alias).
+        let r = ql.execute("SHOW CHROMOSOMES;").unwrap();
+        let names: Vec<String> = r
+            .rows
+            .iter()
+            .filter_map(|r| match r.fields.get("chromosome") {
+                Some(Value::Text(t)) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(names.contains(&"chr_users".to_string()));
+        assert!(names.contains(&"chr_orders".to_string()));
+        ql.execute("SHOW TABLES;").unwrap();
+
+        // ALTER CHROMOSOME ADD COLUMN — metadata-only online DDL.
+        ql.execute("ALTER CHROMOSOME chr_users ADD COLUMN note TEXT;")
+            .unwrap();
+        assert!(ql
+            .sql
+            .get_schema("chr_users")
+            .unwrap()
+            .columns
+            .contains_key("note"));
+
+        // CREATE / DROP INDEX render through the shared SQL registry.
+        ql.execute("CREATE INDEX idx_users_note ON chr_users (note);")
+            .unwrap();
+        assert!(ql
+            .sql
+            .get_schema("chr_users")
+            .unwrap()
+            .secondary_index_on("note")
+            .is_some());
+        ql.execute("DROP INDEX idx_users_note ON chr_users;").unwrap();
+        assert!(ql
+            .sql
+            .get_schema("chr_users")
+            .unwrap()
+            .secondary_index_on("note")
+            .is_none());
+    }
+
+    #[test]
+    fn explain_returns_plan_without_rows() {
+        let (_e, ql) = setup_relational();
+        let r = ql
+            .execute("EXPLAIN FROM chr_users |> WHERE balance > 90.0 |> EMIT user_id;")
+            .unwrap();
+        assert!(r.rows.is_empty());
+        assert!(r.engine_note.contains("Filter"), "{}", r.engine_note);
+        assert!(r.engine_note.contains("SeqScan"), "{}", r.engine_note);
+        // EXPLAIN of a write is rejected without executing.
+        assert!(ql.execute("EXPLAIN TX { chr_users:1.balance = 0.0 }").is_err());
+    }
+
+    #[test]
+    fn rowset_update_delete_and_insert_if_absent() {
+        let (engine, ql) = setup_relational();
+        let sql = ql.sql.clone();
+
+        // Row-set UPDATE with a broad WHERE.
+        let r = ql
+            .execute("UPDATE chr_users SET balance = 0.0 WHERE balance < 90.0;")
+            .unwrap();
+        assert_eq!(r.rows.len(), 1, "only user 3 (75.0)");
+        let raw = engine.get(b"chr_users:3").unwrap().unwrap();
+        let fields = RowCodec::decode(&raw).unwrap();
+        assert!(fields
+            .iter()
+            .any(|(k, v)| k == "balance" && *v == Value::Float(0.0)));
+
+        // UPDATE without WHERE touches every row.
+        ql.execute("UPDATE chr_users SET status_extra = 'x';").is_err(); // unknown column
+        let r = ql.execute("UPDATE chr_users SET balance = 1.5;").unwrap();
+        assert_eq!(r.rows.len(), 3);
+
+        // ?= insert-if-absent (ON CONFLICT DO NOTHING spelling).
+        let r = ql
+            .execute(
+                "TX { chr_users:9 ?= { user_id: 9, username: 'new', balance: 10.0 } };",
+            )
+            .unwrap();
+        assert_eq!(r.rows[0].fields.get("inserted"), Some(&Value::Int(1)));
+        let r = ql
+            .execute(
+                "TX { chr_users:9 ?= { user_id: 9, username: 'AGAIN', balance: 99.0 } };",
+            )
+            .unwrap();
+        assert_eq!(r.rows[0].fields.get("inserted"), Some(&Value::Int(0)));
+        let raw = engine.get(b"chr_users:9").unwrap().unwrap();
+        let fields = RowCodec::decode(&raw).unwrap();
+        assert!(
+            fields.iter().any(|(k, v)| k == "username" && *v == Value::Text("new".into())),
+            "?= must not overwrite an existing locus"
+        );
+
+        // Row-set DELETE honors FK CASCADE (user 1's orders go too) and
+        // RESTRICT errors.
+        let r = ql.execute("DELETE FROM chr_users WHERE user_id = 1;").unwrap();
+        assert_eq!(r.rows.len(), 3, "user 1 + 2 cascaded orders");
+        assert!(engine.get(b"chr_users:1").unwrap().is_none());
+        assert!(engine.get(b"chr_orders:10").unwrap().is_none());
+        assert!(engine.get(b"chr_orders:11").unwrap().is_none());
+
+        // RESTRICT: chr_users is referenced by chr_orders ON DELETE CASCADE,
+        // so create a RESTRICT reference to exercise the error path.
+        sql.execute(
+            "CREATE TABLE chr_notes (note_id INT, user_id INT, PRIMARY KEY (note_id), \
+             FOREIGN KEY (user_id) REFERENCES chr_users(user_id))",
+        )
+        .unwrap();
+        sql.execute("INSERT INTO chr_notes (note_id, user_id) VALUES (1, 2)")
+            .unwrap();
+        let err = ql.execute("DELETE FROM chr_users WHERE user_id = 2;").unwrap_err();
+        assert!(err.contains("RESTRICT"), "{}", err);
+
+        // DELETE without WHERE removes everything.
+        let r = ql.execute("DELETE FROM chr_orders;").unwrap();
+        assert_eq!(r.rows.len(), 1, "only order 12 is left at this point");
+        let _ = sql;
+    }
 }
+
 #[cfg(test)]
 mod acl_parse_tests {
     use super::referenced_tables;

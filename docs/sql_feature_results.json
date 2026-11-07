@@ -1,6 +1,6 @@
 {
   "meta": {
-    "date": "2026-10-31 21:20:04",
+    "date": "2026-11-07 23:30:25",
     "machine": "Linux-5.10.134-013.15.kangaroo.al8.x86_64-x86_64-with-glibc2.41",
     "systems": {
       "dnadb": "dna-db-core 3.0.0 (native, --sync strict)",
@@ -137,7 +137,7 @@
           "status": "ok",
           "detail": "6 row(s) match",
           "note": "plan: SeqScan(users) -> Filter(balance IS NOT NULL) -> Sort(user_id ASC) -> Project([\"user_id\"])",
-          "expect": "unsupported"
+          "expect": "rows"
         }
       }
     },
@@ -150,7 +150,7 @@
           "status": "ok",
           "detail": "3 row(s) match",
           "note": "plan: SeqScan(orders) -> Sort(order_id ASC) -> Project([\"order_id\", \"total_usd * 2 AS double_total\"]) -> Limit(3)",
-          "expect": "unsupported"
+          "expect": "rows"
         }
       }
     },
@@ -163,7 +163,7 @@
           "status": "ok",
           "detail": "8 row(s) match",
           "note": "plan: SeqScan(users) -> InnerHashJoin(users.user_id, orders.user_id) -> Sort(order_id ASC) -> Project([\"username\", \"order_id\"])",
-          "expect": "unsupported"
+          "expect": "rows"
         }
       }
     },
@@ -202,7 +202,7 @@
           "status": "ok",
           "detail": "8 row(s) match",
           "note": "plan: SeqScan(users) -> RightHashJoin(users.user_id, orders.user_id) -> Sort(order_id ASC) -> Project([\"username\", \"order_id\"])",
-          "expect": "unsupported"
+          "expect": "rows"
         }
       }
     },
@@ -215,7 +215,7 @@
           "status": "ok",
           "detail": "10 row(s) match",
           "note": "plan: SeqScan(users) -> FullHashJoin(users.user_id, orders.user_id) -> Sort(user_id ASC, order_id ASC) -> Project([\"username\", \"order_id\"])",
-          "expect": "unsupported"
+          "expect": "rows"
         }
       }
     },
@@ -306,7 +306,7 @@
           "status": "ok",
           "detail": "1 row(s) match",
           "note": "plan: ScalarEvaluate() -> ScalarSub(once: SELECT MAX(total_usd) FROM orders) -> Project([\"SELECT MAX(total_usd) FROM orders AS mx\"])",
-          "expect": "unsupported"
+          "expect": "rows"
         }
       }
     },
@@ -384,7 +384,7 @@
           "status": "ok",
           "detail": "0 row(s) match",
           "note": "rolled-back row must not exist | plan: PointGet(users = 50) -> Filter(user_id = 50) -> Project([\"username\"])",
-          "expect": "unsupported"
+          "expect": "rows"
         }
       }
     },
@@ -397,7 +397,7 @@
           "status": "ok",
           "detail": "10 row(s) match",
           "note": "plan: Union(DISTINCT) [ SeqScan(users) -> Project([\"username\"]) | SeqScan(orders) -> Project([\"status\"]) ]",
-          "expect": "unsupported"
+          "expect": "rows"
         }
       }
     },
@@ -410,7 +410,7 @@
           "status": "ok",
           "detail": "SHOW TABLES -> ['3', '4', 'big_orders', 'lsm+reedsolomon rs(4+2)', 'orders', 'users']",
           "note": "",
-          "expect": "unsupported"
+          "expect": "ok"
         }
       }
     },
@@ -423,7 +423,7 @@
           "status": "ok",
           "detail": "EXPLAIN returns 1 row(s)",
           "note": "",
-          "expect": "unsupported"
+          "expect": "ok"
         }
       }
     }
