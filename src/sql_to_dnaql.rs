@@ -339,16 +339,35 @@ pub(crate) fn transpile(
                 .map(|t| format!(" ON {}", t))
                 .unwrap_or_default()
         )),
-        Stmt::AddColumn {
-            table,
-            column,
-            col_type,
-        } => Ok(format!(
-            "ALTER CHROMOSOME {} ADD COLUMN {} {};",
-            table,
-            column,
-            type_name(col_type)?
-        )),
+        Stmt::AlterTable { table, action } => match action {
+            crate::sql_engine::AlterAction::AddColumn { column, col_type } => Ok(format!(
+                "ALTER CHROMOSOME {} ADD COLUMN {} {};",
+                table,
+                column,
+                type_name(col_type)?
+            )),
+            crate::sql_engine::AlterAction::DropColumn { column } => Ok(format!(
+                "ALTER CHROMOSOME {} DROP COLUMN {};",
+                table, column
+            )),
+            crate::sql_engine::AlterAction::RenameColumn { old, new } => Ok(format!(
+                "ALTER CHROMOSOME {} RENAME COLUMN {} TO {};",
+                table, old, new
+            )),
+            crate::sql_engine::AlterAction::ModifyColumn { column, col_type } => Ok(format!(
+                "ALTER CHROMOSOME {} MODIFY COLUMN {} {};",
+                table,
+                column,
+                type_name(col_type)?
+            )),
+            crate::sql_engine::AlterAction::ChangeColumn { old, new, col_type } => Ok(format!(
+                "ALTER CHROMOSOME {} CHANGE COLUMN {} {} {};",
+                table,
+                old,
+                new,
+                type_name(col_type)?
+            )),
+        },
         Stmt::ShowTables => Ok("SHOW CHROMOSOMES;".into()),
         Stmt::ShowStorage { table, .. } => Err(format!(
             "SQL→DnaQL: SHOW STORAGE is SQL-only; the DnaQL equivalent for one locus is \
@@ -389,7 +408,7 @@ fn describe_kind(stmt: &Stmt) -> &'static str {
         Stmt::DropTable { .. } => "DROP TABLE",
         Stmt::CreateIndex { .. } => "CREATE INDEX",
         Stmt::DropIndex { .. } => "DROP INDEX",
-        Stmt::AddColumn { .. } => "ALTER TABLE",
+        Stmt::AlterTable { .. } => "ALTER TABLE",
         Stmt::ShowTables => "SHOW TABLES",
         Stmt::ShowStorage { .. } => "SHOW STORAGE",
         Stmt::Explain(_) => "EXPLAIN",
@@ -417,6 +436,7 @@ fn select_pipeline(
         joins,
         where_clause,
         group_by,
+        grouping,
         having,
         order_by,
         limit,
@@ -428,6 +448,12 @@ fn select_pipeline(
             describe_kind(stmt)
         ));
     };
+    if !grouping.is_empty() {
+        return Err(
+            "SQL→DnaQL: GROUPING SETS (ROLLUP/CUBE/WITH ROLLUP) is SQL-only; run the \"
+             GROUP BY\" levels as separate DnaQL GROUP pipelines".into(),
+        );
+    }
 
     let schema = schema_of(from)
         .ok_or_else(|| format!("SQL→DnaQL: table '{}' does not exist", from))?;
@@ -1158,6 +1184,50 @@ mod tests {
                 .unwrap(),
             "ALTER CHROMOSOME chr_users ADD COLUMN note TEXT;"
         );
+        // v4.2: every ALTER action has a DnaQL spelling, and the DnaQL form
+        // executes through the same online DDL (parity in both directions).
+        assert_eq!(
+            sql.sql_to_dnaql("ALTER TABLE chr_users DROP COLUMN note")
+                .unwrap(),
+            "ALTER CHROMOSOME chr_users DROP COLUMN note;"
+        );
+        assert_eq!(
+            sql.sql_to_dnaql("ALTER TABLE chr_users RENAME COLUMN note TO memo")
+                .unwrap(),
+            "ALTER CHROMOSOME chr_users RENAME COLUMN note TO memo;"
+        );
+        assert_eq!(
+            sql.sql_to_dnaql("ALTER TABLE chr_users MODIFY COLUMN note INT")
+                .unwrap(),
+            "ALTER CHROMOSOME chr_users MODIFY COLUMN note INT;"
+        );
+        assert_eq!(
+            sql.sql_to_dnaql("ALTER TABLE chr_users CHANGE COLUMN note memo INT")
+                .unwrap(),
+            "ALTER CHROMOSOME chr_users CHANGE COLUMN note memo INT;"
+        );
+        // Round-trip: DnaQL ALTER forms execute like their SQL twins.
+        let dnaql = crate::dna_ql::DnaQlEngine::new(
+            crate::engine::Engine::open(crate::engine::EngineConfig {
+                dir_path: std::env::temp_dir().join(format!("dna_ddl_rt_{}", std::process::id())),
+                memtable_capacity: 4 * 1024 * 1024,
+                sync_mode: crate::wal::SyncMode::Strict,
+                mirror_disk_path: None,
+                ..Default::default()
+            })
+            .unwrap()
+            .into(),
+            sql.clone(),
+        );
+        dnaql.execute("CREATE CHROMOSOME chr_rt (id INT, name TEXT, PRIMARY KEY (id));").unwrap();
+        dnaql.execute("ALTER CHROMOSOME chr_rt ADD COLUMN tag TEXT;").unwrap();
+        dnaql.execute("ALTER CHROMOSOME chr_rt RENAME COLUMN tag TO label;").unwrap();
+        dnaql.execute("ALTER CHROMOSOME chr_rt MODIFY COLUMN label INT;").unwrap();
+        dnaql.execute("ALTER CHROMOSOME chr_rt CHANGE COLUMN label mark TEXT;").unwrap();
+        dnaql.execute("ALTER CHROMOSOME chr_rt DROP COLUMN mark;").unwrap();
+        let schema = dnaql.sql.get_schema("chr_rt").unwrap();
+        assert!(schema.columns.contains_key("name"));
+        assert!(!schema.columns.contains_key("mark"));
     }
 
     #[test]

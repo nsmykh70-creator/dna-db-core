@@ -363,20 +363,23 @@ DROP INDEX idx_orders_total ON chr_orders;
 
 ### 3.5. Ограничения (честно)
 
-- нет `GROUP BY ROLLUP`/`CUBE`, нет оконных рамок (frames) — из оконных
-  функций только `ROW_NUMBER`/`RANK`/`DENSE_RANK`, и они не сочетаются
-  с `GROUP BY`/агрегатами;
-- JOIN-планы всегда hash-join — индексные JOIN-планы не строятся
-  (точечные `WHERE pk = …` и диапазоны по индексам планируются);
-- `ALTER TABLE` — только `ADD COLUMN` (metadata-only, мгновенно);
-  DROP/RENAME колонки и смена типа не поддерживаются;
-- скалярные/коррелированные подзапросы, `EXISTS` и CTE (`WITH`)
-  поддерживаются (с v3.6), но `LATERAL` и рекурсивные CTE — нет;
-- `RIGHT/FULL JOIN`, `UNION [ALL]` и SQL-транзакции
-  (`BEGIN/COMMIT/ROLLBACK`) реализованы с v3.6.
+- `LATERAL` и коррелированные производные таблицы в FROM не
+  поддерживаются (скалярные/коррелированные подзапросы, `EXISTS`, CTE
+  и `WITH RECURSIVE` — поддерживаются);
+- value-offset `RANGE`-рамки окон (`RANGE BETWEEN n PRECEDING ...`)
+  не поддерживаются — используйте `ROWS`; `RANGE` принимается для
+  `UNBOUNDED PRECEDING / CURRENT ROW / UNBOUNDED FOLLOWING`;
+- смена типа PK-колонки (`ALTER TABLE ... MODIFY COLUMN <pk>`) не
+  поддерживается — ключи строк выводятся из значения PK (пересоздайте
+  таблицу); DROP/RENAME/MODIFY/CHANGE обычных колонок поддержаны
+  с v4.2, все DML/DDL-ограничения предыдущих версий сняты:
+  `RIGHT/FULL JOIN`, `UNION [ALL]`, SQL-транзакции
+  (`BEGIN/COMMIT/ROLLBACK`) — с v3.6; оконные функции с рамками и
+  поверх GROUP BY, `ROLLUP`/`CUBE`, `WITH RECURSIVE` и IndexJoin-планы —
+  с v4.2.
 
 Актуальный список честных ограничений платформы — в
-[RELEASE_NOTES_v4.0.0.md](RELEASE_NOTES_v4.0.0.md).
+[RELEASE_NOTES_v4.2.0.md](RELEASE_NOTES_v4.2.0.md).
 
 ---
 

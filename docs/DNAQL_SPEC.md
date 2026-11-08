@@ -83,7 +83,12 @@ RowSetStmt      ::= "UPDATE" Identifier "SET" Identifier "=" Literal ("," ...)* 
 
 ChromosomeDDL   ::= "CREATE" "CHROMOSOME" Identifier ["IF NOT EXISTS"] "(" DefList ")" ";"
                   | "DROP" "CHROMOSOME" Identifier ["IF EXISTS"] ";"
-                  | "ALTER" "CHROMOSOME" Identifier "ADD" "COLUMN" Identifier Type ";" ;
+                  | "ALTER" "CHROMOSOME" Identifier AlterAction ";" ;
+AlterAction     ::= "ADD" "COLUMN" Identifier Type
+                  | "DROP" "COLUMN" Identifier                    (* v4.2 *)
+                  | "RENAME" "COLUMN" Identifier "TO" Identifier  (* v4.2 *)
+                  | "MODIFY" "COLUMN" Identifier Type             (* v4.2 *)
+                  | "CHANGE" "COLUMN" Identifier Identifier Type ;(* v4.2 *)
 
 IndexDDL        ::= "CREATE" ["UNIQUE"] "INDEX" ["IF NOT EXISTS"] Identifier
                     "ON" Identifier "(" Identifier ")" ";"
@@ -220,6 +225,11 @@ durability. Крэш между инструкциями оставляет ло
 ### 4.6. DDL и интроспекция (v2.2)
 - `CREATE CHROMOSOME` / `DROP CHROMOSOME` — как в v2.1, через реестр схем SQL-движка.
 - `ALTER CHROMOSOME t ADD COLUMN c TYPE` — мгновенная metadata-only DDL (v3.9).
+- `ALTER CHROMOSOME t DROP|RENAME|MODIFY|CHANGE COLUMN ...` (v4.2) —
+  полный цикл колонки: DROP перезаписывает строки одним атомарным батчем
+  (колонка не «воскресает»), RENAME/MODIFY/CHANGE конвертируют значения
+  и перестраивают индексы; рендерятся через SQL-движок, семантика
+  идентична `ALTER TABLE` (см. SQL_MANUAL_RU §2.3/§3.5).
 - `CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON chr (col)` /
   `DROP INDEX [IF EXISTS] name [ON chr]` — реестр индексов общий с SQL.
 - `SHOW CHROMOSOMES` (алиас `SHOW TABLES`) — строки вида `chromosome`.

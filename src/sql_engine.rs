@@ -274,6 +274,11 @@ pub enum Stmt {
         joins: Vec<JoinSpec>,
         where_clause: Option<Expr>,
         group_by: Vec<String>,
+        /// v4.2 grouping sets (ROLLUP / CUBE / WITH ROLLUP): empty for a
+        /// plain GROUP BY; otherwise one set per super-aggregate level.
+        /// `group_by` keeps the declared column list for validation and
+        /// NULL-marker insertion; the sets drive the actual aggregation.
+        grouping: Vec<Vec<String>>,
         having: Option<Expr>,
         order_by: Vec<(String, bool)>, // (column / aggregate name, asc)
         limit: Option<usize>,
@@ -349,15 +354,59 @@ pub enum Stmt {
     /// v3.6: `WITH name AS (SELECT ...) [, name2 AS (...)] SELECT ...` —
     /// common table expressions. Each CTE is materialised once into a
     /// statement-scoped temp store and referenced like a table.
+    /// v4.2: `WITH RECURSIVE` — a CTE whose definition is `base UNION [ALL]
+    /// recursive` is evaluated iteratively (the recursive side sees only
+    /// the previous round's rows; iteration stops on an empty round).
     Cte {
         ctes: Vec<(String, Stmt)>,
+        /// v4.2: WITH RECURSIVE — iterative materialisation per CTE whose
+        /// definition is a UNION of a base and a self-referencing side.
+        recursive: bool,
         body: Box<Stmt>,
     },
-    /// v3.9 Online DDL: instant metadata-only `ALTER TABLE t ADD COLUMN c T`
-    /// (no row rewrite; existing rows read the new column as NULL).
-    AddColumn {
+    /// v4.2 full online DDL: `ALTER TABLE t <action>` — ADD / DROP / RENAME
+    /// COLUMN and MODIFY / CHANGE COLUMN (type conversion) are all supported.
+    /// ADD stays metadata-only and instant; every other action rewrites the
+    /// schema and all row payloads in ONE atomic WAL batch.
+    AlterTable {
         table: String,
+        action: AlterAction,
+    },
+}
+
+/// v4.2: the action part of an `ALTER TABLE` statement.
+#[derive(Debug, Clone)]
+pub(crate) enum AlterAction {
+    /// `ADD [COLUMN] c T` — metadata-only and instant (v3.9 behaviour kept).
+    AddColumn {
         column: String,
+        col_type: ColumnType,
+    },
+    /// `DROP [COLUMN] c` — metadata-only: the column disappears from the
+    /// schema (and from every projection), stale bytes inside old row
+    /// payloads are ignored by readers and physically removed on the next
+    /// rewrite of each row. Secondary indexes on the column are swept.
+    DropColumn {
+        column: String,
+    },
+    /// `RENAME COLUMN a TO b` — one atomic batch rewrites the schema plus
+    /// every row payload that carries the old key and the secondary index
+    /// built over it.
+    RenameColumn {
+        old: String,
+        new: String,
+    },
+    /// `MODIFY [COLUMN] c T` — every stored value is converted to the new
+    /// type. All rows are converted in memory first; a single inconvertible
+    /// value aborts the whole statement before anything is written.
+    ModifyColumn {
+        column: String,
+        col_type: ColumnType,
+    },
+    /// `CHANGE [COLUMN] a b T` — rename + type conversion in one pass.
+    ChangeColumn {
+        old: String,
+        new: String,
         col_type: ColumnType,
     },
 }
@@ -423,11 +472,19 @@ pub(crate) enum SelectItem {
         rendered: String,
     },
     /// v3.6: window function `ROW_NUMBER() / RANK() / DENSE_RANK() OVER
-    /// (PARTITION BY ... ORDER BY ...)` computed over the filtered row set.
+    /// (PARTITION BY ... ORDER BY ...)`; v4.2 adds aggregate window
+    /// functions (SUM/COUNT/AVG/MIN/MAX over a frame) and ROWS/RANGE
+    /// frames. Computed AFTER aggregation (standard SQL order): over the
+    /// grouped rows when GROUP BY/aggregates are present, else over the
+    /// filtered row set.
     Window {
         func: WindowFunc,
         partition: Vec<String>,
         order: Vec<(String, bool)>,
+        /// v4.2: optional explicit `ROWS BETWEEN ... AND ...` / `RANGE ...`
+        /// frame; None = the standard default (whole partition without
+        /// ORDER BY, RANGE UNBOUNDED PRECEDING..CURRENT ROW with it).
+        frame: Option<WindowFrame>,
         /// Canonical rendering used as the internal row key.
         canonical: String,
         /// Output column name: alias if given, else the canonical rendering.
@@ -435,20 +492,59 @@ pub(crate) enum SelectItem {
     },
 }
 
-/// v3.6 ranking window functions.
+/// v4.2: one bound of a window frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrameBound {
+    UnboundedPreceding,
+    /// `ROWS n PRECEDING` (n >= 0; 0 == CURRENT ROW).
+    Preceding(i64),
+    CurrentRow,
+    /// `ROWS n FOLLOWING` (n >= 0; 0 == CURRENT ROW).
+    Following(i64),
+    UnboundedFollowing,
+}
+
+/// v4.2: explicit window frame (`ROWS`/`RANGE` between two bounds).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WindowFrame {
+    pub start: FrameBound,
+    pub end: FrameBound,
+}
+
+/// v3.6 ranking window functions; v4.2 adds aggregates used as window
+/// functions (`SUM(x) OVER (...)` etc. — the frame determines the peers).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WindowFunc {
     RowNumber,
     Rank,
     DenseRank,
+    /// An aggregate evaluated per row over the window frame. `arg == None`
+    /// is only valid for COUNT(*).
+    Agg {
+        func: AggFunc,
+        arg: Option<String>,
+    },
 }
 
 impl WindowFunc {
-    fn name(&self) -> &'static str {
+    /// Function name for plan/canonical rendering (aggregate style for the
+    /// Agg variant, e.g. `SUM(total)`).
+    fn render_name(&self) -> String {
         match self {
-            WindowFunc::RowNumber => "ROW_NUMBER",
-            WindowFunc::Rank => "RANK",
-            WindowFunc::DenseRank => "DENSE_RANK",
+            WindowFunc::RowNumber => "ROW_NUMBER".to_string(),
+            WindowFunc::Rank => "RANK".to_string(),
+            WindowFunc::DenseRank => "DENSE_RANK".to_string(),
+            WindowFunc::Agg { func, arg } => format!(
+                "{}({})",
+                match func {
+                    AggFunc::Count => "COUNT",
+                    AggFunc::Sum => "SUM",
+                    AggFunc::Avg => "AVG",
+                    AggFunc::Min => "MIN",
+                    AggFunc::Max => "MAX",
+                },
+                arg.as_deref().unwrap_or("*")
+            ),
         }
     }
     fn from_name(name: &str) -> Option<Self> {
@@ -458,6 +554,10 @@ impl WindowFunc {
             "DENSE_RANK" => Some(WindowFunc::DenseRank),
             _ => None,
         }
+    }
+    /// True for ranking functions (their value never depends on the frame).
+    fn is_ranking(&self) -> bool {
+        !matches!(self, WindowFunc::Agg { .. })
     }
 }
 
@@ -685,24 +785,48 @@ impl SParser {
         } else if self.kw("ALTER") {
             self.expect_kw("TABLE")?;
             let table = self.ident()?;
-            self.expect_kw("ADD")?;
-            self.expect_kw("COLUMN")?;
-            let column = self.ident()?;
-            let col_type = if self.kw("INT") || self.kw("INTEGER") || self.kw("INT64") {
-                ColumnType::Int64
-            } else if self.kw("FLOAT") || self.kw("FLOAT64") || self.kw("DOUBLE") {
-                ColumnType::Float64
-            } else if self.kw("TEXT") || self.kw("VARCHAR") || self.kw("STRING") {
-                ColumnType::Text
-            } else if self.kw("DNA") || self.kw("DNA2BIT") {
-                ColumnType::Dna2Bit
-            } else if self.kw("TIMESTAMP") {
-                ColumnType::Timestamp
+            // v4.2: full ALTER TABLE surface — ADD / DROP / RENAME /
+            // MODIFY / CHANGE COLUMN (MySQL-compatible spellings; the
+            // COLUMN keyword is optional exactly like in MySQL).
+            let action = if self.kw("ADD") {
+                let _ = self.kw("COLUMN");
+                let column = self.ident()?;
+                let col_type = self.parse_col_type(&column)?;
+                AlterAction::AddColumn { column, col_type }
+            } else if self.kw("DROP") {
+                let _ = self.kw("COLUMN");
+                AlterAction::DropColumn {
+                    column: self.ident()?,
+                }
+            } else if self.kw("RENAME") {
+                if !self.kw("COLUMN") {
+                    return Err(
+                        "SQL: unsupported ALTER TABLE RENAME target (supported: RENAME COLUMN a TO b)"
+                            .into(),
+                    );
+                }
+                let old = self.ident()?;
+                self.expect_kw("TO")?;
+                AlterAction::RenameColumn { old, new: self.ident()? }
+            } else if self.kw("MODIFY") {
+                let _ = self.kw("COLUMN");
+                let column = self.ident()?;
+                let col_type = self.parse_col_type(&column)?;
+                AlterAction::ModifyColumn { column, col_type }
+            } else if self.kw("CHANGE") {
+                let _ = self.kw("COLUMN");
+                let old = self.ident()?;
+                let new = self.ident()?;
+                let col_type = self.parse_col_type(&new)?;
+                AlterAction::ChangeColumn { old, new, col_type }
             } else {
-                return Err(format!("SQL: unknown column type for '{}'", column));
+                return Err(
+                    "SQL: unsupported ALTER TABLE action (supported: ADD / DROP / RENAME / MODIFY / CHANGE COLUMN)"
+                        .into(),
+                );
             };
             self.eat_semi();
-            Ok(Stmt::AddColumn { table, column, col_type })
+            Ok(Stmt::AlterTable { table, action })
         } else if self.kw("EXPLAIN") {
             // kw() already consumed the EXPLAIN token.
             let inner = self.parse_stmt()?;
@@ -722,9 +846,34 @@ impl SParser {
         }
     }
 
+    /// Parse the column-type tail of a DDL item (v4.2 helper shared by
+    /// every `ALTER TABLE` action): INT | INTEGER | INT64 | FLOAT |
+    /// FLOAT64 | DOUBLE | TEXT | VARCHAR | STRING | DNA | DNA2BIT |
+    /// TIMESTAMP. A trailing `NOT NULL` is accepted but not enforced,
+    /// mirroring CREATE TABLE.
+    fn parse_col_type(&mut self, column: &str) -> Result<ColumnType, String> {
+        let ty = if self.kw("INT") || self.kw("INTEGER") || self.kw("INT64") {
+            ColumnType::Int64
+        } else if self.kw("FLOAT") || self.kw("FLOAT64") || self.kw("DOUBLE") {
+            ColumnType::Float64
+        } else if self.kw("TEXT") || self.kw("VARCHAR") || self.kw("STRING") {
+            ColumnType::Text
+        } else if self.kw("DNA") || self.kw("DNA2BIT") {
+            ColumnType::Dna2Bit
+        } else if self.kw("TIMESTAMP") {
+            ColumnType::Timestamp
+        } else {
+            return Err(format!("SQL: unknown column type for '{}'", column));
+        };
+        let _ = self.kw("NOT") && self.kw("NULL"); // accepted, not enforced
+        Ok(ty)
+    }
+
     /// `WITH name AS (SELECT ...) [, name2 AS (...)] body` (v3.6).
     fn parse_cte(&mut self) -> Result<Stmt, String> {
         self.enter()?;
+        // v4.2: `WITH RECURSIVE name AS (base UNION [ALL] recursive) body`.
+        let recursive = self.kw("RECURSIVE");
         let mut ctes = Vec::new();
         loop {
             let name = self.ident()?;
@@ -746,6 +895,7 @@ impl SParser {
         self.leave();
         Ok(Stmt::Cte {
             ctes,
+            recursive,
             body: Box::new(body),
         })
     }
@@ -873,20 +1023,52 @@ impl SParser {
         } else {
             None
         };
-        let group_by = if self.kw("GROUP") {
+        let (group_by, grouping) = if self.kw("GROUP") {
             self.expect_kw("BY")?;
-            let mut cols = Vec::new();
-            loop {
-                cols.push(self.ident()?);
-                if matches!(self.peek(), STok::Comma) {
-                    self.next();
-                } else {
-                    break;
+            // v4.2: set-based grouping — `GROUP BY ROLLUP (a, b)` /
+            // `GROUP BY CUBE (a, b)` (standard SQL spellings).
+            let set_head = matches!(self.peek(), STok::Ident(s) if s.eq_ignore_ascii_case("ROLLUP") || s.eq_ignore_ascii_case("CUBE"));
+            if set_head && matches!(self.peek_at(1), STok::LParen) {
+                let cube = matches!(self.peek(), STok::Ident(s) if s.eq_ignore_ascii_case("CUBE"));
+                self.next();
+                self.expect(STok::LParen)?;
+                let mut cols = Vec::new();
+                loop {
+                    cols.push(self.ident()?);
+                    if matches!(self.peek(), STok::Comma) {
+                        self.next();
+                    } else {
+                        break;
+                    }
                 }
+                self.expect(STok::RParen)?;
+                let sets = if cube {
+                    cube_sets(&cols)?
+                } else {
+                    rollup_sets(&cols)
+                };
+                (cols, sets)
+            } else {
+                let mut cols = Vec::new();
+                loop {
+                    cols.push(self.ident()?);
+                    if matches!(self.peek(), STok::Comma) {
+                        self.next();
+                    } else {
+                        break;
+                    }
+                }
+                // v4.2: MySQL spelling `GROUP BY a, b WITH ROLLUP`.
+                let grouping = if self.kw("WITH") {
+                    self.expect_kw("ROLLUP")?;
+                    rollup_sets(&cols)
+                } else {
+                    Vec::new()
+                };
+                (cols, grouping)
             }
-            cols
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
         let having = if self.kw("HAVING") {
             Some(self.parse_expr()?)
@@ -958,6 +1140,7 @@ impl SParser {
             joins,
             where_clause,
             group_by,
+            grouping,
             having,
             order_by,
             limit,
@@ -992,59 +1175,85 @@ impl SParser {
                 rendered,
             });
         }
-        // v3.6: window function ROW_NUMBER()/RANK()/DENSE_RANK() OVER (...).
+        // v3.6: window functions `ROW_NUMBER()/RANK()/DENSE_RANK() OVER (...)`;
+        // v4.2 also accepts aggregates as window functions (`SUM(x) OVER
+        // (...)`) — an aggregate call followed by OVER is a window, anything
+        // else stays a plain aggregate (the parser backtracks to try it).
         if let STok::Ident(s) = self.peek().clone() {
-            if matches!(self.peek_at(1), STok::LParen)
-                && WindowFunc::from_name(&s).is_some()
-            {
-                let func = WindowFunc::from_name(&s).unwrap();
-                self.next();
-                self.next(); // (
-                self.expect(STok::RParen)?;
-                self.expect_kw("OVER")?;
-                self.expect(STok::LParen)?;
-                let mut partition = Vec::new();
-                if self.kw("PARTITION") {
-                    self.expect_kw("BY")?;
-                    loop {
-                        partition.push(self.ident()?);
-                        if matches!(self.peek(), STok::Comma) {
-                            self.next();
-                        } else {
-                            break;
-                        }
-                    }
+            if matches!(self.peek_at(1), STok::LParen) {
+                if WindowFunc::from_name(&s).is_some() {
+                    let func = WindowFunc::from_name(&s).unwrap();
+                    self.next();
+                    self.next(); // (
+                    self.expect(STok::RParen)?;
+                    self.expect_kw("OVER")?;
+                    let (partition, order, frame) = self.parse_over_spec()?;
+                    let alias = self.maybe_as_alias()?;
+                    let canonical = render_window(&func, &partition, &order, frame);
+                    let rendered = alias.unwrap_or_else(|| canonical.clone());
+                    return Ok(SelectItem::Window {
+                        func,
+                        partition,
+                        order,
+                        frame,
+                        canonical,
+                        rendered,
+                    });
                 }
-                let mut order = Vec::new();
-                if self.kw("ORDER") {
-                    self.expect_kw("BY")?;
-                    loop {
-                        let col = self.ident()?;
-                        let asc = if self.kw("DESC") {
-                            false
+                if AggFunc::from_name(&s).is_ok() {
+                    let save = self.pos;
+                    let func = AggFunc::from_name(&s).unwrap();
+                    self.next();
+                    self.next(); // (
+                    let arg = if matches!(self.peek(), STok::Star) {
+                        self.next();
+                        None
+                    } else {
+                        let first = self.ident()?;
+                        // v4.2: nested aggregate `SUM(SUM(x)) OVER (...)` —
+                        // the inner aggregate names the canonical key that
+                        // the grouped rows carry when windows run over a
+                        // GROUP BY result (standard SQL spelling).
+                        if matches!(self.peek(), STok::LParen) {
+                            if AggFunc::from_name(&first).is_ok() {
+                                self.next(); // (
+                                let inner = if matches!(self.peek(), STok::Star) {
+                                    self.next();
+                                    None
+                                } else {
+                                    Some(self.ident()?)
+                                };
+                                self.expect(STok::RParen)?;
+                                Some(render_agg(&first, inner.as_deref()))
+                            } else {
+                                return Err(format!(
+                                    "SQL: unsupported window argument '{}(...)' (column or aggregate expected)",
+                                    first
+                                ));
+                            }
                         } else {
-                            self.kw("ASC");
-                            true
-                        };
-                        order.push((col, asc));
-                        if matches!(self.peek(), STok::Comma) {
-                            self.next();
-                        } else {
-                            break;
+                            Some(first)
                         }
+                    };
+                    self.expect(STok::RParen)?;
+                    if self.kw("OVER") {
+                        let (partition, order, frame) = self.parse_over_spec()?;
+                        let wfunc = WindowFunc::Agg { func, arg };
+                        let alias = self.maybe_as_alias()?;
+                        let canonical = render_window(&wfunc, &partition, &order, frame);
+                        let rendered = alias.unwrap_or_else(|| canonical.clone());
+                        return Ok(SelectItem::Window {
+                            func: wfunc,
+                            partition,
+                            order,
+                            frame,
+                            canonical,
+                            rendered,
+                        });
                     }
+                    // Not a window: rewind and let the aggregate branch parse it.
+                    self.pos = save;
                 }
-                self.expect(STok::RParen)?;
-                let alias = self.maybe_as_alias()?;
-                let canonical = render_window(&func, &partition, &order);
-                let rendered = alias.unwrap_or_else(|| canonical.clone());
-                return Ok(SelectItem::Window {
-                    func,
-                    partition,
-                    order,
-                    canonical,
-                    rendered,
-                });
             }
         }
         // aggregate call: COUNT(*) / SUM(col) — recognised before the general
@@ -1126,6 +1335,159 @@ impl SParser {
             }
         }
         Ok(None)
+    }
+
+    /// v4.2: the body of an `OVER (...)` clause: PARTITION BY refs, ORDER
+    /// BY refs and an optional ROWS/RANGE frame.
+    fn parse_over_spec(
+        &mut self,
+    ) -> Result<(Vec<String>, Vec<(String, bool)>, Option<WindowFrame>), String> {
+        self.expect(STok::LParen)?;
+        let mut partition = Vec::new();
+        if self.kw("PARTITION") {
+            self.expect_kw("BY")?;
+            loop {
+                partition.push(self.parse_window_ref()?);
+                if matches!(self.peek(), STok::Comma) {
+                    self.next();
+                } else {
+                    break;
+                }
+            }
+        }
+        let mut order = Vec::new();
+        if self.kw("ORDER") {
+            self.expect_kw("BY")?;
+            loop {
+                let col = self.parse_window_ref()?;
+                let asc = if self.kw("DESC") {
+                    false
+                } else {
+                    self.kw("ASC");
+                    true
+                };
+                order.push((col, asc));
+                if matches!(self.peek(), STok::Comma) {
+                    self.next();
+                } else {
+                    break;
+                }
+            }
+        }
+        let frame = if self.kw("ROWS") {
+            Some(self.parse_frame(false)?)
+        } else if self.kw("RANGE") {
+            Some(self.parse_frame(true)?)
+        } else {
+            None
+        };
+        self.expect(STok::RParen)?;
+        Ok((partition, order, frame))
+    }
+
+    /// One reference inside PARTITION BY / ORDER BY of a window: a plain
+    /// column, or an aggregate call rendered canonically — `OVER (ORDER BY
+    /// SUM(amount))` references the aggregate key that the grouped row
+    /// carries when windows run over a GROUP BY result.
+    fn parse_window_ref(&mut self) -> Result<String, String> {
+        let name = self.ident()?;
+        if matches!(self.peek(), STok::LParen) {
+            if AggFunc::from_name(&name).is_ok() {
+                self.next(); // (
+                let arg = if matches!(self.peek(), STok::Star) {
+                    self.next();
+                    None
+                } else {
+                    Some(self.ident()?)
+                };
+                self.expect(STok::RParen)?;
+                return Ok(render_agg(&name, arg.as_deref()));
+            }
+            return Err(format!(
+                "SQL: unsupported OVER reference '{}(...)' (column or aggregate expected)",
+                name
+            ));
+        }
+        Ok(name)
+    }
+
+    /// v4.2: a ROWS/RANGE frame after the unit keyword was consumed.
+    /// `RANGE` accepts only UNBOUNDED PRECEDING / CURRENT ROW /
+    /// UNBOUNDED FOLLOWING bounds (value-offset RANGE frames are a
+    /// documented gap); `ROWS` accepts the full grammar.
+    fn parse_frame(&mut self, is_range: bool) -> Result<WindowFrame, String> {
+        let (start, end) = if self.kw("BETWEEN") {
+            let s = self.parse_frame_bound()?;
+            self.expect_kw("AND")?;
+            let e = self.parse_frame_bound()?;
+            (s, e)
+        } else {
+            // Shorthand `ROWS <bound>` == BETWEEN UNBOUNDED PRECEDING AND <bound>.
+            (FrameBound::UnboundedPreceding, self.parse_frame_bound()?)
+        };
+        if is_range {
+            let ok = matches!(
+                start,
+                FrameBound::UnboundedPreceding | FrameBound::CurrentRow
+            ) && matches!(
+                end,
+                FrameBound::UnboundedFollowing | FrameBound::CurrentRow
+            );
+            if !ok {
+                return Err(
+                    "SQL: RANGE frames support only UNBOUNDED PRECEDING, CURRENT ROW and UNBOUNDED FOLLOWING bounds (use ROWS for value offsets)"
+                        .into(),
+                );
+            }
+        }
+        // Frame sanity: start must not lie after end.
+        let bad = matches!(
+            (start, end),
+            (FrameBound::CurrentRow, FrameBound::Preceding(_))
+                | (FrameBound::Following(_), FrameBound::Preceding(_))
+                | (FrameBound::Following(_), FrameBound::CurrentRow)
+                | (FrameBound::UnboundedFollowing, _)
+        ) || match (start, end) {
+            (FrameBound::Preceding(a), FrameBound::Preceding(b)) => a < b,
+            (FrameBound::Following(a), FrameBound::Following(b)) => a > b,
+            _ => false,
+        };
+        if bad {
+            return Err("SQL: window frame start must not come after its end".into());
+        }
+        Ok(WindowFrame { start, end })
+    }
+
+    /// One frame bound: UNBOUNDED PRECEDING/FOLLOWING, n PRECEDING/FOLLOWING
+    /// (n >= 0) or CURRENT ROW.
+    fn parse_frame_bound(&mut self) -> Result<FrameBound, String> {
+        if self.kw("UNBOUNDED") {
+            if self.kw("PRECEDING") {
+                return Ok(FrameBound::UnboundedPreceding);
+            }
+            if self.kw("FOLLOWING") {
+                return Ok(FrameBound::UnboundedFollowing);
+            }
+            return Err("SQL: expected PRECEDING or FOLLOWING after UNBOUNDED".into());
+        }
+        if self.kw("CURRENT") {
+            self.expect_kw("ROW")?;
+            return Ok(FrameBound::CurrentRow);
+        }
+        if let STok::Int(n) = self.peek().clone() {
+            self.next();
+            if n < 0 {
+                return Err("SQL: frame offset must be non-negative".into());
+            }
+            if self.kw("PRECEDING") {
+                return Ok(FrameBound::Preceding(n));
+            }
+            if self.kw("FOLLOWING") {
+                return Ok(FrameBound::Following(n));
+            }
+            return Err("SQL: expected PRECEDING or FOLLOWING after frame offset".into());
+        }
+        Err("SQL: expected frame bound (UNBOUNDED PRECEDING/FOLLOWING, n PRECEDING/FOLLOWING, CURRENT ROW)".into())
     }
 
     fn parse_insert(&mut self) -> Result<Stmt, String> {
@@ -1762,7 +2124,7 @@ fn collect_stmt_tables(stmt: &Stmt, out: &mut Vec<String>) -> Result<(), String>
             collect_stmt_tables(left, out)?;
             collect_stmt_tables(right, out)?;
         }
-        Stmt::Cte { ctes, body } => {
+        Stmt::Cte { ctes, body, .. } => {
             for (_, def) in ctes {
                 collect_stmt_tables(def, out)?;
             }
@@ -1770,7 +2132,7 @@ fn collect_stmt_tables(stmt: &Stmt, out: &mut Vec<String>) -> Result<(), String>
         }
         Stmt::ShowTables | Stmt::Tx { .. } => {}
         Stmt::ShowStorage { table, .. } => out.push(table.clone()),
-        Stmt::AddColumn { table, .. } => out.push(table.clone()),
+        Stmt::AlterTable { table, .. } => out.push(table.clone()),
         Stmt::Insert { table, rows, on_conflict } => {
             out.push(table.clone());
             // Column values are literals; no table refs beyond the target.
@@ -1885,7 +2247,7 @@ fn collect_stmt_columns(stmt: &Stmt, out: &mut Vec<String>) -> Result<(), String
                 }
             }
         }
-        Stmt::Cte { ctes, body } => {
+        Stmt::Cte { ctes, body, .. } => {
             for (_, def) in ctes {
                 collect_stmt_columns(def, out)?;
             }
@@ -2282,6 +2644,7 @@ impl SqlEngine {
                 joins,
                 where_clause,
                 group_by,
+                grouping,
                 having,
                 order_by,
                 limit,
@@ -2292,6 +2655,7 @@ impl SqlEngine {
                 &joins,
                 where_clause,
                 &group_by,
+                &grouping,
                 having,
                 &order_by,
                 limit,
@@ -2305,7 +2669,9 @@ impl SqlEngine {
                 limit,
                 offset,
             } => self.exec_union(*left, *right, all, order_by, limit, offset),
-            Stmt::Cte { ctes, body } => self.exec_cte(ctes, *body, tx),
+            Stmt::Cte { ctes, recursive, body } => {
+                self.exec_cte(ctes, recursive, *body, tx)
+            }
             Stmt::ShowTables => self.exec_show_tables(),
             Stmt::ShowStorage { table, pk } => self.exec_show_storage(&table, pk.as_ref()),
             Stmt::Tx { action } => self.exec_tx(action, tx),
@@ -2363,11 +2729,7 @@ impl SqlEngine {
                 if_exists,
                 table,
             } => self.exec_drop_index(&name, if_exists, table.as_deref()),
-            Stmt::AddColumn {
-                table,
-                column,
-                col_type,
-            } => self.exec_add_column(&table, &column, col_type),
+            Stmt::AlterTable { table, action } => self.exec_alter_table(&table, action),
             Stmt::Explain(inner) => self.exec_explain(*inner),
         }
     }
@@ -2611,6 +2973,7 @@ impl SqlEngine {
     fn exec_cte(
         &self,
         ctes: Vec<(String, Stmt)>,
+        recursive: bool,
         body: Stmt,
         tx: &mut Option<SqlTxBuffer>,
     ) -> Result<
@@ -2640,7 +3003,12 @@ impl SqlEngine {
                     name
                 ));
             }
-            let (_, rows, _cplan, _) = self.exec_stmt(def.clone(), &mut None)?;
+            let rows = if recursive {
+                self.exec_recursive_cte(name, def, &mut plan)?
+            } else {
+                let (_, rows, _cplan, _) = self.exec_stmt(def.clone(), &mut None)?;
+                rows
+            };
             let mut store = self.cte_store.lock().unwrap();
             if store.contains_key(name) {
                 return Err(format!("SQL: duplicate CTE name '{}'", name));
@@ -2655,6 +3023,100 @@ impl SqlEngine {
         let (columns, rows, body_plan, message) = result?;
         plan.push_str(&body_plan);
         Ok((columns, rows, plan, message))
+    }
+
+    /// v4.2: one iterative `WITH RECURSIVE` CTE. The definition must be
+    /// `base UNION [ALL] recursive` where the recursive side references the
+    /// CTE name. The base term runs once; each round publishes ONLY the
+    /// previous round's rows under the CTE name (standard delta semantics),
+    /// runs the recursive side, and appends the fresh rows — `UNION`
+    /// dedupes full rows across all rounds, `UNION ALL` keeps everything.
+    /// Iteration stops on an empty round; hard caps guard runaway
+    /// recursion (clear error instead of unbounded memory).
+    fn exec_recursive_cte(
+        &self,
+        name: &str,
+        def: &Stmt,
+        plan: &mut String,
+    ) -> Result<Vec<BTreeMap<String, Value>>, String> {
+        const MAX_RECURSIVE_ITERATIONS: usize = 10_000;
+        const MAX_RECURSIVE_ROWS: usize = 1_000_000;
+        let Stmt::Union {
+            left,
+            right,
+            all,
+            ..
+        } = def
+        else {
+            return Err(format!(
+                "SQL: recursive CTE '{}' must be `WITH RECURSIVE name AS (base UNION [ALL] recursive)`",
+                name
+            ));
+        };
+        let fingerprint = |row: &BTreeMap<String, Value>| -> Vec<u8> {
+            crate::relational::RowCodec::encode(
+                &row.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>(),
+            )
+        };
+        // Base term: evaluated once, must not reference the CTE itself (the
+        // store is empty at this point, so a self-reference is a clean
+        // "relation does not exist" error from the engine).
+        let (_, base_rows, _, _) = self.exec_stmt((**left).clone(), &mut None)?;
+        let mut acc: Vec<BTreeMap<String, Value>> = Vec::with_capacity(base_rows.len());
+        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        for row in base_rows {
+            if !*all {
+                let fp = fingerprint(&row);
+                if !seen.insert(fp) {
+                    continue;
+                }
+            }
+            acc.push(row);
+        }
+        let mut delta = acc.clone();
+        let mut iterations = 0usize;
+        loop {
+            iterations += 1;
+            if iterations > MAX_RECURSIVE_ITERATIONS {
+                self.cte_store.lock().unwrap().remove(name);
+                return Err(format!(
+                    "SQL: recursive CTE '{}' exceeded {} iterations (cyclic recursion?)",
+                    name, MAX_RECURSIVE_ITERATIONS
+                ));
+            }
+            // Publish ONLY the previous round's rows for this round.
+            {
+                let mut store = self.cte_store.lock().unwrap();
+                store.insert(name.to_string(), std::mem::take(&mut delta));
+            }
+            let (_, new_rows, _, _) = self.exec_stmt((**right).clone(), &mut None)?;
+            delta = Vec::new();
+            for row in new_rows {
+                if !*all {
+                    let fp = fingerprint(&row);
+                    if !seen.contains(&fp) {
+                        seen.insert(fp);
+                        delta.push(row);
+                    }
+                } else {
+                    delta.push(row);
+                }
+            }
+            if delta.is_empty() {
+                break;
+            }
+            if acc.len() + delta.len() > MAX_RECURSIVE_ROWS {
+                self.cte_store.lock().unwrap().remove(name);
+                return Err(format!(
+                    "SQL: recursive CTE '{}' produced more than {} rows",
+                    name, MAX_RECURSIVE_ROWS
+                ));
+            }
+            acc.extend(delta.iter().cloned());
+        }
+        // Leave the store clean: the caller publishes the full result set.
+        self.cte_store.lock().unwrap().remove(name);
+        Ok(acc)
     }
 
     /// v3.6 UNION / UNION ALL executor. Both sides must be SELECT-shaped
@@ -2795,6 +3257,7 @@ impl SqlEngine {
                 joins,
                 where_clause,
                 group_by,
+                grouping,
                 having,
                 order_by,
                 limit,
@@ -2805,6 +3268,7 @@ impl SqlEngine {
                 joins,
                 where_clause.clone(),
                 group_by,
+                grouping,
                 having.clone(),
                 order_by,
                 *limit,
@@ -2825,9 +3289,9 @@ impl SqlEngine {
                 *limit,
                 *offset,
             ),
-            Stmt::Cte { ctes, body } => {
+            Stmt::Cte { ctes, recursive, body } => {
                 let mut none = None;
-                self.exec_cte(ctes.clone(), (**body).clone(), &mut none)
+                self.exec_cte(ctes.clone(), *recursive, (**body).clone(), &mut none)
             }
             other => Err(format!(
                 "SQL: expected a SELECT statement, got {}",
@@ -3029,6 +3493,7 @@ impl SqlEngine {
                 joins,
                 where_clause,
                 group_by,
+                grouping,
                 having,
                 order_by,
                 limit,
@@ -3040,6 +3505,7 @@ impl SqlEngine {
                     &joins,
                     where_clause,
                     &group_by,
+                    &grouping,
                     having,
                     &order_by,
                     limit,
@@ -3168,12 +3634,28 @@ impl SqlEngine {
                 Some(_) => format!("ShowStorage(point {})", table),
                 None => format!("ShowStorage(scan {})", table),
             },
-            Stmt::AddColumn { table, column, .. } => {
-                format!("AlterTable({} ADD COLUMN {})", table, column)
+            Stmt::AlterTable { table, action } => {
+                let detail = match action {
+                    AlterAction::AddColumn { column, .. } => {
+                        format!("ADD COLUMN {})", column)
+                    }
+                    AlterAction::DropColumn { column } => format!("DROP COLUMN {})", column),
+                    AlterAction::RenameColumn { old, new } => {
+                        format!("RENAME COLUMN {} TO {})", old, new)
+                    }
+                    AlterAction::ModifyColumn { column, .. } => {
+                        format!("MODIFY COLUMN {})", column)
+                    }
+                    AlterAction::ChangeColumn { old, new, .. } => {
+                        format!("CHANGE COLUMN {} TO {})", old, new)
+                    }
+                };
+                format!("AlterTable({} {}", table, detail)
             }
             Stmt::Tx { action } => format!("Tx({:?})", action),
-            Stmt::Cte { ctes, body } => format!(
-                "CTE({}) {}",
+            Stmt::Cte { ctes, recursive, body } => format!(
+                "{}({}) {}",
+                if *recursive { "RecursiveCTE" } else { "CTE" },
                 ctes.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>().join(", "),
                 Self::describe_stmt(body)
             ),
@@ -3197,6 +3679,11 @@ impl SqlEngine {
             .engine
             .scan_prefix(prefix.as_bytes())
             .map_err(|e| e.to_string())?;
+        // v4.2: fields of DROP COLUMN-ed columns that still linger inside
+        // old row payloads are invisible to every read path (WHERE, joins,
+        // ORDER BY): rows are projected onto the live schema right here.
+        let live: Option<std::collections::HashSet<String>> =
+            self.get_schema(table).map(|s| s.columns.keys().cloned().collect());
         let mut out = Vec::new();
         for (key, payload) in raw {
             // skip the schema meta-row
@@ -3205,7 +3692,92 @@ impl SqlEngine {
             }
             let fields = RowCodec::decode(&payload)
                 .map_err(|e| format!("row {} unreadable: {}", String::from_utf8_lossy(&key), e))?;
-            out.push(fields.into_iter().collect());
+            match &live {
+                Some(cols) => out.push(
+                    fields
+                        .into_iter()
+                        .filter(|(k, _)| cols.contains(k))
+                        .collect(),
+                ),
+                None => out.push(fields.into_iter().collect()),
+            }
+        }
+        Ok(out)
+    }
+
+    /// v4.2: index nested-loop join — for every left row, probe the right
+    /// table's secondary index (or the primary key) with the join value and
+    /// merge matches exactly like `hash_join` (conflicting right columns are
+    /// renamed `joined_<col>`; NULL keys never match). LEFT joins keep
+    /// unmatched left rows padded with NULL right columns, mirroring
+    /// `hash_join_left`.
+    fn index_join(
+        &self,
+        left_rows: &[BTreeMap<String, Value>],
+        j: &JoinSpec,
+        table: &str,
+        right_col: &str,
+    ) -> Result<Vec<BTreeMap<String, Value>>, String> {
+        let schema = self
+            .get_schema(table)
+            .ok_or_else(|| format!("SQL: relation '{}' does not exist", table))?;
+        let is_pk = right_col == schema.primary_locus_column;
+        if !is_pk && schema.secondary_index_on(right_col).is_none() {
+            return Err(format!(
+                "SQL: IndexJoin requires an index on '{}.{}'",
+                table, right_col
+            ));
+        }
+        let right_cols: Vec<String> = schema.columns.keys().cloned().collect();
+        let mut out: Vec<BTreeMap<String, Value>> = Vec::new();
+        for l in left_rows {
+            let key = l.get(&j.left_col).cloned().unwrap_or(Value::Null);
+            let mut matched: Vec<BTreeMap<String, Value>> = Vec::new();
+            if !key.is_null() {
+                if is_pk {
+                    if let Some(row) = self.read_row_point(table, &key)? {
+                        matched.push(row);
+                    }
+                } else {
+                    let mut prefix = index_prefix(table, right_col);
+                    prefix.extend_from_slice(&escape_index_part(&encode_ordered_value(&key)));
+                    let entries = self
+                        .engine
+                        .scan_prefix(&prefix)
+                        .map_err(|e| e.to_string())?;
+                    for (_, payload) in entries {
+                        if let Ok(holder) = String::from_utf8(payload) {
+                            if let Some(row) = self.read_row_by_key(&holder)? {
+                                matched.push(row);
+                            }
+                        }
+                    }
+                }
+            }
+            if matched.is_empty() {
+                if j.join_type == JoinType::Left {
+                    let mut row = l.clone();
+                    for c in &right_cols {
+                        if !row.contains_key(c) {
+                            row.insert(c.clone(), Value::Null);
+                        }
+                    }
+                    out.push(row);
+                }
+                continue;
+            }
+            for r in matched {
+                let mut merged = l.clone();
+                for (k, val) in r.iter() {
+                    let name = if merged.contains_key(k) {
+                        format!("joined_{}", k)
+                    } else {
+                        k.clone()
+                    };
+                    merged.insert(name, val.clone());
+                }
+                out.push(merged);
+            }
         }
         Ok(out)
     }
@@ -3291,7 +3863,18 @@ impl SqlEngine {
             Some(payload) => {
                 let fields = RowCodec::decode(&payload)
                     .map_err(|e| format!("row {} unreadable: {}", key, e))?;
-                Ok(Some(fields.into_iter().collect()))
+                // v4.2: hide fields of DROP COLUMN-ed columns (same
+                // visibility rule as read_table_rows).
+                let live: std::collections::HashSet<String> = self
+                    .get_schema(table)
+                    .map(|s| s.columns.keys().cloned().collect())
+                    .unwrap_or_default();
+                Ok(Some(
+                    fields
+                        .into_iter()
+                        .filter(|(k, _)| live.is_empty() || live.contains(k))
+                        .collect(),
+                ))
             }
             None => Ok(None),
         }
@@ -3567,6 +4150,37 @@ impl SqlEngine {
         Ok(())
     }
 
+    /// v4.2 dispatch of `ALTER TABLE <table> <action>`.
+    fn exec_alter_table(
+        &self,
+        table: &str,
+        action: AlterAction,
+    ) -> Result<
+        (
+            Vec<String>,
+            Vec<BTreeMap<String, Value>>,
+            String,
+            Option<String>,
+        ),
+        String,
+    > {
+        match action {
+            AlterAction::AddColumn { column, col_type } => {
+                self.exec_add_column(table, &column, col_type)
+            }
+            AlterAction::DropColumn { column } => self.exec_drop_column(table, &column),
+            AlterAction::RenameColumn { old, new } => {
+                self.exec_rename_column(table, &old, &new)
+            }
+            AlterAction::ModifyColumn { column, col_type } => {
+                self.exec_alter_column_type(table, &column, None, col_type)
+            }
+            AlterAction::ChangeColumn { old, new, col_type } => {
+                self.exec_alter_column_type(table, &old, Some(&new), col_type)
+            }
+        }
+    }
+
     /// v3.9 Online DDL: `ALTER TABLE t ADD COLUMN c T` — metadata-only and
     /// instant: the schema row is rewritten (one WAL batch), no existing
     /// row is touched, reads of the new column on old rows yield NULL.
@@ -3613,6 +4227,484 @@ impl SqlEngine {
                 column, table
             )),
         ))
+    }
+
+    /// v4.2: `ALTER TABLE t DROP COLUMN c` — one atomic WAL batch rewrites
+    /// the schema and every row payload without the dropped field, so the
+    /// column can never resurrect (re-adding it starts empty). Secondary
+    /// indexes on the column are swept in the same batch.
+    fn exec_drop_column(
+        &self,
+        table: &str,
+        column: &str,
+    ) -> Result<
+        (
+            Vec<String>,
+            Vec<BTreeMap<String, Value>>,
+            String,
+            Option<String>,
+        ),
+        String,
+    > {
+        let mut schema = self
+            .get_schema(table)
+            .ok_or_else(|| format!("SQL: relation '{}' does not exist", table))?;
+        if !schema.columns.contains_key(column) {
+            return Err(format!(
+                "SQL: unknown column '{}' in table '{}'",
+                column, table
+            ));
+        }
+        if column == schema.primary_locus_column {
+            return Err(format!(
+                "SQL: cannot DROP COLUMN '{}': it is the primary key of '{}'",
+                column, table
+            ));
+        }
+        if schema.foreign_keys.iter().any(|f| f.column == column) {
+            return Err(format!(
+                "SQL: cannot DROP COLUMN '{}': a foreign key is declared on it; drop the constraint first",
+                column
+            ));
+        }
+        if self.foreign_key_targets(table, column)? {
+            return Err(format!(
+                "SQL: cannot DROP COLUMN '{}': a foreign key in another table references {}.({})",
+                column, table, column
+            ));
+        }
+        let start = std::time::Instant::now();
+        // One atomic batch: rewritten rows (without the dropped field) +
+        // index sweep + new schema row. read_table_rows already projects
+        // onto the live schema, so writing its rows back drops the stale
+        // field physically.
+        let rows = self.read_table_rows(table)?;
+        let had_index = schema.secondary_index_on(column).is_some();
+        schema.columns.remove(column);
+        schema.secondary_indexes.retain(|i| i.column != column);
+        let mut batch: Vec<(crate::wal::WalOp, Vec<u8>, Option<Vec<u8>>)> =
+            Vec::with_capacity(rows.len() + 8);
+        if had_index {
+            let prefix = index_prefix(table, column);
+            let entries = self
+                .engine
+                .scan_prefix(&prefix)
+                .map_err(|e| e.to_string())?;
+            for (key, _) in entries {
+                batch.push((crate::wal::WalOp::Delete, key, None));
+            }
+        }
+        let rows_count = rows.len();
+        for mut row in rows {
+            // The rows were read while the column was still live, so the
+            // dropped field is removed explicitly here (the atomic batch
+            // writes the row payloads without it).
+            row.remove(column);
+            let pk = Self::pk_of(&schema, &row)?;
+            batch.push((
+                crate::wal::WalOp::Put,
+                Self::row_key(table, &pk).into_bytes(),
+                Some(crate::relational::RowCodec::encode(
+                    &row.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>(),
+                )),
+            ));
+        }
+        let payload = serde_json::to_vec(&schema).map_err(|e| e.to_string())?;
+        batch.push((
+            crate::wal::WalOp::Put,
+            format!("__schema:{}", table).into_bytes(),
+            Some(payload),
+        ));
+        self.engine.write_batch(&batch).map_err(|e| e.to_string())?;
+        self.schemas
+            .write()
+            .insert(table.to_string(), schema.clone());
+        let us = start.elapsed().as_micros() as u64;
+        Ok((
+            vec!["status".into(), "table".into(), "column".into()],
+            vec![mk_row(&[
+                ("status", Value::Text("OK".into())),
+                ("table", Value::Text(table.to_string())),
+                ("column", Value::Text(column.to_string())),
+            ])],
+            format!(
+                "AlterTable({} DROP COLUMN {}, {} rows rewritten, {} µs, one atomic batch)",
+                table,
+                column,
+                rows_count,
+                us
+            ),
+            Some(format!(
+                "column '{}' removed from '{}' atomically (schema + data + indexes)",
+                column, table
+            )),
+        ))
+    }
+
+    /// v4.2: `ALTER TABLE t RENAME COLUMN a TO b` — schema metadata plus a
+    /// physical rewrite of every row payload carrying the old key, all in
+    /// ONE atomic WAL batch (single fsync durability interval). Secondary
+    /// indexes on the column and foreign keys referencing it are updated.
+    fn exec_rename_column(
+        &self,
+        table: &str,
+        old: &str,
+        new: &str,
+    ) -> Result<
+        (
+            Vec<String>,
+            Vec<BTreeMap<String, Value>>,
+            String,
+            Option<String>,
+        ),
+        String,
+    > {
+        let mut schema = self
+            .get_schema(table)
+            .ok_or_else(|| format!("SQL: relation '{}' does not exist", table))?;
+        if old == new {
+            return Ok((
+                vec!["status".into()],
+                vec![mk_row(&[("status", Value::Text("OK".into()))])],
+                format!("AlterTable({} RENAME COLUMN {} TO {}) [no-op]", table, old, new),
+                None,
+            ));
+        }
+        if !schema.columns.contains_key(old) {
+            return Err(format!(
+                "SQL: unknown column '{}' in table '{}'",
+                old, table
+            ));
+        }
+        if schema.columns.contains_key(new) {
+            return Err(format!(
+                "SQL: column '{}' already exists in table '{}'",
+                new, table
+            ));
+        }
+        let start = std::time::Instant::now();
+        // Move the column inside the schema map, keeping the declared type.
+        let col_type = schema.columns.remove(old).expect("checked above");
+        schema.columns.insert(new.to_string(), col_type);
+        if schema.primary_locus_column == old {
+            schema.primary_locus_column = new.to_string();
+        }
+        for idx in &mut schema.secondary_indexes {
+            if idx.column == old {
+                idx.column = new.to_string();
+            }
+        }
+        for fk in &mut schema.foreign_keys {
+            if fk.column == old {
+                fk.column = new.to_string();
+            }
+        }
+        // Foreign keys in OTHER tables that reference this column.
+        let mut extra_schemas = Vec::new();
+        {
+            let schemas = self.schemas.read();
+            for (other_name, other) in schemas.iter() {
+                if other_name == table {
+                    continue;
+                }
+                let mut updated = other.clone();
+                let mut changed = false;
+                for fk in &mut updated.foreign_keys {
+                    if fk.target_chromosome == table && fk.target_locus_column == old {
+                        fk.target_locus_column = new.to_string();
+                        changed = true;
+                    }
+                }
+                if changed {
+                    extra_schemas.push(updated);
+                }
+            }
+        }
+        // Rewrite every row payload under the new key name.
+        let rows = self.read_table_rows(table)?;
+        let mut batch: Vec<(crate::wal::WalOp, Vec<u8>, Option<Vec<u8>>)> =
+            Vec::with_capacity(rows.len() + 8);
+        let had_index = schema.secondary_index_on(new).is_some();
+        if had_index {
+            let prefix = index_prefix(table, old);
+            let entries = self
+                .engine
+                .scan_prefix(&prefix)
+                .map_err(|e| e.to_string())?;
+            for (key, _) in entries {
+                batch.push((crate::wal::WalOp::Delete, key, None));
+            }
+        }
+        for row in &rows {
+            let mut rewritten = row.clone();
+            if let Some(v) = rewritten.remove(old) {
+                rewritten.insert(new.to_string(), v);
+            }
+            let pk = Self::pk_of(&schema, &rewritten)?;
+            batch.push((
+                crate::wal::WalOp::Put,
+                Self::row_key(table, &pk).into_bytes(),
+                Some(crate::relational::RowCodec::encode(
+                    &rewritten.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>(),
+                )),
+            ));
+            if had_index {
+                batch.extend(Self::index_delta_batch(
+                    &schema,
+                    None,
+                    Some((table, &rewritten)),
+                ));
+            }
+        }
+        for extra in &extra_schemas {
+            let payload = serde_json::to_vec(extra).map_err(|e| e.to_string())?;
+            batch.push((
+                crate::wal::WalOp::Put,
+                format!("__schema:{}", extra.name).into_bytes(),
+                Some(payload),
+            ));
+        }
+        let payload = serde_json::to_vec(&schema).map_err(|e| e.to_string())?;
+        batch.push((
+            crate::wal::WalOp::Put,
+            format!("__schema:{}", table).into_bytes(),
+            Some(payload),
+        ));
+        self.engine.write_batch(&batch).map_err(|e| e.to_string())?;
+        self.schemas
+            .write()
+            .insert(table.to_string(), schema.clone());
+        for extra in extra_schemas {
+            self.schemas.write().insert(extra.name.clone(), extra);
+        }
+        let us = start.elapsed().as_micros() as u64;
+        Ok((
+            vec!["status".into(), "table".into(), "column".into()],
+            vec![mk_row(&[
+                ("status", Value::Text("OK".into())),
+                ("table", Value::Text(table.to_string())),
+                ("column", Value::Text(new.to_string())),
+            ])],
+            format!(
+                "AlterTable({} RENAME COLUMN {} TO {}, {} rows rewritten, {} µs, one atomic batch)",
+                table,
+                old,
+                new,
+                rows.len(),
+                us
+            ),
+            Some(format!(
+                "column '{}' renamed to '{}' in '{}' atomically (schema + data + indexes)",
+                old, new, table
+            )),
+        ))
+    }
+
+    /// v4.2: `ALTER TABLE t MODIFY COLUMN c T` / `CHANGE COLUMN a b T` —
+    /// converts every stored value to the new type and (for CHANGE) renames
+    /// the column, all in ONE atomic WAL batch. The whole statement is
+    /// prepared in memory first: a single inconvertible value aborts it
+    /// before anything is written (no partial conversion, ever). The
+    /// primary-key column may keep its type but cannot change it (row keys
+    /// are derived from the stored PK value).
+    fn exec_alter_column_type(
+        &self,
+        table: &str,
+        column: &str,
+        new_name: Option<&str>,
+        new_type: ColumnType,
+    ) -> Result<
+        (
+            Vec<String>,
+            Vec<BTreeMap<String, Value>>,
+            String,
+            Option<String>,
+        ),
+        String,
+    > {
+        let mut schema = self
+            .get_schema(table)
+            .ok_or_else(|| format!("SQL: relation '{}' does not exist", table))?;
+        let old_type = schema
+            .columns
+            .get(column)
+            .cloned()
+            .ok_or_else(|| format!("SQL: unknown column '{}' in table '{}'", column, table))?;
+        let final_name = new_name.unwrap_or(column).to_string();
+        if final_name != column && schema.columns.contains_key(&final_name) {
+            return Err(format!(
+                "SQL: column '{}' already exists in table '{}'",
+                final_name, table
+            ));
+        }
+        if matches!(new_type, ColumnType::ForeignLink { .. }) {
+            return Err(
+                "SQL: ALTER COLUMN to a foreign-key type is not supported; declare FKs in CREATE TABLE"
+                    .into(),
+            );
+        }
+        let type_changes = old_type != new_type;
+        if type_changes && column == schema.primary_locus_column {
+            return Err(format!(
+                "SQL: changing the type of the primary-key column '{}' is not supported (drop and recreate the table instead)",
+                column
+            ));
+        }
+        let start = std::time::Instant::now();
+        let rows = self.read_table_rows(table)?;
+        // Convert everything in memory first — atomicity guarantee.
+        let mut converted: Vec<BTreeMap<String, Value>> = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let mut out = row.clone();
+            let pk_hint = row.get(&schema.primary_locus_column).map(|v| v.to_string()).unwrap_or_default();
+            let v = out.remove(column).unwrap_or(Value::Null);
+            let nv = if type_changes {
+                convert_value(&v, &new_type).map_err(|e| {
+                    format!("SQL: {} (row pk={})", e, pk_hint)
+                })?
+            } else {
+                v
+            };
+            out.insert(final_name.clone(), nv);
+            converted.push(out);
+        }
+        // Schema updates.
+        if final_name != column {
+            let col_ty = schema.columns.remove(column).expect("checked above");
+            schema.columns.insert(final_name.clone(), col_ty);
+            if schema.primary_locus_column == column {
+                schema.primary_locus_column = final_name.clone();
+            }
+            for idx in &mut schema.secondary_indexes {
+                if idx.column == column {
+                    idx.column = final_name.clone();
+                }
+            }
+            for fk in &mut schema.foreign_keys {
+                if fk.column == column {
+                    fk.column = final_name.clone();
+                }
+            }
+        }
+        if type_changes {
+            schema.columns.insert(final_name.clone(), new_type.clone());
+        }
+        // Referencing FKs that name the old column of this table.
+        let mut extra_schemas = Vec::new();
+        if final_name != column {
+            let schemas = self.schemas.read();
+            for (other_name, other) in schemas.iter() {
+                if other_name == table {
+                    continue;
+                }
+                let mut updated = other.clone();
+                let mut changed = false;
+                for fk in &mut updated.foreign_keys {
+                    if fk.target_chromosome == table && fk.target_locus_column == column {
+                        fk.target_locus_column = final_name.clone();
+                        changed = true;
+                    }
+                }
+                if changed {
+                    extra_schemas.push(updated);
+                }
+            }
+        }
+        // One atomic batch: rewritten rows, index rebuild, schema rows.
+        let mut batch: Vec<(crate::wal::WalOp, Vec<u8>, Option<Vec<u8>>)> =
+            Vec::with_capacity(converted.len() * 2 + 8);
+        let had_index = schema.secondary_index_on(&final_name).is_some();
+        if had_index {
+            let prefix = index_prefix(table, column);
+            let entries = self
+                .engine
+                .scan_prefix(&prefix)
+                .map_err(|e| e.to_string())?;
+            for (key, _) in entries {
+                batch.push((crate::wal::WalOp::Delete, key, None));
+            }
+        }
+        for row in &converted {
+            let pk = Self::pk_of(&schema, row)?;
+            batch.push((
+                crate::wal::WalOp::Put,
+                Self::row_key(table, &pk).into_bytes(),
+                Some(crate::relational::RowCodec::encode(
+                    &row.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>(),
+                )),
+            ));
+            if had_index {
+                batch.extend(Self::index_delta_batch(&schema, None, Some((table, row))));
+            }
+        }
+        for extra in &extra_schemas {
+            let payload = serde_json::to_vec(extra).map_err(|e| e.to_string())?;
+            batch.push((
+                crate::wal::WalOp::Put,
+                format!("__schema:{}", extra.name).into_bytes(),
+                Some(payload),
+            ));
+        }
+        let payload = serde_json::to_vec(&schema).map_err(|e| e.to_string())?;
+        batch.push((
+            crate::wal::WalOp::Put,
+            format!("__schema:{}", table).into_bytes(),
+            Some(payload),
+        ));
+        self.engine.write_batch(&batch).map_err(|e| e.to_string())?;
+        self.schemas
+            .write()
+            .insert(table.to_string(), schema.clone());
+        for extra in extra_schemas {
+            self.schemas.write().insert(extra.name.clone(), extra);
+        }
+        let us = start.elapsed().as_micros() as u64;
+        let verb = if final_name != column { "CHANGE" } else { "MODIFY" };
+        Ok((
+            vec!["status".into(), "table".into(), "column".into()],
+            vec![mk_row(&[
+                ("status", Value::Text("OK".into())),
+                ("table", Value::Text(table.to_string())),
+                ("column", Value::Text(final_name.clone())),
+            ])],
+            format!(
+                "AlterTable({} {} COLUMN {} {}, {} rows rewritten, {} µs, one atomic batch)",
+                table,
+                verb,
+                final_name,
+                Self::type_word(&new_type),
+                converted.len(),
+                us
+            ),
+            Some(format!(
+                "column '{}' of '{}' now stores {} atomically",
+                final_name, table, Self::type_word(&new_type)
+            )),
+        ))
+    }
+
+    /// Human-readable word for a column type (status rows of ALTER).
+    fn type_word(t: &ColumnType) -> &'static str {
+        match t {
+            ColumnType::Int64 => "INT",
+            ColumnType::Float64 => "FLOAT",
+            ColumnType::Text => "TEXT",
+            ColumnType::Dna2Bit => "DNA",
+            ColumnType::Timestamp => "TIMESTAMP",
+            ColumnType::ForeignLink { .. } => "FK",
+        }
+    }
+
+    /// True when any OTHER table declares a foreign key targeting
+    /// `table(column)` (used by DROP COLUMN to refuse unsafe drops).
+    fn foreign_key_targets(&self, table: &str, column: &str) -> Result<bool, String> {
+        let schemas = self.schemas.read();
+        Ok(schemas.iter().any(|(name, t)| {
+            name != table
+                && t.foreign_keys
+                    .iter()
+                    .any(|f| f.target_chromosome == table && f.target_locus_column == column)
+        }))
     }
 
     /// Enforce every UNIQUE secondary index of `table` for the row `new`
@@ -4141,9 +5233,13 @@ impl SqlEngine {
             // Row-key move (pk change) also moves index suffixes: the delta
             // above already computed fresh keys from the new row/pk.
             let _ = (&old_table_key, &new_table_key);
+            // v4.2: physically drop fields of DROP COLUMN-ed columns when a
+            // row is rewritten (metadata-only DDL leaves stale bytes in old
+            // payloads; the next rewrite of each row cleans them up).
             let payload = RowCodec::encode(
                 &new_row
                     .iter()
+                    .filter(|(k, _)| schema.columns.contains_key(k.as_str()))
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect::<Vec<_>>(),
             );
@@ -4380,6 +5476,7 @@ impl SqlEngine {
         joins: &[JoinSpec],
         where_clause: Option<Expr>,
         group_by: &[String],
+        grouping: &[Vec<String>],
         having: Option<Expr>,
         order_by: &[(String, bool)],
         limit: Option<usize>,
@@ -4422,31 +5519,49 @@ impl SqlEngine {
             (rows, op)
         };
 
-        // JOINs (hash join on equi-condition; O(n+m) build+probe)
+        // JOINs (hash join on equi-condition; O(n+m) build+probe). v4.2: an
+        // indexed right side switches INNER/LEFT joins to IndexJoin —
+        // per-outer-row index probes (or PK point gets) instead of a hash
+        // build over the whole right side — whenever the left side is small
+        // enough for that to pay off (cost heuristic below). RIGHT/FULL
+        // keep the symmetric hash plans.
         for j in joins {
             let right = self.read_table_rows(&j.table)?;
-            let next = match j.join_type {
-                JoinType::Inner => hash_join(&current, &right, &j.left_col, &j.right_col),
-                JoinType::Left => hash_join_left(&current, &right, &j.left_col, &j.right_col),
-                // RIGHT JOIN == LEFT JOIN with the sides swapped (the row
-                // model is single-namespace, so column naming is unchanged).
-                JoinType::Right => {
-                    hash_join_left(&right, &current, &j.right_col, &j.left_col)
-                }
-                // FULL OUTER JOIN: left join + every right row that never
-                // matched, padded with NULLs on the left columns.
-                JoinType::Full => {
-                    hash_join_full(&current, &right, &j.left_col, &j.right_col)
+            let right_schema = self.get_schema(&j.table);
+            let indexed = right_schema
+                .as_ref()
+                .map(|s| {
+                    j.right_col == s.primary_locus_column
+                        || s.secondary_index_on(&j.right_col).is_some()
+                })
+                .unwrap_or(false);
+            // Cost heuristic: with |left| ≪ |right|, n probes beat building
+            // a hash table over every right row. INNER/LEFT only — RIGHT /
+            // FULL need the symmetric side, which the index does not serve.
+            let use_index_join = indexed
+                && matches!(j.join_type, JoinType::Inner | JoinType::Left)
+                && current.len() * 8 + 16 < right.len();
+            let next = if use_index_join {
+                self.index_join(&current, &j, &j.table, &j.right_col)?
+            } else {
+                match j.join_type {
+                    JoinType::Inner => hash_join(&current, &right, &j.left_col, &j.right_col),
+                    JoinType::Left => hash_join_left(&current, &right, &j.left_col, &j.right_col),
+                    // RIGHT JOIN == LEFT JOIN with the sides swapped (the row
+                    // model is single-namespace, so column naming is unchanged).
+                    JoinType::Right => {
+                        hash_join_left(&right, &current, &j.right_col, &j.left_col)
+                    }
+                    // FULL OUTER JOIN: left join + every right row that never
+                    // matched, padded with NULLs on the left columns.
+                    JoinType::Full => {
+                        hash_join_full(&current, &right, &j.left_col, &j.right_col)
+                    }
                 }
             };
             plan.push_str(&format!(
-                " -> {}HashJoin({}.{}, {}.{})",
-                match j.join_type {
-                    JoinType::Left => "Left",
-                    JoinType::Right => "Right",
-                    JoinType::Full => "Full",
-                    JoinType::Inner => "Inner",
-                },
+                " -> {}Join({}.{}, {}.{})",
+                if use_index_join { "Index" } else { "Hash" },
                 from,
                 j.left_col,
                 j.table,
@@ -4472,35 +5587,14 @@ impl SqlEngine {
             }
         }
 
-        // Window functions (v3.6): computed over the filtered row set, before
-        // projection and ORDER BY. Not combinable with GROUP BY/aggregates.
+        // v4.2: window functions are computed AFTER aggregation (standard
+        // SQL evaluation order). The projection items are collected here;
+        // the actual computation happens once the aggregated row set (when
+        // GROUP BY/aggregates are present) or the filtered row set exists.
         let window_items: Vec<&SelectItem> = projection
             .iter()
             .filter(|p| matches!(p, SelectItem::Window { .. }))
             .collect();
-        if !window_items.is_empty() {
-            if !collect_agg_items(projection, having.as_ref()).is_empty()
-                || !group_by.is_empty()
-                || having.is_some()
-            {
-                return Err(
-                    "SQL: window functions cannot be combined with GROUP BY/aggregates".into(),
-                );
-            }
-            for item in &window_items {
-                if let SelectItem::Window {
-                    func,
-                    partition,
-                    order,
-                    canonical,
-                    ..
-                } = item
-                {
-                    compute_window(current.as_mut_slice(), *func, partition, order, canonical);
-                    plan.push_str(&format!(" -> Window({})", canonical));
-                }
-            }
-        }
 
         // Scalar subqueries in the projection (v3.6): uncorrelated ones run
         // once; correlated ones are re-resolved per output row.
@@ -4534,9 +5628,73 @@ impl SqlEngine {
         }
 
         // Aggregation (GROUP BY / HAVING / aggregate projections).
-        let agg_items = collect_agg_items(projection, having.as_ref());
+        let mut agg_items = collect_agg_items(projection, having.as_ref());
+        // v4.2: nested aggregates inside aggregate windows over a GROUP BY
+        // result (`SUM(SUM(x)) OVER ()`) — the inner SUM(x) must be computed
+        // as a group aggregate first. Only meaningful (and legal) when
+        // grouping actually happens; nested aggregates without GROUP BY are
+        // a hard error, same as PostgreSQL.
+        let nested_window_aggs: Vec<String> = projection
+            .iter()
+            .filter_map(|p| match p {
+                SelectItem::Window {
+                    func: WindowFunc::Agg { arg: Some(a), .. },
+                    ..
+                } if parse_rendered_agg(a).is_some() => Some(a.clone()),
+                _ => None,
+            })
+            .collect();
+        if !nested_window_aggs.is_empty() {
+            if group_by.is_empty() {
+                return Err(
+                    "SQL: aggregate function calls cannot be nested (SUM(SUM(x)) OVER ... requires GROUP BY)"
+                        .into(),
+                );
+            }
+            for warg in nested_window_aggs {
+                if let Some((func, arg)) = parse_rendered_agg(&warg) {
+                    if !agg_items.iter().any(|(n, _, _, _)| *n == warg) {
+                        agg_items.push((warg.clone(), warg.clone(), func, arg));
+                    }
+                }
+            }
+        }
         let has_agg = !group_by.is_empty() || !agg_items.is_empty() || having.is_some();
-        if has_agg {
+        if !grouping.is_empty() {
+            // v4.2: ROLLUP / CUBE / WITH ROLLUP — aggregate once per
+            // grouping set and merge; columns outside a set read NULL
+            // (the standard super-aggregate marker). Every set runs the
+            // same aggregate projections and HAVING as a plain GROUP BY.
+            plan.push_str(&format!(
+                " -> Aggregate(grouping_sets={}, cols={:?})",
+                grouping.len(),
+                group_by
+            ));
+            let base = current;
+            let mut merged: Vec<BTreeMap<String, Value>> = Vec::new();
+            for set in grouping {
+                if set.is_empty() && agg_items.is_empty() {
+                    continue; // nothing to report for a bare grand-total row
+                }
+                let part = self.aggregate_rows(
+                    base.clone(),
+                    set,
+                    &agg_items,
+                    having.as_ref(),
+                    from,
+                    &mut plan,
+                )?;
+                for mut row in part {
+                    for col in group_by {
+                        if !set.contains(col) {
+                            row.insert(col.clone(), Value::Null);
+                        }
+                    }
+                    merged.push(row);
+                }
+            }
+            current = merged;
+        } else if has_agg {
             current = self.aggregate_rows(
                 current,
                 group_by,
@@ -4545,6 +5703,35 @@ impl SqlEngine {
                 from,
                 &mut plan,
             )?;
+        }
+
+        // v4.2: window functions (v3.6 ranking; v4.2 aggregate windows and
+        // ROWS/RANGE frames) run over the aggregated rows when GROUP BY /
+        // aggregates are present (standard SQL evaluation order), else over
+        // the filtered row set. Partition/ORDER BY references must be
+        // columns (or aggregate keys) present in that row set.
+        if !window_items.is_empty() {
+            for item in &window_items {
+                if let SelectItem::Window {
+                    func,
+                    partition,
+                    order,
+                    frame,
+                    canonical,
+                    ..
+                } = item
+                {
+                    compute_window(
+                        current.as_mut_slice(),
+                        func,
+                        partition,
+                        order,
+                        *frame,
+                        canonical,
+                    );
+                    plan.push_str(&format!(" -> Window({})", canonical));
+                }
+            }
         }
 
         // A computed projection item may be referenced from ORDER BY by its
@@ -4686,6 +5873,30 @@ impl SqlEngine {
             let star =
                 projection.is_empty() || projection.iter().any(|p| matches!(p, SelectItem::Star));
             if !star {
+                // v4.2: grouped rows carry window / scalar-sub results under
+                // their canonical keys (there is no non-grouped Project pass
+                // to rename them) — rename canonical → output alias first.
+                let renames: Vec<(String, String)> = projection
+                    .iter()
+                    .filter_map(|p| match p {
+                        SelectItem::Window { canonical, rendered, .. }
+                        | SelectItem::ScalarSub { canonical, rendered, .. }
+                            if canonical != rendered =>
+                        {
+                            Some((canonical.clone(), rendered.clone()))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if !renames.is_empty() {
+                    for row in current.iter_mut() {
+                        for (from_k, to_k) in &renames {
+                            if let Some(v) = row.remove(from_k) {
+                                row.insert(to_k.clone(), v);
+                            }
+                        }
+                    }
+                }
                 let mut keep: Vec<String> = group_by.to_vec();
                 for item in projection {
                     match item {
@@ -4737,6 +5948,45 @@ impl SqlEngine {
         if let Some(n) = limit {
             plan.push_str(&format!(" -> Limit({})", n));
             current.truncate(n);
+        }
+
+        // v4.2: `SELECT *` over a plain table projects exactly the schema
+        // columns — this hides fields of DROP COLUMN-ed columns still
+        // lingering inside old row payloads. Keys introduced by the
+        // statement itself (window canonicals, computed aliases, scalar
+        // subqueries) stay; JOIN outputs are left untouched.
+        if (projection.is_empty() || projection.iter().any(|p| matches!(p, SelectItem::Star)))
+            && joins.is_empty()
+            && !from.is_empty()
+        {
+            if let Some(schema) = self.get_schema(from) {
+                let mut keep: std::collections::HashSet<String> =
+                    schema.columns.keys().cloned().collect();
+                for item in projection {
+                    match item {
+                        SelectItem::Window { canonical, .. } => {
+                            keep.insert(canonical.clone());
+                        }
+                        SelectItem::Computed { rendered, .. } => {
+                            keep.insert(rendered.clone());
+                        }
+                        SelectItem::ScalarSub { canonical, .. } => {
+                            keep.insert(canonical.clone());
+                        }
+                        _ => {}
+                    }
+                }
+                for row in current.iter_mut() {
+                    let stale: Vec<String> = row
+                        .keys()
+                        .filter(|k| !keep.contains(*k))
+                        .cloned()
+                        .collect();
+                    for k in stale {
+                        row.remove(&k);
+                    }
+                }
+            }
         }
 
         // Column list for tabular consumers.
@@ -5412,6 +6662,72 @@ fn mk_row(fields: &[(&str, Value)]) -> BTreeMap<String, Value> {
         .collect()
 }
 
+/// v4.2: value conversion for `ALTER TABLE ... MODIFY/CHANGE COLUMN`.
+/// Rules (documented in SQL_MANUAL §2.3):
+///   * NULL converts to NULL under every target type;
+///   * →INT: FLOAT rounds half away from zero (MySQL semantics), TEXT must
+///     parse as i64 (otherwise the whole statement aborts), DNA never;
+///   * →FLOAT: INT widens, TEXT must parse as f64, DNA never;
+///   * →TEXT: every value renders through its Display form (DNA keeps the
+///     nucleotide chain);
+///   * →DNA: TEXT must be non-empty pure ACGT (same rule as INSERT
+///     literals, `typed_string_literal`), DNA passes through;
+///   * →TIMESTAMP: values pass through unchanged (the engine never
+///     re-renders timestamps).
+fn convert_value(v: &Value, to: &ColumnType) -> Result<Value, String> {
+    if v.is_null() {
+        return Ok(Value::Null);
+    }
+    match to {
+        ColumnType::Int64 => match v {
+            Value::Int(i) => Ok(Value::Int(*i)),
+            Value::Float(f) => Ok(Value::Int(f.round() as i64)),
+            Value::Text(s) => s.trim().parse::<i64>().map(Value::Int).map_err(|_| {
+                format!(
+                    "cannot convert '{}' to INT: not an integer",
+                    s
+                )
+            }),
+            Value::Dna(s) => Err(format!("cannot convert DNA '{}' to INT", s)),
+            Value::Null => unreachable!("handled above"),
+        },
+        ColumnType::Float64 => match v {
+            Value::Int(i) => Ok(Value::Float(*i as f64)),
+            Value::Float(f) => Ok(Value::Float(*f)),
+            Value::Text(s) => s.trim().parse::<f64>().map(Value::Float).map_err(|_| {
+                format!("cannot convert '{}' to FLOAT: not a number", s)
+            }),
+            Value::Dna(s) => Err(format!("cannot convert DNA '{}' to FLOAT", s)),
+            Value::Null => unreachable!("handled above"),
+        },
+        ColumnType::Text => Ok(Value::Text(match v {
+            Value::Int(i) => i.to_string(),
+            Value::Float(f) => f.to_string(),
+            Value::Text(s) => s.clone(),
+            Value::Dna(s) => s.clone(),
+            Value::Null => unreachable!("handled above"),
+        })),
+        ColumnType::Dna2Bit => match v {
+            Value::Dna(s) => Ok(Value::Dna(s.clone())),
+            Value::Text(s) => match typed_string_literal(s) {
+                Value::Dna(d) => Ok(Value::Dna(d)),
+                _ => Err(format!(
+                    "cannot convert '{}' to DNA: expected non-empty ACGT sequence",
+                    s
+                )),
+            },
+            other => Err(format!(
+                "cannot convert '{}' to DNA: expected non-empty ACGT sequence",
+                other
+            )),
+        },
+        ColumnType::Timestamp => Ok(v.clone()),
+        ColumnType::ForeignLink { .. } => {
+            Err("cannot ALTER a column into a foreign-key type".into())
+        }
+    }
+}
+
 /// Literal typing rule shared by INSERT values and WHERE operands:
 /// non-empty pure-ACGT strings become `Value::Dna` (uppercased), everything
 /// else stays `Value::Text`.
@@ -5506,6 +6822,7 @@ fn render_select_sql(stmt: &Stmt) -> String {
         joins,
         where_clause,
         group_by,
+        grouping,
         having,
         order_by,
         limit,
@@ -5560,7 +6877,25 @@ fn render_select_sql(stmt: &Stmt) -> String {
         out.push_str(&format!(" WHERE {}", expr_to_sql(w)));
     }
     if !group_by.is_empty() {
-        out.push_str(&format!(" GROUP BY {}", group_by.join(", ")));
+        // v4.2: re-render the grouping-set form faithfully (rollup chain →
+        // WITH ROLLUP; full power set → CUBE; otherwise the ROLLUP spelling).
+        if grouping.len() > 1 {
+            let is_rollup = grouping.len() == group_by.len() + 1
+                && grouping
+                    .iter()
+                    .enumerate()
+                    .all(|(k, set)| *set == group_by[..group_by.len() - k]);
+            let is_cube = grouping.len() == 1usize << group_by.len();
+            if is_cube {
+                out.push_str(&format!(" GROUP BY CUBE ({})", group_by.join(", ")));
+            } else if is_rollup {
+                out.push_str(&format!(" GROUP BY {} WITH ROLLUP", group_by.join(", ")));
+            } else {
+                out.push_str(&format!(" GROUP BY ROLLUP ({})", group_by.join(", ")));
+            }
+        } else {
+            out.push_str(&format!(" GROUP BY {}", group_by.join(", ")));
+        }
     }
     if let Some(h) = having {
         out.push_str(&format!(" HAVING {}", expr_to_sql(h)));
@@ -5776,8 +7111,13 @@ fn expr_has_subquery(e: &Expr) -> bool {
 }
 
 /// Canonical rendering of a window function expression.
-fn render_window(func: &WindowFunc, partition: &[String], order: &[(String, bool)]) -> String {
-    let mut s = format!("{}() OVER (", func.name());
+fn render_window(
+    func: &WindowFunc,
+    partition: &[String],
+    order: &[(String, bool)],
+    frame: Option<WindowFrame>,
+) -> String {
+    let mut s = format!("{} OVER (", func.render_name());
     if !partition.is_empty() {
         s.push_str(&format!("PARTITION BY {} ", partition.join(", ")));
     }
@@ -5791,8 +7131,58 @@ fn render_window(func: &WindowFunc, partition: &[String], order: &[(String, bool
                 .join(", ")
         ));
     }
+    if let Some(f) = frame {
+        if !s.ends_with('(') {
+            s.push(' ');
+        }
+        s.push_str(&render_frame(f));
+    }
     s.push(')');
     s
+}
+
+/// Canonical rendering of a frame (`ROWS BETWEEN 1 PRECEDING AND CURRENT ROW`).
+fn render_frame(f: WindowFrame) -> String {
+    let bound = |b: FrameBound| match b {
+        FrameBound::UnboundedPreceding => "UNBOUNDED PRECEDING".to_string(),
+        FrameBound::Preceding(n) => format!("{} PRECEDING", n),
+        FrameBound::CurrentRow => "CURRENT ROW".to_string(),
+        FrameBound::Following(n) => format!("{} FOLLOWING", n),
+        FrameBound::UnboundedFollowing => "UNBOUNDED FOLLOWING".to_string(),
+    };
+    format!("ROWS BETWEEN {} AND {}", bound(f.start), bound(f.end))
+}
+
+/// v4.2: grouping sets of `ROLLUP (a, b, c)` — full list, then every
+/// prefix, ending with the grand-total (empty) set.
+fn rollup_sets(cols: &[String]) -> Vec<Vec<String>> {
+    (0..=cols.len())
+        .rev()
+        .map(|k| cols[..k].to_vec())
+        .collect()
+}
+
+/// v4.2: grouping sets of `CUBE (a, b, ...)` — every subset of the column
+/// list (2^n sets), from the full set down to the grand-total. Capped at
+/// 12 columns (4096 sets) to keep the explosion honest.
+fn cube_sets(cols: &[String]) -> Result<Vec<Vec<String>>, String> {
+    if cols.len() > 12 {
+        return Err(format!(
+            "SQL: CUBE over {} columns is not supported (limit 12)",
+            cols.len()
+        ));
+    }
+    let n = cols.len();
+    let mut sets = Vec::with_capacity(1 << n);
+    for mask in (0u32..(1 << n) as u32).rev() {
+        sets.push(
+            (0..n)
+                .filter(|i| mask & (1 << i) != 0)
+                .map(|i| cols[i].clone())
+                .collect(),
+        );
+    }
+    Ok(sets)
 }
 
 /// Render any SELECT-shaped statement back to SQL text (subquery execution).
@@ -5800,16 +7190,22 @@ pub(crate) fn render_stmt_sql(stmt: &Stmt) -> String {
     render_select_sql(stmt)
 }
 
-/// Compute a ranking window function over `rows` in place, inserting the
-/// result under `canonical`. Rows are grouped by the partition key (encoded
+/// Compute a window function over `rows` in place, inserting the result
+/// under `canonical`. Rows are grouped by the partition key (encoded
 /// values), sorted by the window ORDER BY inside each partition, then
-/// numbered: ROW_NUMBER = position, RANK = position of first peer,
-/// DENSE_RANK = consecutive peer groups.
+/// evaluated: ROW_NUMBER = position, RANK = position of first peer,
+/// DENSE_RANK = consecutive peer groups. v4.2 adds aggregate window
+/// functions: the value of `SUM/COUNT/AVG/MIN/MAX OVER (...)` is the
+/// aggregate over the frame of the current row — explicit ROWS/RANGE
+/// bounds when given, otherwise the standard default (whole partition
+/// without ORDER BY; RANGE UNBOUNDED PRECEDING..CURRENT ROW with peers
+/// included when ORDER BY is present).
 fn compute_window(
     rows: &mut [BTreeMap<String, Value>],
-    func: WindowFunc,
+    func: &WindowFunc,
     partition: &[String],
     order: &[(String, bool)],
+    frame: Option<WindowFrame>,
     canonical: &str,
 ) {
     // Index rows by partition key.
@@ -5838,31 +7234,216 @@ fn compute_window(
                 std::cmp::Ordering::Equal
             });
         }
-        let mut rank = 1usize;
-        let mut dense = 1usize;
-        for (pos, &i) in idxs.iter().enumerate() {
-            let value = match func {
-                WindowFunc::RowNumber => (pos + 1) as i64,
-                WindowFunc::Rank => rank as i64,
-                WindowFunc::DenseRank => dense as i64,
-            };
-            rows[i].insert(canonical.to_string(), Value::Int(value));
-            let is_last = pos + 1 == idxs.len();
-            if !is_last {
-                // Peers share the same ORDER BY values; a new peer group
-                // advances RANK to the current position and DENSE_RANK by 1.
-                let a = &rows[i];
-                let b = &rows[idxs[pos + 1]];
-                let peer = order.iter().all(|(col, _)| {
-                    let va = a.get(col).cloned().unwrap_or(Value::Null);
-                    let vb = b.get(col).cloned().unwrap_or(Value::Null);
-                    va.compare(&vb) == std::cmp::Ordering::Equal
-                });
-                if !peer {
-                    rank = pos + 2;
-                    dense += 1;
+        if func.is_ranking() {
+            let mut rank = 1usize;
+            let mut dense = 1usize;
+            for (pos, &i) in idxs.iter().enumerate() {
+                let value = match func {
+                    WindowFunc::RowNumber => (pos + 1) as i64,
+                    WindowFunc::Rank => rank as i64,
+                    WindowFunc::DenseRank => dense as i64,
+                    WindowFunc::Agg { .. } => unreachable!("guarded by is_ranking"),
+                };
+                rows[i].insert(canonical.to_string(), Value::Int(value));
+                let is_last = pos + 1 == idxs.len();
+                if !is_last {
+                    // Peers share the same ORDER BY values; a new peer group
+                    // advances RANK to the current position and DENSE_RANK by 1.
+                    let a = &rows[i];
+                    let b = &rows[idxs[pos + 1]];
+                    let peer = order.iter().all(|(col, _)| {
+                        let va = a.get(col).cloned().unwrap_or(Value::Null);
+                        let vb = b.get(col).cloned().unwrap_or(Value::Null);
+                        va.compare(&vb) == std::cmp::Ordering::Equal
+                    });
+                    if !peer {
+                        rank = pos + 2;
+                        dense += 1;
+                    }
                 }
             }
+            continue;
+        }
+        // v4.2: aggregate window function — evaluate the frame per row.
+        let WindowFunc::Agg { func: agg, arg } = func else {
+            unreachable!("guarded by is_ranking");
+        };
+        let n = idxs.len();
+        // Last peer of every position (RANGE frames include all peers).
+        let last_peer: Vec<usize> = {
+            let mut out = Vec::with_capacity(n);
+            let mut start = 0usize;
+            while start < n {
+                let mut end = start;
+                while end + 1 < n {
+                    let a = &rows[idxs[start]];
+                    let b = &rows[idxs[end + 1]];
+                    let peer = order.iter().all(|(col, _)| {
+                        let va = a.get(col).cloned().unwrap_or(Value::Null);
+                        let vb = b.get(col).cloned().unwrap_or(Value::Null);
+                        va.compare(&vb) == std::cmp::Ordering::Equal
+                    });
+                    if peer {
+                        end += 1;
+                    } else {
+                        break;
+                    }
+                }
+                for _ in start..=end {
+                    out.push(end);
+                }
+                start = end + 1;
+            }
+            out
+        };
+        for (pos, &i) in idxs.iter().enumerate() {
+            // Frame range [start..=end] in partition order.
+            let (start, end) = match frame {
+                None => {
+                    if order.is_empty() {
+                        (0usize, n - 1)
+                    } else {
+                        // Default frame: RANGE UNBOUNDED PRECEDING..CURRENT ROW.
+                        (0usize, last_peer[pos])
+                    }
+                }
+                Some(f) => {
+                    let end = match f.end {
+                        FrameBound::UnboundedFollowing => n - 1,
+                        FrameBound::CurrentRow => {
+                            if f.start == FrameBound::CurrentRow {
+                                // RANGE CURRENT ROW includes peers; ROWS
+                                // CURRENT ROW is exactly this row.
+                                last_peer[pos]
+                            } else {
+                                pos
+                            }
+                        }
+                        FrameBound::Preceding(k) => pos.saturating_sub(k as usize),
+                        FrameBound::Following(k) => (pos + k as usize).min(n - 1),
+                        FrameBound::UnboundedPreceding => 0,
+                    };
+                    let start = match f.start {
+                        FrameBound::UnboundedPreceding => 0usize,
+                        FrameBound::Preceding(k) => pos.saturating_sub(k as usize),
+                        FrameBound::CurrentRow => pos,
+                        FrameBound::Following(k) => (pos + k as usize).min(n),
+                        FrameBound::UnboundedFollowing => n,
+                    };
+                    (start, end)
+                }
+            };
+            let value = if end < start {
+                // Empty frame: aggregates over nothing are NULL (standard).
+                Value::Null
+            } else {
+                let slice: Vec<&BTreeMap<String, Value>> =
+                    idxs[start..=end].iter().map(|&j| &rows[j]).collect();
+                eval_window_agg(agg, arg.as_deref(), &slice)
+            };
+            rows[i].insert(canonical.to_string(), value);
+        }
+    }
+}
+
+/// Evaluate one aggregate (COUNT/SUM/AVG/MIN/MAX) over a frame slice.
+/// NULL values are skipped (COUNT(*) counts every row); SUM/COUNT of pure
+/// integers stays Int, any Float involvement widens to Float, mirroring
+/// the GROUP BY aggregate semantics.
+fn eval_window_agg(
+    agg: &AggFunc,
+    arg: Option<&str>,
+    slice: &[&BTreeMap<String, Value>],
+) -> Value {
+    match agg {
+        AggFunc::Count => {
+            let c = match arg {
+                None => slice.len() as i64,
+                Some(col) => slice
+                    .iter()
+                    .filter(|r| r.get(col).map(|v| !v.is_null()).unwrap_or(false))
+                    .count() as i64,
+            };
+            Value::Int(c)
+        }
+        AggFunc::Sum => {
+            let mut sum = 0.0f64;
+            let mut saw_float = false;
+            let mut saw_any = false;
+            for r in slice {
+                if let Some(v) = arg.and_then(|col| r.get(col)) {
+                    match v {
+                        Value::Int(i) => {
+                            sum += *i as f64;
+                            saw_any = true;
+                        }
+                        Value::Float(f) => {
+                            sum += *f;
+                            saw_float = true;
+                            saw_any = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if !saw_any {
+                Value::Null
+            } else if saw_float {
+                Value::Float(sum)
+            } else {
+                Value::Int(sum as i64)
+            }
+        }
+        AggFunc::Avg => {
+            let mut sum = 0.0f64;
+            let mut cnt = 0u64;
+            for r in slice {
+                if let Some(v) = arg.and_then(|col| r.get(col)) {
+                    match v {
+                        Value::Int(i) => {
+                            sum += *i as f64;
+                            cnt += 1;
+                        }
+                        Value::Float(f) => {
+                            sum += *f;
+                            cnt += 1;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if cnt == 0 {
+                Value::Null
+            } else {
+                Value::Float(sum / cnt as f64)
+            }
+        }
+        AggFunc::Min | AggFunc::Max => {
+            let mut best: Option<Value> = None;
+            for r in slice {
+                if let Some(v) = arg.and_then(|col| r.get(col)) {
+                    if v.is_null() {
+                        continue;
+                    }
+                    best = Some(match best {
+                        None => v.clone(),
+                        Some(b) => {
+                            let ord = v.compare(&b);
+                            let take = if matches!(agg, AggFunc::Min) {
+                                ord == std::cmp::Ordering::Less
+                            } else {
+                                ord == std::cmp::Ordering::Greater
+                            };
+                            if take {
+                                v.clone()
+                            } else {
+                                b
+                            }
+                        }
+                    });
+                }
+            }
+            best.unwrap_or(Value::Null)
         }
     }
 }
@@ -7057,6 +8638,429 @@ mod tests {
         assert!(map.contains("balance [FLOAT] = 100"), "{}", map);
         assert!(map.contains("RowCodec tag 2"), "{}", map);
     }
+
+    // ---------------- v4.2: full ALTER TABLE ----------------
+
+    fn get_val(sql: &SqlEngine, q: &str, col: &str) -> Value {
+        let res = sql.execute(q).unwrap();
+        assert_eq!(res.rows.len(), 1, "expected one row for: {}", q);
+        res.rows[0].get(col).cloned().unwrap_or(Value::Null)
+    }
+
+    #[test]
+    fn alter_table_drop_column_hides_and_sweeps_index() {
+        let (_e, sql) = setup();
+        sql.execute("INSERT INTO chr_users (user_id = 1, username = 'ada', balance = 10.5)")
+            .unwrap();
+        sql.execute("CREATE INDEX idx_balance ON chr_users (balance)")
+            .unwrap();
+        sql.execute("ALTER TABLE chr_users DROP COLUMN balance")
+            .unwrap();
+        let res = sql.execute("SELECT * FROM chr_users").unwrap();
+        assert!(!res.columns.contains(&"balance".to_string()));
+        // WHERE over a dropped column matches nothing (unknown column reads
+        // NULL and NULL = x is never true — three-valued logic).
+        assert_eq!(
+            sql.execute("SELECT user_id FROM chr_users WHERE balance = 10.5")
+                .map(|r| r.rows.len())
+                .unwrap_or(0),
+            0
+        );
+        // The index over the dropped column was swept: the IndexScan helper
+        // must not find entries (and re-adding the column yields NULLs).
+        sql.execute("ALTER TABLE chr_users ADD COLUMN balance FLOAT")
+            .unwrap();
+        assert_eq!(
+            get_val(&sql, "SELECT balance FROM chr_users WHERE user_id = 1", "balance"),
+            Value::Null
+        );
+        // Stale payload bytes are physically cleaned on the next rewrite.
+        sql.execute("UPDATE chr_users SET balance = 7.25 WHERE user_id = 1")
+            .unwrap();
+        assert_eq!(
+            get_val(&sql, "SELECT balance FROM chr_users WHERE user_id = 1", "balance"),
+            Value::Float(7.25)
+        );
+        // Guards: the PK column and FK-carrier columns are refused.
+        assert!(sql.execute("ALTER TABLE chr_users DROP COLUMN user_id").is_err());
+        assert!(sql.execute("ALTER TABLE chr_orders DROP COLUMN user_id").is_err());
+    }
+
+    #[test]
+    fn alter_table_rename_column_rewrites_rows_and_indexes() {
+        let (_e, sql) = setup();
+        sql.execute("INSERT INTO chr_users (user_id = 1, username = 'ada', balance = 10.5)")
+            .unwrap();
+        sql.execute("INSERT INTO chr_users (user_id = 2, username = 'bob', balance = 20.5)")
+            .unwrap();
+        sql.execute("CREATE INDEX idx_name ON chr_users (username)")
+            .unwrap();
+        sql.execute("ALTER TABLE chr_users RENAME COLUMN username TO login")
+            .unwrap();
+        // Data survived the physical rewrite under the new key.
+        assert_eq!(
+            get_val(&sql, "SELECT login FROM chr_users WHERE user_id = 1", "login"),
+            Value::Text("ada".into())
+        );
+        // The old name is gone from the schema: nothing is projected.
+        let res = sql.execute("SELECT username FROM chr_users").unwrap();
+        assert!(!res.columns.contains(&"username".to_string()));
+        assert!(res.rows.iter().all(|r| !r.contains_key("username")));
+        // The renamed index still serves equality lookups (IndexScan plan).
+        let res = sql
+            .execute("SELECT user_id FROM chr_users WHERE login = 'bob'")
+            .unwrap();
+        assert_eq!(res.rows.len(), 1);
+        assert!(res.execution_plan.contains("IndexScan"), "plan: {}", res.execution_plan);
+        // Renaming onto an existing column is refused; PK rename is allowed
+        // (row keys are value-derived, so nothing moves).
+        assert!(sql
+            .execute("ALTER TABLE chr_users RENAME COLUMN balance TO login")
+            .is_err());
+        sql.execute("ALTER TABLE chr_users RENAME COLUMN user_id TO uid")
+            .unwrap();
+        assert_eq!(
+            get_val(&sql, "SELECT uid FROM chr_users WHERE login = 'ada'", "uid"),
+            Value::Int(1)
+        );
+    }
+
+    #[test]
+    fn alter_table_modify_column_converts_values() {
+        let (_e, sql) = setup();
+        sql.execute("CREATE TABLE chr_t (id INT, note TEXT, score FLOAT, PRIMARY KEY (id))")
+            .unwrap();
+        sql.execute("INSERT INTO chr_t (id = 1, note = '42', score = 2.5)")
+            .unwrap();
+        sql.execute("INSERT INTO chr_t (id = 2, note = '7', score = 2.4)")
+            .unwrap();
+        // TEXT → INT parses every value; FLOAT → INT rounds half away from
+        // zero (MySQL semantics: 2.5 → 3, 2.4 → 2).
+        sql.execute("ALTER TABLE chr_t MODIFY COLUMN note INT").unwrap();
+        assert_eq!(get_val(&sql, "SELECT note FROM chr_t WHERE id = 1", "note"), Value::Int(42));
+        sql.execute("ALTER TABLE chr_t MODIFY COLUMN score INT").unwrap();
+        assert_eq!(get_val(&sql, "SELECT score FROM chr_t WHERE id = 1", "score"), Value::Int(3));
+        assert_eq!(get_val(&sql, "SELECT score FROM chr_t WHERE id = 2", "score"), Value::Int(2));
+        // INT → TEXT renders; TEXT → DNA validates ACGT.
+        sql.execute("ALTER TABLE chr_t MODIFY COLUMN note TEXT").unwrap();
+        assert_eq!(
+            get_val(&sql, "SELECT note FROM chr_t WHERE id = 1", "note"),
+            Value::Text("42".into())
+        );
+        // Atomicity: one inconvertible value aborts the whole statement and
+        // leaves the data untouched.
+        sql.execute("INSERT INTO chr_t (id = 3, note = 'not-a-number')").unwrap();
+        assert!(sql.execute("ALTER TABLE chr_t MODIFY COLUMN note INT").is_err());
+        assert_eq!(
+            get_val(&sql, "SELECT note FROM chr_t WHERE id = 3", "note"),
+            Value::Text("not-a-number".into())
+        );
+        assert_eq!(
+            get_val(&sql, "SELECT note FROM chr_t WHERE id = 1", "note"),
+            Value::Text("42".into())
+        );
+        // CHANGE = rename + conversion in one pass.
+        sql.execute("ALTER TABLE chr_t CHANGE COLUMN note memo TEXT").unwrap();
+        assert_eq!(
+            get_val(&sql, "SELECT memo FROM chr_t WHERE id = 3", "memo"),
+            Value::Text("not-a-number".into())
+        );
+        // PK type change is refused.
+        assert!(sql.execute("ALTER TABLE chr_t MODIFY COLUMN id TEXT").is_err());
+    }
+
+    // ---------------- v4.2: aggregate windows + frames ----------------
+
+    #[test]
+    fn window_aggregates_frames_and_running_totals() {
+        let (_e, sql) = setup();
+        sql.execute("INSERT INTO chr_users (user_id = 1, username = 'a', balance = 10.0)")
+            .unwrap();
+        sql.execute("INSERT INTO chr_users (user_id = 2, username = 'b', balance = 20.0)")
+            .unwrap();
+        sql.execute("INSERT INTO chr_users (user_id = 3, username = 'c', balance = 30.0)")
+            .unwrap();
+        // Default frame with ORDER BY = RANGE UNBOUNDED PRECEDING..CURRENT
+        // ROW: running total.
+        let res = sql
+            .execute(
+                "SELECT user_id, SUM(balance) OVER (ORDER BY user_id) AS run \
+                 FROM chr_users ORDER BY user_id ASC",
+            )
+            .unwrap();
+        let run: Vec<Value> = res
+            .rows
+            .iter()
+            .map(|r| r.get("run").cloned().unwrap())
+            .collect();
+        assert_eq!(run, vec![Value::Float(10.0), Value::Float(30.0), Value::Float(60.0)]);
+        // Whole-partition frame (no ORDER BY): grand total on every row.
+        let res = sql
+            .execute(
+                "SELECT user_id, SUM(balance) OVER () AS total, \
+                 COUNT(*) OVER () AS n FROM chr_users WHERE user_id <= 2 ORDER BY user_id ASC",
+            )
+            .unwrap();
+        assert_eq!(res.rows[0].get("total"), Some(&Value::Float(30.0)));
+        assert_eq!(res.rows[1].get("n"), Some(&Value::Int(2)));
+        // Explicit ROWS frame: moving sum of the previous and current row.
+        let res = sql
+            .execute(
+                "SELECT user_id, \
+                 SUM(balance) OVER (ORDER BY user_id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS mv \
+                 FROM chr_users ORDER BY user_id ASC",
+            )
+            .unwrap();
+        let mv: Vec<Value> = res
+            .rows
+            .iter()
+            .map(|r| r.get("mv").cloned().unwrap())
+            .collect();
+        assert_eq!(mv, vec![Value::Float(10.0), Value::Float(30.0), Value::Float(50.0)]);
+        // ROWS 1 FOLLOWING .. UNBOUNDED FOLLOWING skips the current row.
+        let res = sql
+            .execute(
+                "SELECT user_id, \
+                 SUM(balance) OVER (ORDER BY user_id ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING) AS tail \
+                 FROM chr_users ORDER BY user_id ASC",
+            )
+            .unwrap();
+        let tail: Vec<Value> = res
+            .rows
+            .iter()
+            .map(|r| r.get("tail").cloned().unwrap())
+            .collect();
+        assert_eq!(tail, vec![Value::Float(50.0), Value::Float(30.0), Value::Null]);
+        // MIN/MAX/AVG windows and ranking functions still work together.
+        let res = sql
+            .execute(
+                "SELECT MIN(balance) OVER (ORDER BY user_id) AS mn, \
+                 ROW_NUMBER() OVER (ORDER BY balance DESC) AS rk \
+                 FROM chr_users WHERE user_id <= 2 ORDER BY user_id ASC",
+            )
+            .unwrap();
+        assert_eq!(res.rows[0].get("mn"), Some(&Value::Float(10.0)));
+        assert_eq!(res.rows[1].get("rk"), Some(&Value::Int(1)));
+        // RANGE beyond the supported bounds is an honest error.
+        assert!(sql
+            .execute("SELECT SUM(balance) OVER (ORDER BY user_id RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM chr_users")
+            .is_err());
+    }
+
+    #[test]
+    fn window_functions_over_group_by_result() {
+        let (_e, sql) = setup();
+        for uid in 1..=3 {
+            sql.execute(&format!(
+                "INSERT INTO chr_users (user_id = {}, username = 'u{}', balance = 1.0)",
+                uid, uid
+            ))
+            .unwrap();
+        }
+        for (oid, uid, total) in [(10, 1, 50.0), (11, 1, 70.0), (12, 2, 200.0), (13, 3, 999.0)] {
+            sql.execute(&format!(
+                "INSERT INTO chr_orders (order_id = {}, user_id = {}, total_usd = {:.1}, status = 'paid')",
+                oid, uid, total
+            ))
+            .unwrap();
+        }
+        // Windows run AFTER aggregation: partition/order may reference group
+        // columns and aggregate keys; aggregate arguments use the nested
+        // spelling (SUM(SUM(x))) to name the grouped aggregate.
+        let res = sql
+            .execute(
+                "SELECT user_id, SUM(total_usd) AS total, \
+                 RANK() OVER (ORDER BY SUM(total_usd) DESC) AS rk \
+                 FROM chr_orders GROUP BY user_id ORDER BY user_id ASC",
+            )
+            .unwrap();
+        assert_eq!(res.rows.len(), 3);
+        assert_eq!(res.rows[0].get("user_id"), Some(&Value::Int(1)));
+        assert_eq!(res.rows[0].get("rk"), Some(&Value::Int(3)));
+        assert_eq!(res.rows[2].get("user_id"), Some(&Value::Int(3)));
+        assert_eq!(res.rows[2].get("rk"), Some(&Value::Int(1)));
+        // Grand total over the grouped rows: SUM(SUM(total_usd)) OVER ()
+        // = 50+70+200+999 = 1319 on every group row.
+        let res = sql
+            .execute(
+                "SELECT user_id, SUM(SUM(total_usd)) OVER () AS grand \
+                 FROM chr_orders GROUP BY user_id ORDER BY user_id ASC",
+            )
+            .unwrap();
+        assert_eq!(res.rows[0].get("grand"), Some(&Value::Float(1319.0)));
+        assert_eq!(res.rows[2].get("grand"), Some(&Value::Float(1319.0)));
+    }
+
+    // ---------------- v4.2: ROLLUP / CUBE ----------------
+
+    #[test]
+    fn group_by_with_rollup_and_cube() {
+        let (_e, sql) = setup();
+        for uid in 1..=2 {
+            sql.execute(&format!(
+                "INSERT INTO chr_users (user_id = {}, username = 'u{}', balance = 1.0)",
+                uid, uid
+            ))
+            .unwrap();
+        }
+        for (oid, uid, total, st) in [
+            (10, 1, 50.0, "paid"),
+            (11, 1, 70.0, "open"),
+            (12, 2, 200.0, "paid"),
+        ] {
+            sql.execute(&format!(
+                "INSERT INTO chr_orders (order_id = {}, user_id = {}, total_usd = {:.1}, status = '{}')",
+                oid, uid, total, st
+            ))
+            .unwrap();
+        }
+        // MySQL spelling: GROUP BY a, b WITH ROLLUP — per-user subtotal plus
+        // the grand total, rolled-up columns carry NULL.
+        let res = sql
+            .execute(
+                "SELECT user_id, status, SUM(total_usd) AS s \
+                 FROM chr_orders GROUP BY user_id, status WITH ROLLUP",
+            )
+            .unwrap();
+        assert_eq!(res.rows.len(), 3 + 2 + 1); // 3 (u,s) + 2 (u,NULL) + 1 grand
+        let grand = res
+            .rows
+            .iter()
+            .find(|r| r.get("user_id") == Some(&Value::Null) && r.get("status") == Some(&Value::Null))
+            .expect("grand total row");
+        assert_eq!(grand.get("s"), Some(&Value::Float(320.0)));
+        // Standard spelling GROUP BY ROLLUP(a, b) is the same sets.
+        let res2 = sql
+            .execute(
+                "SELECT user_id, status, SUM(total_usd) AS s \
+                 FROM chr_orders GROUP BY ROLLUP (user_id, status)",
+            )
+            .unwrap();
+        assert_eq!(res2.rows.len(), res.rows.len());
+        // CUBE(user_id, status) = 4 sets: (u,s), (u), (s), ().
+        let res = sql
+            .execute(
+                "SELECT user_id, status, COUNT(*) AS c \
+                 FROM chr_orders GROUP BY CUBE (user_id, status)",
+            )
+            .unwrap();
+        // distinct (u,s) = 3, distinct users = 2, distinct statuses = 2,
+        // grand total = 1.
+        assert_eq!(res.rows.len(), 3 + 2 + 2 + 1);
+    }
+
+    // ---------------- v4.2: WITH RECURSIVE ----------------
+
+    #[test]
+    fn with_recursive_walks_hierarchy_and_dedupes_cycles() {
+        let (_e, sql) = setup();
+        sql.execute("CREATE TABLE chr_org (id INT, manager_id INT, PRIMARY KEY (id))")
+            .unwrap();
+        for (id, mgr) in [(1, 0), (2, 1), (3, 2), (4, 2), (5, 3)] {
+            sql.execute(&format!(
+                "INSERT INTO chr_org (id = {}, manager_id = {})",
+                id, mgr
+            ))
+            .unwrap();
+        }
+        // Walk from 5 up to the root: 5 → 3 → 2 → 1.
+        let res = sql
+            .execute(
+                "WITH RECURSIVE chain AS ( \
+                     SELECT id, manager_id FROM chr_org WHERE id = 5 \
+                     UNION ALL \
+                     SELECT c.id, c.manager_id FROM chr_org c \
+                       INNER JOIN chain ch ON c.id = ch.manager_id \
+                 ) SELECT id FROM chain ORDER BY id ASC",
+            )
+            .unwrap();
+        let ids: Vec<Value> = res.rows.iter().map(|r| r.get("id").cloned().unwrap()).collect();
+        assert_eq!(ids, vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(5)]);
+        // Cyclic data + UNION dedupe terminates naturally.
+        sql.execute("CREATE TABLE chr_cyc (id INT, nxt INT, PRIMARY KEY (id))")
+            .unwrap();
+        for (id, nxt) in [(1, 2), (2, 3), (3, 1)] {
+            sql.execute(&format!("INSERT INTO chr_cyc (id = {}, nxt = {})", id, nxt))
+                .unwrap();
+        }
+        let res = sql
+            .execute(
+                "WITH RECURSIVE walk AS ( \
+                     SELECT id, nxt FROM chr_cyc WHERE id = 1 \
+                     UNION \
+                     SELECT c.id, c.nxt FROM chr_cyc c INNER JOIN walk w ON c.id = w.nxt \
+                 ) SELECT COUNT(*) AS n FROM walk",
+            )
+            .unwrap();
+        assert_eq!(res.rows[0].get("n"), Some(&Value::Int(3)));
+        // UNION ALL over a cycle hits the iteration cap with a clear error
+        // (not a hang, not unbounded memory).
+        let err = sql
+            .execute(
+                "WITH RECURSIVE spin AS ( \
+                     SELECT id, nxt FROM chr_cyc WHERE id = 1 \
+                     UNION ALL \
+                     SELECT c.id, c.nxt FROM chr_cyc c INNER JOIN spin s ON c.id = s.nxt \
+                 ) SELECT COUNT(*) FROM spin",
+            )
+            .unwrap_err();
+        assert!(err.contains("iterations"), "err: {}", err);
+        // Non-UNION recursive bodies are rejected up front.
+        assert!(sql
+            .execute(
+                "WITH RECURSIVE bad AS (SELECT id FROM chr_org WHERE id = 1) SELECT * FROM bad"
+            )
+            .is_err());
+    }
+
+    // ---------------- v4.2: IndexJoin plans ----------------
+
+    #[test]
+    fn index_join_plan_for_small_left_side() {
+        let (_e, sql) = setup();
+        sql.execute("INSERT INTO chr_users (user_id = 1, username = 'ada', balance = 1.0)")
+            .unwrap();
+        sql.execute("INSERT INTO chr_users (user_id = 2, username = 'nobody', balance = 2.0)")
+            .unwrap();
+        // 200 indexed orders, all belonging to user 1.
+        for i in 10..210 {
+            sql.execute(&format!(
+                "INSERT INTO chr_orders (order_id = {}, user_id = 1, total_usd = 5.0, status = 'paid')",
+                i
+            ))
+            .unwrap();
+        }
+        sql.execute("CREATE INDEX idx_orders_user ON chr_orders (user_id)")
+            .unwrap();
+        // Left side = 2 users, right side = 200 indexed orders → IndexJoin.
+        let res = sql
+            .execute(
+                "SELECT username, order_id FROM chr_users \
+                 INNER JOIN chr_orders ON user_id = user_id",
+            )
+            .unwrap();
+        assert!(res.execution_plan.contains("IndexJoin"), "plan: {}", res.execution_plan);
+        assert_eq!(res.rows.len(), 200);
+        // LEFT join keeps the orderless user with NULL right columns.
+        let res = sql
+            .execute(
+                "SELECT username, order_id FROM chr_users \
+                 LEFT JOIN chr_orders ON user_id = user_id WHERE username = 'nobody'",
+            )
+            .unwrap();
+        assert_eq!(res.rows.len(), 1);
+        assert_eq!(res.rows[0].get("order_id"), Some(&Value::Null));
+        // RIGHT / FULL stay on hash plans.
+        let res = sql
+            .execute(
+                "SELECT username FROM chr_users \
+                 RIGHT JOIN chr_orders ON user_id = user_id WHERE order_id = 10",
+            )
+            .unwrap();
+        assert!(res.execution_plan.contains("HashJoin"), "plan: {}", res.execution_plan);
+        assert_eq!(res.rows.len(), 1);
+    }
+
 }
 #[cfg(test)]
 mod acl_parse_tests {
@@ -7211,4 +9215,5 @@ mod security_regression_tests {
         let left_joined = hash_join_left(&left, &right, "id", "id");
         assert_eq!(left_joined.len(), 4);
     }
+
 }

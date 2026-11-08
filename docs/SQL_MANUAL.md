@@ -366,20 +366,23 @@ How it works:
 
 ### 3.5. Limitations (honest list)
 
-- no `GROUP BY ROLLUP`/`CUBE`, no window frames — the only window
-  functions are `ROW_NUMBER`/`RANK`/`DENSE_RANK`, and they cannot be
-  combined with `GROUP BY`/aggregates;
-- JOIN plans are always hash joins — index-based JOIN plans are not
-  built (point `WHERE pk = …` lookups and index ranges are planned);
-- `ALTER TABLE` supports only `ADD COLUMN` (metadata-only, instant);
-  DROP/RENAME column and type changes are not supported;
-- scalar/correlated subqueries, `EXISTS` and CTEs (`WITH`) are
-  supported (since v3.6), but `LATERAL` and recursive CTEs are not;
-- `RIGHT/FULL JOIN`, `UNION [ALL]` and SQL transactions
-  (`BEGIN/COMMIT/ROLLBACK`) shipped in v3.6.
+- `LATERAL` and correlated derived tables in FROM are not supported
+  (scalar/correlated subqueries, `EXISTS`, CTEs and `WITH RECURSIVE`
+  are supported);
+- value-offset `RANGE` window frames (`RANGE BETWEEN n PRECEDING ...`)
+  are not supported — use `ROWS`; `RANGE` is accepted for
+  `UNBOUNDED PRECEDING / CURRENT ROW / UNBOUNDED FOLLOWING`;
+- changing the type of the primary-key column (`ALTER TABLE ... MODIFY
+  COLUMN <pk>`) is not supported — row keys are derived from the stored
+  PK value (recreate the table instead); DROP/RENAME/MODIFY/CHANGE of
+  regular columns shipped in v4.2; every DML/DDL limitation of earlier
+  versions is gone: `RIGHT/FULL JOIN`, `UNION [ALL]` and SQL
+  transactions (`BEGIN/COMMIT/ROLLBACK`) shipped in v3.6; window
+  functions with frames and over GROUP BY, `ROLLUP`/`CUBE`,
+  `WITH RECURSIVE` and IndexJoin plans shipped in v4.2.
 
 The current list of honest platform-level limitations lives in
-[RELEASE_NOTES_v4.0.0.md](RELEASE_NOTES_v4.0.0.md).
+[RELEASE_NOTES_v4.2.0.md](RELEASE_NOTES_v4.2.0.md).
 
 ---
 

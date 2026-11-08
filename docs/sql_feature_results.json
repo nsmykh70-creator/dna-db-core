@@ -1,6 +1,6 @@
 {
   "meta": {
-    "date": "2026-11-07 23:46:34",
+    "date": "2026-11-08 10:48:22",
     "machine": "Linux-5.10.134-013.15.kangaroo.al8.x86_64-x86_64-with-glibc2.41",
     "systems": {
       "dnadb": "dna-db-core 3.0.0 (native, --sync strict)",
@@ -162,7 +162,7 @@
         "dnadb": {
           "status": "ok",
           "detail": "8 row(s) match",
-          "note": "plan: SeqScan(users) -> InnerHashJoin(users.user_id, orders.user_id) -> Sort(order_id ASC) -> Project([\"username\", \"order_id\"])",
+          "note": "plan: SeqScan(users) -> HashJoin(users.user_id, orders.user_id) -> Sort(order_id ASC) -> Project([\"username\", \"order_id\"])",
           "expect": "rows"
         }
       }
@@ -175,7 +175,7 @@
         "dnadb": {
           "status": "ok",
           "detail": "8 row(s) match",
-          "note": "plan: SeqScan(users) -> InnerHashJoin(users.user_id, orders.user_id) -> Sort(order_id ASC) -> Project([\"username\", \"order_id\"])",
+          "note": "plan: SeqScan(users) -> HashJoin(users.user_id, orders.user_id) -> Sort(order_id ASC) -> Project([\"username\", \"order_id\"])",
           "expect": "rows"
         }
       }
@@ -188,7 +188,7 @@
         "dnadb": {
           "status": "ok",
           "detail": "10 row(s) match",
-          "note": "plan: SeqScan(users) -> LeftHashJoin(users.user_id, orders.user_id) -> Sort(username ASC, order_id ASC) -> Project([\"username\", \"order_id\"])",
+          "note": "plan: SeqScan(users) -> HashJoin(users.user_id, orders.user_id) -> Sort(username ASC, order_id ASC) -> Project([\"username\", \"order_id\"])",
           "expect": "rows"
         }
       }
@@ -201,7 +201,7 @@
         "dnadb": {
           "status": "ok",
           "detail": "8 row(s) match",
-          "note": "plan: SeqScan(users) -> RightHashJoin(users.user_id, orders.user_id) -> Sort(order_id ASC) -> Project([\"username\", \"order_id\"])",
+          "note": "plan: SeqScan(users) -> HashJoin(users.user_id, orders.user_id) -> Sort(order_id ASC) -> Project([\"username\", \"order_id\"])",
           "expect": "rows"
         }
       }
@@ -214,7 +214,7 @@
         "dnadb": {
           "status": "ok",
           "detail": "10 row(s) match",
-          "note": "plan: SeqScan(users) -> FullHashJoin(users.user_id, orders.user_id) -> Sort(user_id ASC, order_id ASC) -> Project([\"username\", \"order_id\"])",
+          "note": "plan: SeqScan(users) -> HashJoin(users.user_id, orders.user_id) -> Sort(user_id ASC, order_id ASC) -> Project([\"username\", \"order_id\"])",
           "expect": "rows"
         }
       }

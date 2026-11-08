@@ -31,7 +31,8 @@
 //!               |  'DROP' 'LOCUS' Ident ':' Int ['CASCADE']
 //!   DDL        ::= 'CREATE' ['UNIQUE'] 'INDEX' Ident 'ON' Ident '(' Ident ')'
 //!               |  'DROP' 'INDEX' Ident ['ON' Ident]
-//!               |  'ALTER' 'CHROMOSOME' Ident 'ADD' 'COLUMN' Ident Type
+//!               |  'ALTER' 'CHROMOSOME' Ident AlterAction   (v4.2: ADD | DROP
+//!                  | RENAME COLUMN a TO b | MODIFY | CHANGE COLUMN ...)
 //!               |  'SHOW' ('CHROMOSOMES'|'TABLES')
 //!   Explain    ::= 'EXPLAIN' (Pipeline|PatternSearch)
 //!
@@ -110,11 +111,17 @@ pub enum DnaQlAst {
         table: String,
         if_exists: bool,
     },
-    /// `ALTER CHROMOSOME name ADD COLUMN col TYPE` (v2.2) — rendered through
-    /// the SQL engine's metadata-only online DDL.
+    /// `ALTER CHROMOSOME name <action>` (v2.2/v4.2) — rendered through
+    /// the SQL engine's online DDL: ADD COLUMN, DROP COLUMN, RENAME
+    /// COLUMN a TO b, MODIFY COLUMN c TYPE, CHANGE COLUMN a b TYPE.
     AlterChromosome {
         table: String,
         column: String,
+        /// For RENAME COLUMN: the new name in `column`, old name here.
+        /// Empty for ADD/MODIFY/DROP.
+        second_column: String,
+        /// ADD / DROP / RENAME / MODIFY / CHANGE.
+        action: String,
         /// Raw type spelling (INT, FLOAT, TEXT, DNA, TIMESTAMP, ...).
         col_type: String,
     },
@@ -950,22 +957,53 @@ impl Parser {
         self.parse_chromosome_drop_tail()
     }
 
-    /// `ALTER CHROMOSOME t ADD COLUMN c TYPE;` (v2.2) — metadata-only online
-    /// DDL rendered through the SQL engine.
+    /// `ALTER CHROMOSOME t ADD|DROP|RENAME|MODIFY|CHANGE COLUMN ...;`
+    /// (v2.2 ADD; v4.2 adds DROP / RENAME / MODIFY / CHANGE) — rendered
+    /// through the SQL engine's online DDL.
     fn parse_alter_chromosome(&mut self) -> Result<DnaQlAst, String> {
         self.next(); // ALTER
         self.expect_kw("CHROMOSOME")?;
         let table = self.ident()?;
-        self.expect_kw("ADD")?;
+        let action = if self.kw("ADD") {
+            "ADD"
+        } else if self.kw("DROP") {
+            "DROP"
+        } else if self.kw("RENAME") {
+            "RENAME"
+        } else if self.kw("MODIFY") {
+            "MODIFY"
+        } else if self.kw("CHANGE") {
+            "CHANGE"
+        } else {
+            return Err(format!(
+                "DnaQL: expected ADD/DROP/RENAME/MODIFY/CHANGE after ALTER CHROMOSOME {}, got {:?}",
+                table,
+                self.peek()
+            ));
+        };
         self.expect_kw("COLUMN")?;
-        let column = self.ident()?;
-        let col_type = self.ident()?;
+        let first = self.ident()?;
+        let (second_column, col_type) = match action {
+            "ADD" | "MODIFY" => (String::new(), self.ident()?),
+            "CHANGE" => {
+                let second = self.ident()?;
+                let ty = self.ident()?;
+                (second, ty)
+            }
+            "RENAME" => {
+                self.expect_kw("TO")?;
+                (self.ident()?, String::new())
+            }
+            _ => (String::new(), String::new()), // DROP
+        };
         if matches!(self.peek(), Tok::Semicolon) {
             self.next();
         }
         Ok(DnaQlAst::AlterChromosome {
             table,
-            column,
+            column: first,
+            second_column,
+            action: action.to_string(),
             col_type,
         })
     }
@@ -1993,8 +2031,16 @@ impl DnaQlEngine {
             DnaQlAst::AlterChromosome {
                 table,
                 column,
+                second_column,
+                action,
                 col_type,
-            } => self.exec_alter_chromosome(table, column, col_type)?,
+            } => self.exec_alter_chromosome(
+                table,
+                column,
+                second_column.clone(),
+                action.clone(),
+                col_type,
+            )?,
             DnaQlAst::CreateIndex {
                 name,
                 table,
@@ -2223,23 +2269,53 @@ impl DnaQlEngine {
         ))
     }
 
-    /// `ALTER CHROMOSOME t ADD COLUMN c TYPE` — rendered through the SQL
-    /// engine's metadata-only online DDL (one schema-row rewrite, instant).
+    /// `ALTER CHROMOSOME t ADD|DROP|RENAME|MODIFY|CHANGE COLUMN ...` —
+    /// rendered through the SQL engine's online DDL (v2.2 ADD COLUMN;
+    /// v4.2 adds DROP / RENAME / MODIFY / CHANGE COLUMN, one atomic batch
+    /// for anything that rewrites rows).
     fn exec_alter_chromosome(
         &self,
         table: &str,
         column: &str,
+        second_column: String,
+        action: String,
         col_type: &str,
     ) -> Result<(Vec<DnaQlRow>, String), String> {
-        let sql = format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, col_type);
+        let sql = match action.as_str() {
+            "ADD" => format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, col_type),
+            "DROP" => format!("ALTER TABLE {} DROP COLUMN {}", table, column),
+            "MODIFY" => format!("ALTER TABLE {} MODIFY COLUMN {} {}", table, column, col_type),
+            "CHANGE" => format!(
+                "ALTER TABLE {} CHANGE COLUMN {} {} {}",
+                table, column, second_column, col_type
+            ),
+            "RENAME" => format!(
+                "ALTER TABLE {} RENAME COLUMN {} TO {}",
+                table, column, second_column
+            ),
+            other => return Err(format!("DnaQL DDL: unsupported ALTER action '{}'", other)),
+        };
         let res = self
             .sql
             .execute(&sql)
             .map_err(|e| format!("DnaQL DDL: {}", e))?;
+        let fallback = match action.as_str() {
+            "ADD" => format!("column '{}' added to chromosome '{}'", column, table),
+            "DROP" => format!("column '{}' dropped from chromosome '{}'", column, table),
+            "MODIFY" => format!("column '{}' modified in chromosome '{}'", column, table),
+            "CHANGE" => format!(
+                "column '{}' renamed to '{}' in chromosome '{}'",
+                column, second_column, table
+            ),
+            "RENAME" => format!(
+                "column '{}' renamed to '{}' in chromosome '{}'",
+                column, second_column, table
+            ),
+            _ => format!("chromosome '{}' altered", table),
+        };
         Ok((
             vec![],
-            res.message
-                .unwrap_or_else(|| format!("column '{}' added to chromosome '{}'", column, table)),
+            res.message.unwrap_or(fallback),
         ))
     }
 
@@ -3419,10 +3495,12 @@ fn ast_summary(ast: &DnaQlAst) -> String {
         DnaQlAst::AlterChromosome {
             table,
             column,
+            second_column,
+            action,
             col_type,
         } => format!(
-            "AlterChromosome {{ table: '{}', column: '{}', type: '{}' }}",
-            table, column, col_type
+            "AlterChromosome {{ table: '{}', action: {}, column: '{}', second: '{}', type: '{}' }}",
+            table, action, column, second_column, col_type
         ),
         DnaQlAst::CreateIndex {
             name,
