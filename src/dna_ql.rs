@@ -969,7 +969,26 @@ impl Parser {
         } else if self.kw("DROP") {
             "DROP"
         } else if self.kw("RENAME") {
-            "RENAME"
+            // Peek WITHOUT consuming: the COLUMN keyword is consumed by the
+            // shared expect_kw below. Bare `RENAME TO t2` is the v4.2.1
+            // table rename.
+            let column_kw = matches!(self.peek(), Tok::Ident(s) if s.eq_ignore_ascii_case("COLUMN"));
+            if column_kw {
+                "RENAME"
+            } else {
+                self.expect_kw("TO")?;
+                let to = self.ident()?;
+                if matches!(self.peek(), Tok::Semicolon) {
+                    self.next();
+                }
+                return Ok(DnaQlAst::AlterChromosome {
+                    table,
+                    column: to,
+                    second_column: String::new(),
+                    action: "RENAME_TABLE".to_string(),
+                    col_type: String::new(),
+                });
+            }
         } else if self.kw("MODIFY") {
             "MODIFY"
         } else if self.kw("CHANGE") {
@@ -2293,6 +2312,7 @@ impl DnaQlEngine {
                 "ALTER TABLE {} RENAME COLUMN {} TO {}",
                 table, column, second_column
             ),
+            "RENAME_TABLE" => format!("ALTER TABLE {} RENAME TO {}", table, column),
             other => return Err(format!("DnaQL DDL: unsupported ALTER action '{}'", other)),
         };
         let res = self

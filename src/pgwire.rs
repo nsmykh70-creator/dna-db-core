@@ -846,22 +846,28 @@ fn encode_result(out: &mut Vec<u8>, res: &QueryResult, sql_text: &str) {
         return;
     }
     // DDL / DML: no rowset, just a command tag.
-    let affected: usize = res
+    let from_rows: Option<usize> = res
         .rows
         .iter()
-        .filter_map(|r| {
-            r.get("affected_rows")
-                .or_else(|| r.get("deleted"))
-                // v4.2: INSERT reports one row per inserted key.
-                .or_else(|| r.get("inserted_key"))
-        })
+        .filter_map(|r| r.get("affected_rows").or_else(|| r.get("deleted")))
         .filter_map(|v| match v {
             Value::Int(i) => Some(*i as usize),
-            Value::Text(_) => Some(1), // inserted_key present → one row
             _ => None,
         })
-        .next()
-        .unwrap_or(0);
+        .next();
+    // v4.2.1 fix: INSERT results carry one `inserted_key` row per written
+    // row (no `affected_rows` key) — the tag must count ALL of them, not
+    // just the first (a multi-row INSERT used to report `INSERT 0 1`).
+    let affected: usize = from_rows.unwrap_or_else(|| {
+        if upper.starts_with("INSERT") {
+            res.rows
+                .iter()
+                .filter(|r| r.contains_key("inserted_key"))
+                .count()
+        } else {
+            0
+        }
+    });
     let tag = if upper.starts_with("INSERT") {
         format!("INSERT 0 {affected}")
     } else if upper.starts_with("UPDATE") {
@@ -964,6 +970,30 @@ fn null_terminated_string(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn insert_tag_counts_every_inserted_row() {
+        // v4.2.1: a multi-row INSERT used to report `INSERT 0 1` because the
+        // tag took only the first result row. One `inserted_key` row per
+        // written row → the tag counts them all.
+        let row = |k: i64| {
+            let mut m = std::collections::BTreeMap::new();
+            m.insert("inserted_key".to_string(), Value::Text(format!("t:{}", k)));
+            m.insert("pk".to_string(), Value::Int(k));
+            m
+        };
+        let res = QueryResult {
+            columns: vec!["inserted_key".into(), "pk".into()],
+            rows: vec![row(1), row(2), row(3)],
+            execution_plan: String::new(),
+            message: None,
+            execution_time_us: 0,
+        };
+        let mut out = Vec::new();
+        encode_result(&mut out, &res, "INSERT INTO t (a = 1), (a = 2), (a = 3)");
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("INSERT 0 3"), "tag bytes: {:?}", text);
+    }
     use super::*;
 
     #[test]

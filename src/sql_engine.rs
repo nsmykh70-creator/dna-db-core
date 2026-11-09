@@ -409,6 +409,12 @@ pub(crate) enum AlterAction {
         new: String,
         col_type: ColumnType,
     },
+    /// `RENAME TO t2` (v4.2.1) — one atomic batch moves the schema row,
+    /// every row key and every secondary-index prefix (entries are rewritten
+    /// to point at the new name); FKs in other tables are re-pointed.
+    RenameTable {
+        to: String,
+    },
 }
 
 /// v3.6 UPSERT tail of an INSERT statement.
@@ -799,15 +805,15 @@ impl SParser {
                     column: self.ident()?,
                 }
             } else if self.kw("RENAME") {
-                if !self.kw("COLUMN") {
-                    return Err(
-                        "SQL: unsupported ALTER TABLE RENAME target (supported: RENAME COLUMN a TO b)"
-                            .into(),
-                    );
+                if self.kw("COLUMN") {
+                    let old = self.ident()?;
+                    self.expect_kw("TO")?;
+                    AlterAction::RenameColumn { old, new: self.ident()? }
+                } else {
+                    // v4.2.1: RENAME TO t2 — table rename.
+                    self.expect_kw("TO")?;
+                    AlterAction::RenameTable { to: self.ident()? }
                 }
-                let old = self.ident()?;
-                self.expect_kw("TO")?;
-                AlterAction::RenameColumn { old, new: self.ident()? }
             } else if self.kw("MODIFY") {
                 let _ = self.kw("COLUMN");
                 let column = self.ident()?;
@@ -3649,6 +3655,9 @@ impl SqlEngine {
                     AlterAction::ChangeColumn { old, new, .. } => {
                         format!("CHANGE COLUMN {} TO {})", old, new)
                     }
+                    AlterAction::RenameTable { to } => {
+                        format!("RENAME TO {})", to)
+                    }
                 };
                 format!("AlterTable({} {}", table, detail)
             }
@@ -4178,7 +4187,167 @@ impl SqlEngine {
             AlterAction::ChangeColumn { old, new, col_type } => {
                 self.exec_alter_column_type(table, &old, Some(&new), col_type)
             }
+            AlterAction::RenameTable { to } => self.exec_rename_table(table, &to),
         }
+    }
+
+    /// v4.2.1 Online DDL: `ALTER TABLE t RENAME TO t2`. One WAL batch moves
+    /// the schema row, every `<t>:<pk>` row key and every `__idx:t:*`
+    /// prefix — index entry keys AND payloads are rewritten to point at the
+    /// new name (a payload still naming the old table would leave every
+    /// moved entry dangling). Foreign keys in other tables that target `t`
+    /// are re-pointed to `t2` and the complementarity (FK) index is
+    /// re-keyed.
+    fn exec_rename_table(
+        &self,
+        table: &str,
+        to: &str,
+    ) -> Result<
+        (
+            Vec<String>,
+            Vec<BTreeMap<String, Value>>,
+            String,
+            Option<String>,
+        ),
+        String,
+    > {
+        let schema = self
+            .get_schema(table)
+            .ok_or_else(|| format!("SQL: relation '{}' does not exist", table))?;
+        if self.get_schema(to).is_some() {
+            return Err(format!("SQL: relation '{}' already exists", to));
+        }
+        if self.cte_contains(to) {
+            return Err(format!("SQL: relation name '{}' conflicts with an active CTE", to));
+        }
+        // Re-point FK references in other schemas.
+        let mut referrers: Vec<ChromosomeTable> = Vec::new();
+        {
+            let schemas = self.schemas.read();
+            for (name, s) in schemas.iter() {
+                if name == table {
+                    continue;
+                }
+                let mut changed = false;
+                let mut s2 = s.clone();
+                for fk in s2.foreign_keys.iter_mut() {
+                    if fk.target_chromosome == *table {
+                        fk.target_chromosome = to.to_string();
+                        changed = true;
+                    }
+                }
+                if changed {
+                    referrers.push(s2);
+                }
+            }
+        }
+        // Move schema + rows + index entries in one batch.
+        let mut batch = Vec::new();
+        let payload = serde_json::to_vec(&schema).map_err(|e| e.to_string())?;
+        batch.push((
+            crate::wal::WalOp::Delete,
+            format!("__schema:{}", table).into_bytes(),
+            None,
+        ));
+        batch.push((
+            crate::wal::WalOp::Put,
+            format!("__schema:{}", to).into_bytes(),
+            Some(payload),
+        ));
+        let old_row_prefix = format!("{}:", table).into_bytes();
+        let new_row_prefix = format!("{}:", to).into_bytes();
+        let old_idx_prefix = format!("__idx:{}:", table).into_bytes();
+        let new_idx_prefix = format!("__idx:{}:", to).into_bytes();
+        let mut moved_rows = 0usize;
+        for (key, val) in self
+            .engine
+            .scan_prefix(&old_row_prefix)
+            .map_err(|e| e.to_string())?
+        {
+            batch.push((crate::wal::WalOp::Delete, key.clone(), None));
+            let mut new_key = new_row_prefix.clone();
+            new_key.extend_from_slice(&key[old_row_prefix.len()..]);
+            batch.push((crate::wal::WalOp::Put, new_key, Some(val)));
+            moved_rows += 1;
+        }
+        let mut moved_idx = 0usize;
+        for (key, val) in self
+            .engine
+            .scan_prefix(&old_idx_prefix)
+            .map_err(|e| e.to_string())?
+        {
+            batch.push((crate::wal::WalOp::Delete, key.clone(), None));
+            let old_row_key = String::from_utf8_lossy(&val).to_string();
+            let new_row_key = format!(
+                "{}{}",
+                String::from_utf8_lossy(&new_row_prefix),
+                &old_row_key[old_row_prefix.len().min(old_row_key.len())..]
+            );
+            let mut new_key = new_idx_prefix.clone();
+            let tail_len = old_row_key.len();
+            let keep_up_to = key.len().saturating_sub(tail_len);
+            new_key.extend_from_slice(&key[old_idx_prefix.len()..keep_up_to]);
+            new_key.extend_from_slice(new_row_key.as_bytes());
+            batch.push((
+                crate::wal::WalOp::Put,
+                new_key,
+                Some(new_row_key.into_bytes()),
+            ));
+            moved_idx += 1;
+        }
+        if !batch.is_empty() {
+            self.engine
+                .write_batch(&batch)
+                .map_err(|e| format!("ALTER TABLE RENAME TO failed: {}", e))?;
+        }
+        for s in &referrers {
+            self.persist_schema(s)?;
+        }
+        {
+            let mut schemas = self.schemas.write();
+            schemas.remove(table);
+            schemas.insert(to.to_string(), schema.clone());
+        }
+        {
+            let mut index = self.complement_index.write();
+            for fk in &schema.foreign_keys {
+                index.register_column(to, &fk.column);
+            }
+            for row in self.read_table_rows(to)? {
+                let Ok(pk) = Self::pk_of(&schema, &row) else {
+                    continue;
+                };
+                let key = Self::row_key(to, &pk);
+                for fk in &schema.foreign_keys {
+                    if let Some(value) = row.get(&fk.column) {
+                        if !value.is_null() {
+                            index.remove(table, &fk.column, &key, value);
+                            index.upsert(to, &fk.column, &key, value);
+                        }
+                    }
+                }
+            }
+        }
+        Ok((
+            vec!["status".into(), "from".into(), "to".into()],
+            vec![mk_row(&[
+                ("status", Value::Text("OK".into())),
+                ("from", Value::Text(table.to_string())),
+                ("to", Value::Text(to.to_string())),
+            ])],
+            format!(
+                "AlterTable({} RENAME TO {}, {} rows, {} index entries moved)",
+                table, to, moved_rows, moved_idx
+            ),
+            Some(format!(
+                "table '{}' renamed to '{}' ({} rows, {} index entries, {} referrers updated)",
+                table,
+                to,
+                moved_rows,
+                moved_idx,
+                referrers.len()
+            )),
+        ))
     }
 
     /// v3.9 Online DDL: `ALTER TABLE t ADD COLUMN c T` — metadata-only and
@@ -5526,8 +5695,26 @@ impl SqlEngine {
         // enough for that to pay off (cost heuristic below). RIGHT/FULL
         // keep the symmetric hash plans.
         for j in joins {
-            let right = self.read_table_rows(&j.table)?;
+            // v4.2.1 fix (silent empty-join bug): SQL allows BOTH ON
+            // orderings (`ON left.col = right.col` and
+            // `ON right.col = left.col`). The parser stores the sides
+            // positionally, so a query written in the reversed order used to
+            // bind the columns to the wrong tables and the join silently
+            // produced nothing. Resolve the sides against the joined table's
+            // schema: the column that exists there is the right side. When
+            // both/neither exist the parsed order stands (identical names —
+            // the common no-op case).
+            let mut j2 = j.clone();
             let right_schema = self.get_schema(&j.table);
+            if let Some(rs) = right_schema.as_ref() {
+                let l_in_right = rs.columns.contains_key(&j.left_col);
+                let r_in_right = rs.columns.contains_key(&j.right_col);
+                if l_in_right && !r_in_right {
+                    std::mem::swap(&mut j2.left_col, &mut j2.right_col);
+                }
+            }
+            let j = &j2;
+            let right = self.read_table_rows(&j.table)?;
             let indexed = right_schema
                 .as_ref()
                 .map(|s| {
@@ -5840,13 +6027,23 @@ impl SqlEngine {
                     }
                 }
                 plan.push_str(&format!(" -> Project({:?})", specs));
+                // v4.2.1: schema columns of the FROM table — used to
+                // NULL-fill physically-missing fields (instant ADD COLUMN /
+                // post-ALTER rows read as NULL, the documented v3.9
+                // behaviour). Unknown columns keep the legacy skip.
+                let schema_cols = self.get_schema(&from).map(|s| s.columns.clone());
                 let mut evaluated: Vec<BTreeMap<String, Value>> = Vec::with_capacity(current.len());
                 for r in current.into_iter() {
                     let mut out = BTreeMap::new();
                     for (src, out_name) in &columns {
-                        if let Some(v) = r.get(src) {
-                            out.insert(out_name.clone(), v.clone());
-                        }
+                        let v = match r.get(src) {
+                            Some(v) => v.clone(),
+                            None => match schema_cols.as_ref() {
+                                Some(cols) if cols.contains_key(src) => Value::Null,
+                                _ => continue,
+                            },
+                        };
+                        out.insert(out_name.clone(), v);
                     }
                     for (out_name, expr) in &computed {
                         let v = expr.eval(&r).unwrap_or(Value::Null);
@@ -7450,6 +7647,96 @@ fn eval_window_agg(
 
 #[cfg(test)]
 mod tests {
+
+    // ---------------- v4.2.1 fixes ----------------
+
+    #[test]
+    fn join_on_accepts_either_side_ordering() {
+        let (_e, sql) = setup();
+        sql.execute("CREATE TABLE chr_b (bid INT, aid2 INT, PRIMARY KEY (bid))").unwrap();
+        sql.execute("CREATE TABLE chr_a (aid INT, nm TEXT, PRIMARY KEY (aid))").unwrap();
+        sql.execute("INSERT INTO chr_b (bid = 1, aid2 = 1)").unwrap();
+        sql.execute("INSERT INTO chr_a (aid = 1, nm = 'ada')").unwrap();
+        // Reversed ON ordering (right table's column FIRST) — used to bind
+        // the sides positionally and silently return zero rows.
+        let res = sql
+            .execute("SELECT nm FROM chr_b b JOIN chr_a a ON a.aid = b.aid2")
+            .unwrap();
+        assert_eq!(res.rows, vec![mk_row(&[("nm", Value::Text("ada".into()))])]);
+        // Standard ordering still works.
+        let res = sql
+            .execute("SELECT nm FROM chr_b b JOIN chr_a a ON b.aid2 = a.aid")
+            .unwrap();
+        assert_eq!(res.rows, vec![mk_row(&[("nm", Value::Text("ada".into()))])]);
+        // LEFT JOIN with the reversed ordering keeps the unmatched left row.
+        sql.execute("INSERT INTO chr_b (bid = 2, aid2 = 9)").unwrap();
+        let res = sql
+            .execute("SELECT bid, nm FROM chr_b b LEFT JOIN chr_a a ON a.aid = b.aid2")
+            .unwrap();
+        assert_eq!(res.rows.len(), 2);
+        let unmatched = res
+            .rows
+            .iter()
+            .find(|r| r.get("bid") == Some(&Value::Int(2)))
+            .unwrap();
+        assert!(matches!(unmatched.get("nm"), Some(Value::Null)));
+    }
+
+    #[test]
+    fn alter_rename_table_moves_schema_rows_and_indexes() {
+        let (_e, sql) = setup();
+        sql.execute("INSERT INTO chr_users (user_id = 1, username = 'carl', balance = 5.0)")
+            .unwrap();
+        sql.execute("CREATE INDEX idx_u ON chr_users (username)").unwrap();
+        sql.execute("ALTER TABLE chr_users RENAME TO chr_members").unwrap();
+        // The old name is gone; the new one holds the rows.
+        assert!(sql.execute("SELECT * FROM chr_users").is_err());
+        let res = sql
+            .execute("SELECT * FROM chr_members WHERE user_id = 1")
+            .unwrap();
+        assert_eq!(res.rows.len(), 1);
+        // The index moved WITH the table — and its entries point at the new
+        // name (the payload rewrite is what makes the lookup work).
+        let res = sql
+            .execute("SELECT user_id FROM chr_members WHERE username = 'carl'")
+            .unwrap();
+        assert_eq!(res.rows.len(), 1);
+        assert!(res.execution_plan.contains("IndexScan"), "plan: {}", res.execution_plan);
+        // Rename onto an existing table is rejected.
+        assert!(sql.execute("ALTER TABLE chr_orders RENAME TO chr_members").is_err());
+        // SHOW TABLES lists the new name exactly once.
+        let res = sql.execute("SHOW TABLES").unwrap();
+        assert_eq!(
+            res.rows
+                .iter()
+                .filter(|r| r.get("table_name")
+                    == Some(&Value::Text("chr_members".into())))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn instant_add_column_reads_null_on_old_rows() {
+        let (_e, sql) = setup();
+        sql.execute("INSERT INTO chr_users (user_id = 1, username = 'ada', balance = 9.0)")
+            .unwrap();
+        // Instant metadata-only ADD COLUMN: old rows must read the new
+        // column as NULL (documented v3.9 behaviour — previously the
+        // projection simply skipped the missing field).
+        sql.execute("ALTER TABLE chr_users ADD COLUMN note TEXT").unwrap();
+        let res = sql
+            .execute("SELECT user_id, note FROM chr_users WHERE user_id = 1")
+            .unwrap();
+        assert_eq!(res.rows[0].get("user_id"), Some(&Value::Int(1)));
+        assert_eq!(res.rows[0].get("note"), Some(&Value::Null));
+        // SELECT * carries the column too (NULL), and new rows write it.
+        sql.execute("INSERT INTO chr_users (user_id = 2, username = 'bob', balance = 1.0, note = 'hi')")
+            .unwrap();
+        let res = sql.execute("SELECT note FROM chr_users").unwrap();
+        let notes: Vec<&Value> = res.rows.iter().map(|r| r.get("note").unwrap()).collect();
+        assert_eq!(notes, vec![&Value::Null, &Value::Text("hi".into())]);
+    }
     use super::*;
     use crate::engine::EngineConfig;
     use crate::wal::SyncMode;

@@ -1,5 +1,18 @@
 # Changelog
 
+## v4.2.1 (2026-11-09) — исправления поверх v4.2
+
+- **Исправлен молчаливый пустой JOIN** при обратном порядке сторон ON —
+  стороны разрешаются по схеме правой таблицы.
+- **Исправлено чтение после мгновенного ADD COLUMN** — NULL вместо
+  «отсутствует».
+- **Исправлен тег multi-row INSERT в pgwire** — `INSERT 0 N` вместо
+  `INSERT 0 1`.
+- **`ALTER TABLE RENAME TO t2`** — переименование таблицы одним батчем
+  (схема + строки + индексные записи: ключи и payload'ы); DnaQL:
+  `ALTER CHROMOSOME t RENAME TO t2`.
+- `scripts/live_pgwire_test.py` — живой pg8000-тест extended protocol (10/10).
+
 ## v4.2.0 (2026-11) — ограничения сняты: полный ALTER TABLE, prepared statements, окна с рамками, ROLLUP/CUBE, WITH RECURSIVE, IndexJoin
 
 Цель релиза — устранение документированных «честных ограничений»

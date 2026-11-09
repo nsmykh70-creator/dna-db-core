@@ -14,9 +14,31 @@
 
 ---
 
+## 0c. Прогон проверки v4.2.0/v4.2.1 — 2026-11-08/09 (нативный Linux, актуальный релиз)
+
+> Ниже — исторические прогоны v3.x–v4.0.
+
+* **Платформа:** Debian 12 sandbox, x86_64, профиль release
+* **Инструментарий:** rustc/cargo (stable), Python 3.12
+
+### Полный набор проверок
+
+| # | Проверка | Команда | Результат |
+|---|---|---|---|
+| 1 | Release-сборка | `cargo build --release` | **PASS** — 0 ошибок |
+| 2 | Все Rust-тесты | `cargo test --release` | **PASS — 252 passed, 0 failed** (221 lib + 31 integration; v4.2 добавил 13 тестов, v4.2.1 — ещё 4: порядок сторон ON, NULL-чтение после мгновенного ADD, тег multi-row INSERT, переименование таблицы) |
+| 3 | Линт | `cargo clippy --release --all-targets` | **PASS** — 0 ошибок |
+| 4 | SQL-соответствие | `python3 scripts/sql_feature_test.py --skip-mysql --skip-postgres` | **PASS — 32/32 ok, 0 unsupported, 0 mismatch, 0 error** |
+| 5 | Smoke протокола | `python scripts/smoke_test.py` | **PASS — 15/15** |
+| 6 | pgwire extended (реальный драйвер) | `python3 scripts/live_pgwire_test.py` (pg8000) | **PASS — 10/10**: prepared SELECT/INSERT с параметрами, ALTER DROP/RENAME/MODIFY COLUMN + RENAME TO, оконные рамки, окна поверх GROUP BY, WITH RECURSIVE, join по переименованной таблице |
+| 7 | pgwire extended E2E | `python3 scripts/pgwire_extended_e2e.py` | **OK** — Parse/Bind/Describe/Execute с `$n`- и `?`-плейсхолдерами, NULL-биндинги, живая сессия psycopg2 |
+
+Подробности: [RELEASE_NOTES_v4.2.0.md](RELEASE_NOTES_v4.2.0.md) (§ v4.2.1).
+
+---
 ## 0. Прогон проверки v3.5.0 — 2026-10-31 (нативный Linux, актуальный релиз)
 
-> Ниже — исторические прогоны v3.0–v3.4.
+> Ниже — исторические прогоны v3.x–v4.0.
 
 * **Платформа:** Debian 13 (trixie), x86_64, 2 vCPU, 4 ГБ RAM, профиль release (`panic = "unwind"`)
 * **Инструментарий:** rustc/cargo 1.99.1, Python 3.12.16

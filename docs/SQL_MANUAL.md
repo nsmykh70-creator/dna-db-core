@@ -375,11 +375,22 @@ How it works:
 - changing the type of the primary-key column (`ALTER TABLE ... MODIFY
   COLUMN <pk>`) is not supported — row keys are derived from the stored
   PK value (recreate the table instead); DROP/RENAME/MODIFY/CHANGE of
-  regular columns shipped in v4.2; every DML/DDL limitation of earlier
-  versions is gone: `RIGHT/FULL JOIN`, `UNION [ALL]` and SQL
-  transactions (`BEGIN/COMMIT/ROLLBACK`) shipped in v3.6; window
-  functions with frames and over GROUP BY, `ROLLUP`/`CUBE`,
-  `WITH RECURSIVE` and IndexJoin plans shipped in v4.2.
+  regular columns and `ALTER TABLE ... RENAME TO t2` shipped in v4.2;
+  every DML/DDL limitation of earlier versions is gone: `RIGHT/FULL
+  JOIN`, `UNION [ALL]` and SQL transactions (`BEGIN/COMMIT/ROLLBACK`)
+  shipped in v3.6; window functions with frames and over GROUP BY,
+  `ROLLUP`/`CUBE`, `WITH RECURSIVE` and IndexJoin plans shipped in v4.2.
+
+v4.2.1 fixes on top of v4.2:
+
+- the JOIN ON condition now accepts either side ordering
+  (`ON right.col = left.col` is legal SQL); previously the sides were
+  bound positionally and a reversed ordering silently returned zero
+  rows;
+- a schema column added by an instant `ADD COLUMN` now reads as NULL on
+  pre-existing rows (it used to read as absent);
+- the pgwire command tag counts every inserted row of a multi-row
+  INSERT (`INSERT 0 N`, not `INSERT 0 1`).
 
 The current list of honest platform-level limitations lives in
 [RELEASE_NOTES_v4.2.0.md](RELEASE_NOTES_v4.2.0.md).
@@ -389,7 +400,7 @@ The current list of honest platform-level limitations lives in
 ## Chapter 4. Tests — how to reproduce
 
 ```bash
-cargo test --release              # 230 tests: 199 lib + 31 integration
+cargo test --release              # 252 tests: 221 lib + 31 integration
 python3 scripts/kill9_test.py     # kill -9: no records lost
 python3 scripts/chaos_test.py     # sector corruption -> self-healing
 ./target/release/dna-db-core bench # real CPU/disk measurements

@@ -367,6 +367,10 @@ pub(crate) fn transpile(
                 new,
                 type_name(col_type)?
             )),
+            crate::sql_engine::AlterAction::RenameTable { to } => Ok(format!(
+                "ALTER CHROMOSOME {} RENAME TO {};",
+                table, to
+            )),
         },
         Stmt::ShowTables => Ok("SHOW CHROMOSOMES;".into()),
         Stmt::ShowStorage { table, .. } => Err(format!(

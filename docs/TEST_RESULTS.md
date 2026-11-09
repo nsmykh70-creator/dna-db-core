@@ -14,9 +14,31 @@
 
 ---
 
+## 0c. v4.2.0/v4.2.1 verification run — 2026-11-08/09 (native Linux, current release)
+
+> The sections below are the historical v3.x–v4.0 runs.
+
+* **Platform:** Debian 12 sandbox, x86_64, release profile
+* **Toolchain:** rustc/cargo (stable), Python 3.12
+
+### Full test battery
+
+| # | Check | Command | Result |
+|---|---|---|---|
+| 1 | Release build | `cargo build --release` | **PASS** — 0 errors |
+| 2 | All Rust tests | `cargo test --release` | **PASS — 252 passed, 0 failed** (221 lib + 31 integration; v4.2 added 13 tests, v4.2.1 added 4: ON-side ordering, instant-ADD NULL reads, multi-row INSERT tag, table rename) |
+| 3 | Lint | `cargo clippy --release --all-targets` | **PASS** — 0 errors |
+| 4 | SQL feature conformance | `python3 scripts/sql_feature_test.py --skip-mysql --skip-postgres` | **PASS — 32/32 ok, 0 unsupported, 0 mismatch, 0 error** |
+| 5 | Live protocol smoke | `python scripts/smoke_test.py` | **PASS — 15/15** |
+| 6 | pgwire extended protocol (real driver) | `python3 scripts/live_pgwire_test.py` (pg8000) | **PASS — 10/10**: prepared SELECT/INSERT with params, ALTER DROP/RENAME/MODIFY COLUMN + RENAME TO, window frames, windows over GROUP BY, WITH RECURSIVE, join on a renamed table |
+| 7 | pgwire extended E2E | `python3 scripts/pgwire_extended_e2e.py` | **OK** — Parse/Bind/Describe/Execute with `$n` and `?` placeholders, NULL binds, live psycopg2 session |
+
+Details: [RELEASE_NOTES_v4.2.0.md](RELEASE_NOTES_v4.2.0.md) (§ v4.2.1).
+
+---
 ## 0. v3.5.0 verification run — 2026-10-31 (native Linux, latest)
 
-> This is the current release. The sections below are the historical v3.0–v3.4 runs.
+> The sections below are the historical v3.x–v4.0 runs.
 
 * **Platform:** Debian 13 (trixie) sandbox, x86_64, 2 vCPU, 4 GB RAM, release profile (`panic = "unwind"`)
 * **Toolchain:** rustc/cargo 1.99.1, Python 3.12.16
