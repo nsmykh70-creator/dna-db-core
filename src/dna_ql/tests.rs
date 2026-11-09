@@ -284,6 +284,237 @@ mod tests {
         assert!(e2.get(b"chr_variants:1").unwrap().is_some());
     }
 }
+
+/// v4.3 pipeline conformance stages: SKIP, JOIN, GROUP (aggregates+HAVING),
+/// EMIT expressions with aliases, NOT/LIKE, SHOW CHROMOSOMES and DDL
+/// passthrough — the SQL-parity track of the DnaQL grammar.
+#[cfg(test)]
+mod pipeline_conformance_tests {
+    use super::*;
+    use crate::engine::{Engine, EngineConfig};
+
+    fn tempdir(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "dna_qlp_{}_{}",
+            name,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn setup() -> (Arc<Engine>, Arc<SqlEngine>, DnaQlEngine) {
+        let engine = Engine::open(EngineConfig {
+            dir_path: tempdir("qlp"),
+            memtable_capacity: 4 * 1024 * 1024,
+            sync_mode: crate::wal::SyncMode::Strict,
+            mirror_disk_path: None,
+            ..Default::default()
+        })
+        .unwrap();
+        let sql = Arc::new(SqlEngine::new(engine.clone()));
+        sql.execute("CREATE TABLE chr_users (user_id INT, username TEXT, PRIMARY KEY (user_id))")
+            .unwrap();
+        sql.execute("CREATE TABLE chr_orders (order_id INT, user_id INT, total_usd FLOAT, status TEXT, PRIMARY KEY (order_id))")
+            .unwrap();
+        sql.execute("INSERT INTO chr_users (user_id, username) VALUES (1, 'ada'), (2, 'grace'), (3, 'alan')")
+            .unwrap();
+        sql.execute(
+            "INSERT INTO chr_orders (order_id, user_id, total_usd, status) VALUES \
+             (10, 1, 50.0, 'paid'), (11, 1, 20.0, 'paid'), (12, 2, 75.0, 'open')",
+        )
+        .unwrap();
+        let ql = DnaQlEngine::new(engine.clone(), sql.clone());
+        (engine, sql, ql)
+    }
+
+    #[test]
+    fn skip_stage_is_sql_offset() {
+        let (_e, _s, ql) = setup();
+        let r = ql
+            .execute("FROM chr_users |> SORT user_id ASC |> SKIP 1 |> EMIT user_id;")
+            .unwrap();
+        let ids: Vec<i64> = r
+            .rows
+            .iter()
+            .map(|r| match r.fields.get("user_id") {
+                Some(Value::Int(i)) => *i,
+                other => panic!("bad user_id: {:?}", other),
+            })
+            .collect();
+        assert_eq!(ids, vec![2, 3]);
+    }
+
+    #[test]
+    fn inner_join_merges_and_filters() {
+        let (_e, _s, ql) = setup();
+        let r = ql
+            .execute(
+                "FROM chr_users |> JOIN chr_orders ON user_id = user_id \
+                 |> WHERE status = 'paid' |> EMIT username, total_usd;",
+            )
+            .unwrap();
+        assert_eq!(r.rows.len(), 2, "ada has two paid orders");
+        for row in &r.rows {
+            assert!(row.fields.contains_key("username"));
+            assert!(row.fields.contains_key("total_usd"));
+        }
+        // Spec §4.2 naming: bare name first, then chr.field, then link_.
+        // Non-colliding columns resolve bare (SQL row model parity).
+        let r = ql
+            .execute(
+                "FROM chr_users |> JOIN chr_orders ON user_id = user_id \
+                 |> WHERE total_usd > 60 |> EMIT username;",
+            )
+            .unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0].fields.get("username"), Some(&Value::Text("grace".into())));
+        // Collided joined columns are addressable under the qualified
+        // fallback (user_id exists on both sides).
+        let r = ql
+            .execute(
+                "FROM chr_users |> JOIN chr_orders ON user_id = user_id \
+                 |> WHERE chr_orders.user_id = 2 |> EMIT username;",
+            )
+            .unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0].fields.get("username"), Some(&Value::Text("grace".into())));
+    }
+
+    #[test]
+    fn left_join_null_extends_unmatched() {
+        let (_e, _s, ql) = setup();
+        let r = ql
+            .execute(
+                "FROM chr_users |> LEFT JOIN chr_orders ON user_id = user_id \
+                 |> EMIT username;",
+            )
+            .unwrap();
+        assert_eq!(r.rows.len(), 4, "ada twice + grace + unmatched alan");
+        assert!(r
+            .rows
+            .iter()
+            .any(|r| r.fields.get("username") == Some(&Value::Text("alan".into()))));
+    }
+
+    #[test]
+    fn group_stage_aggregates_and_having() {
+        let (_e, _s, ql) = setup();
+        let r = ql
+            .execute(
+                "FROM chr_orders |> GROUP user_id, COUNT(*) AS n, SUM(total_usd) AS total \
+                 HAVING COUNT(*) > 1 |> EMIT user_id, n;",
+            )
+            .unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0].fields.get("user_id"), Some(&Value::Int(1)));
+        assert_eq!(r.rows[0].fields.get("n"), Some(&Value::Int(2)));
+        // Global aggregation without group columns.
+        let r = ql.execute("FROM chr_orders |> GROUP COUNT(*), AVG(total_usd);").unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0].fields.get("COUNT(*)"), Some(&Value::Int(3)));
+        match r.rows[0].fields.get("AVG(total_usd)") {
+            Some(Value::Float(f)) => assert!((f - (50.0 + 20.0 + 75.0) / 3.0).abs() < 1e-9),
+            other => panic!("bad avg: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn emit_expressions_and_aliases() {
+        let (_e, _s, ql) = setup();
+        let r = ql
+            .execute(
+                "FROM chr_users |> WHERE user_id = 1 |> EMIT username AS name, user_id * 10 AS dec_id;",
+            )
+            .unwrap();
+        assert_eq!(r.rows[0].fields.get("name"), Some(&Value::Text("ada".into())));
+        assert_eq!(r.rows[0].fields.get("dec_id"), Some(&Value::Int(10)));
+        // Missing columns project as NULL (SQL row shapes).
+        let r = ql
+            .execute("FROM chr_users |> WHERE user_id = 1 |> EMIT no_such_col;")
+            .unwrap();
+        assert_eq!(r.rows[0].fields.get("no_such_col"), Some(&Value::Null));
+    }
+
+    #[test]
+    fn not_like_and_sortby_expressions() {
+        let (_e, _s, ql) = setup();
+        let r = ql
+            .execute(
+                "FROM chr_users |> WHERE NOT username LIKE 'a%' |> EMIT username;",
+            )
+            .unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0].fields.get("username"), Some(&Value::Text("grace".into())));
+        // NOT IN + computed sort (descending by arithmetic key).
+        let r = ql
+            .execute(
+                "FROM chr_users |> WHERE user_id NOT IN (3) |> SORT user_id * -1 ASC |> EMIT username;",
+            )
+            .unwrap();
+        let names: Vec<&Value> = r.rows.iter().map(|r| r.fields.get("username").unwrap()).collect();
+        assert_eq!(names, vec![&Value::Text("grace".into()), &Value::Text("ada".into())]);
+    }
+
+    #[test]
+    fn show_chromosomes_and_ddl_passthrough() {
+        let (_e, sql, ql) = setup();
+        let r = ql.execute("SHOW CHROMOSOMES;").unwrap();
+        let mut names: Vec<String> = r
+            .rows
+            .iter()
+            .map(|r| match r.fields.get("chromosome") {
+                Some(Value::Text(s)) => s.clone(),
+                other => panic!("bad chromosome: {:?}", other),
+            })
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["chr_orders", "chr_users"]);
+        // Same list as SQL SHOW TABLES — the consoles can never disagree.
+        let mut sql_names = sql.list_tables();
+        sql_names.sort();
+        assert_eq!(names, sql_names);
+
+        let r = ql.execute("SHOW CHROMOSOMES LIKE 'chr_o%';").unwrap();
+        assert_eq!(r.rows.len(), 1);
+
+        // DDL passthrough executes on the shared SQL engine.
+        ql.execute("CREATE INDEX idx_orders_user ON chr_orders (user_id);").unwrap();
+        let plan = sql
+            .execute("SELECT * FROM chr_orders WHERE user_id = 1")
+            .unwrap();
+        assert!(plan.execution_plan.contains("Index"), "index must be visible: {}", plan.execution_plan);
+        ql.execute("DROP INDEX idx_orders_user ON chr_orders;").unwrap();
+        let plan = sql
+            .execute("SELECT * FROM chr_orders WHERE user_id = 1")
+            .unwrap();
+        assert!(plan.execution_plan.contains("Seq"), "index dropped: {}", plan.execution_plan);
+        // ALTER passthrough.
+        ql.execute("ALTER CHROMOSOME chr_users ADD COLUMN note TEXT DEFAULT 'x';").unwrap();
+        let schema = sql.get_schema("chr_users").unwrap();
+        assert!(schema.columns.contains_key("note"));
+        ql.execute("ALTER CHROMOSOME chr_users DROP COLUMN note;").unwrap();
+        assert!(sql.get_schema("chr_users").unwrap().columns.get("note").is_none());
+    }
+
+    #[test]
+    fn acl_sees_join_target_and_ddl_tables() {
+        use super::referenced_tables;
+        assert_eq!(
+            referenced_tables("FROM chr_users |> JOIN chr_orders ON user_id = user_id")
+                .unwrap(),
+            vec!["chr_orders".to_string(), "chr_users".to_string()]
+        );
+        assert_eq!(
+            referenced_tables("CREATE INDEX i ON chr_orders (user_id);").unwrap(),
+            vec!["chr_orders".to_string()]
+        );
+    }
+}
 #[cfg(test)]
 mod acl_parse_tests {
     use super::referenced_tables;
@@ -351,3 +582,4 @@ mod security_regression_tests {
         );
     }
 }
+

@@ -138,12 +138,58 @@ physical map in DnaQL terms, one click from either console.
 
 ---
 
+## Chapter 3.1. SQL-parity pipeline stages (v4.3)
+
+DnaQL is no longer a read-only side dialect: the pipeline accepts the
+relational constructs SQL clients rely on, and the SQL→DnaQL transpiler
+maps the full SQL surface onto them (see `sql_to_dnaql`).
+
+```dnaql
+-- OFFSET (SQL LIMIT ... OFFSET n)
+FROM chr_users |> SORT balance ASC |> SKIP 50 |> LIMIT 10 |> EMIT *;
+
+-- INNER / LEFT JOIN with an optional compound ON
+FROM chr_users
+|> LEFT JOIN chr_orders ON user_id = user_id AND status = 'paid'
+|> EMIT username, total_usd;
+
+-- GROUP BY + aggregates + HAVING (aggregates answer to both the canonical
+-- SQL key and the alias, exactly like the SQL executor)
+FROM chr_orders
+|> GROUP user_id, COUNT(*) AS n, SUM(total_usd) AS total
+HAVING COUNT(*) > 1
+|> SORT n DESC |> EMIT user_id, n, total;
+
+-- expressions everywhere: aliases, computed sort keys, NOT/LIKE/CAST
+FROM chr_users
+|> WHERE NOT username LIKE 'a%' AND balance IS NOT NULL
+|> SORT balance * -1 ASC
+|> EMIT username, balance * 2 AS double_balance, CAST(balance AS SIGNED) AS whole;
+
+-- introspection and DDL (executes on the shared SQL engine)
+SHOW CHROMOSOMES LIKE 'chr_%';
+CREATE INDEX idx_orders_user ON chr_orders (user_id);
+ALTER CHROMOSOME chr_users ADD COLUMN note TEXT DEFAULT 'x';
+DROP INDEX idx_orders_user ON chr_orders;
+```
+
+A query must end cleanly: trailing tokens after a complete statement are an
+error (a malformed `EMIT a, b * 10` can no longer silently truncate to
+`EMIT a, b`).
+
 ## Chapter 4. Rosetta Stone cheat sheet: SQL vs DnaQL
 
 | Operation | ANSI SQL | Standard DnaQL | Quick DnaQL |
 |:---|:---|:---|:---|
 | Search with mutation | *not native* | `FIND PATTERN 'ACGT' IN chr WHERE HAMMING_DISTANCE <= 1` | `chr ? 'ACGT' ~1` |
-| Relational JOIN | `SELECT ... JOIN b ON ...` | `FROM a LINK b VIA COMPLEMENT(a_id)` | `FROM a |> LINK b => emit *` |
+| Relational JOIN (key-seek) | `SELECT ... JOIN b ON ...` | `FROM a LINK b VIA COMPLEMENT(a_id)` | `FROM a |> LINK b => emit *` |
+| Equi-join (general) | `SELECT ... JOIN b ON a.x = b.y` | `FROM a |> JOIN b ON x = y` | — |
+| LEFT JOIN | `SELECT ... LEFT JOIN b ON ...` | `FROM a |> LEFT JOIN b ON x = y` | — |
+| GROUP BY + aggregates | `SELECT g, COUNT(*) FROM t GROUP BY g HAVING ...` | `FROM t |> GROUP g COUNT(*) HAVING ...` | — |
+| OFFSET | `LIMIT 10 OFFSET 50` | `FROM t |> SKIP 50 |> LIMIT 10` | — |
+| Computed projection | `SELECT x*2 AS y FROM t` | `FROM t |> EMIT x * 2 AS y` | — |
+| Table list | `SHOW TABLES` | `SHOW CHROMOSOMES` | — |
+| Index DDL | `CREATE INDEX i ON t (c)` | `CREATE INDEX i ON t (c);` | — |
 | Transaction | `BEGIN; UPDATE; INSERT; COMMIT;` | `SYNTHESIZE ... BEGIN ... LIGATE` | `TX { ... }` |
 | Reverse complement | *external library* | `ANALYZE SEQUENCE s |> REV_COMP()` | `ANALYZE SEQUENCE s |> REV_COMP()` |
 | Field filter | `WHERE x > 1` | `FROM a |> WHERE x > 1` | `FROM a |> WHERE x > 1` |

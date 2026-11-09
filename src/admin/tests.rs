@@ -243,8 +243,8 @@ fn panel_explain_compact_and_disk_size() {
     );
     assert!(storage.contains("stored:"));
 
-    // Explain: SELECT — no DnaQL TX needed for this projection? The
-    // transpiler supports plain SELECT; JOIN is the rejected one.
+    // Explain: SELECT — v4.3 transpiles JOIN onto the DnaQL JOIN stage
+    // (SQL↔DnaQL conformance track); the panel reports both forms.
     let (status, body) = http(
         port,
         "POST",
@@ -254,8 +254,11 @@ fn panel_explain_compact_and_disk_size() {
     );
     assert_eq!(status, 200);
     let v: J = serde_json::from_str(&body).unwrap();
-    assert!(v["dnaql"].is_null(), "JOIN must have no DnaQL form");
-    assert!(v["dnaql_error"].as_str().unwrap().contains("JOIN"));
+    let dnaql = v["dnaql"].as_str().unwrap_or("");
+    assert!(
+        dnaql.contains("JOIN chr_t"),
+        "JOIN must transpile to the DnaQL JOIN stage: {dnaql}"
+    );
     assert!(v["storage"].as_str().unwrap().contains("chr_t"));
 
     // Explain: garbage query -> 400 with both errors reported.

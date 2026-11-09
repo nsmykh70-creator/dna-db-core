@@ -26,12 +26,14 @@ impl SParser {
         let mut t = ChromosomeTable::new(table_name.clone(), "id");
         let mut fks: Vec<ForeignKeyConstraint> = Vec::new();
         loop {
-            // CMS edition: MySQL constraint lines inside CREATE TABLE —
+            // MySQL constraint lines inside CREATE TABLE —
             // `KEY name (col(len))`, `INDEX name (col)`, `UNIQUE KEY name (col)`,
             // `FULLTEXT KEY name (col)`. Single-column keys become engine
             // secondary indexes; composite keys index their first column
             // non-uniquely (engine single-PK limitation, CMS_EDITION_RU.md §4).
-            #[cfg(feature = "cms")]
+            // Grammar is shared with the plain build: the SQL surface must not
+            // depend on the cms feature (the wire dialect gate is the only
+            // cms-specific layer).
             if self.peek_is_cms_constraint() {
                 self.parse_cms_table_constraint(&mut t)?;
                 if matches!(self.peek(), STok::Comma) {
@@ -47,28 +49,18 @@ impl SParser {
                 let pk = self.ident()?;
                 // Prefix index `PRIMARY KEY (id(100))` (Joomla's
                 // webauthn_credentials) — the length is dropped; the engine
-                // indexes the whole column. cms-gated: keeps the plain
-                // (non-cms) build byte-identical to pre-cms behaviour.
-                #[cfg(feature = "cms")]
+                // indexes the whole column.
                 self.consume_type_len()?;
-                // CMS edition: composite PRIMARY KEY (a, b) — the engine keys
+                // Composite PRIMARY KEY (a, b) — the engine keys
                 // on the first column for native paths; the full list is
                 // retained so row keys encode every key part (MediaWiki
                 // l10n_cache, Joomla session tables).
-                #[cfg(feature = "cms")]
-                {
-                    t.primary_key_cols = vec![pk.clone()];
-                    while matches!(self.peek(), STok::Comma) {
-                        self.next();
-                        let part = self.ident()?;
-                        self.consume_type_len()?;
-                        t.primary_key_cols.push(part);
-                    }
-                }
-                #[cfg(not(feature = "cms"))]
+                t.primary_key_cols = vec![pk.clone()];
                 while matches!(self.peek(), STok::Comma) {
                     self.next();
-                    let _ = self.ident()?;
+                    let part = self.ident()?;
+                    self.consume_type_len()?;
+                    t.primary_key_cols.push(part);
                 }
                 t.primary_locus_column = pk;
                 self.expect(STok::RParen)?;
@@ -102,11 +94,14 @@ impl SParser {
             } else {
                 let col = self.ident()?;
                 let ty = self.parse_column_type()?;
-                // CMS edition: MySQL-dialect column flags in any order
+                // MySQL-dialect column flags in any order
                 // (UNSIGNED NOT NULL DEFAULT '…' AUTO_INCREMENT …).
                 // AUTO_INCREMENT records the sequence column (exec_insert_tx
                 // assigns values); lengths/defaults are consumed and dropped.
-                #[cfg(feature = "cms")]
+                // Shared grammar: accepted (and recorded on the schema) in
+                // every build — the cms feature gates wire dialects, not SQL.
+                // (DEFAULT-fill / coercion *execution* stays cms-gated in
+                // exec_insert_tx by design.)
                 {
                     let mut not_null = false;
                     let mut default: Option<String> = None;
@@ -155,10 +150,7 @@ impl SParser {
                         if self.kw("PRIMARY") {
                             self.expect_kw("KEY")?;
                             t.primary_locus_column = col.clone();
-                            #[cfg(feature = "cms")]
-                            {
-                                t.primary_key_cols = vec![col.clone()];
-                            }
+                            t.primary_key_cols = vec![col.clone()];
                             continue;
                         }
                         if self.kw("UNIQUE") {
@@ -253,8 +245,6 @@ impl SParser {
                         t.column_defaults.insert(col.clone(), d);
                     }
                 }
-                #[cfg(not(feature = "cms"))]
-                let _ = self.kw("NOT") && self.kw("NULL"); // accepted, not enforced in v2.1
                 t.add_column(col, ty);
             }
             if matches!(self.peek(), STok::Comma) {
@@ -279,10 +269,9 @@ impl SParser {
             t.primary_locus_column = "__rowid".to_string();
             t.auto_increment_column = Some("__rowid".to_string());
         }
-        // CMS edition: MySQL table options after the column list —
+        // MySQL table options after the column list —
         // `ENGINE=InnoDB AUTO_INCREMENT=1 DEFAULT CHARSET=utf8mb4
         // COLLATE=utf8mb4_unicode_520_ci` — consumed and ignored.
-        #[cfg(feature = "cms")]
         {
             loop {
                 // MySQL separates table options with commas too:
@@ -341,13 +330,13 @@ impl SParser {
         })
     }
 
-    /// Column type of a CREATE TABLE column. Without the cms feature this is
-    /// the original base-type grammar; with cms it also accepts the
+    /// Column type of a CREATE TABLE column: base grammar plus the
     /// MySQL-dialect names WordPress DDL uses (bigint/tinyint/datetime/
-    /// longtext/decimal/...), consuming optional `(n)` lengths.
+    /// longtext/decimal/...), consuming optional `(n)` lengths. The SQL
+    /// surface is identical in every build — the cms feature gates wire
+    /// dialects and shims, never the grammar.
     pub(super) fn parse_column_type(&mut self) -> Result<ColumnType, String> {
         if self.kw("INT") || self.kw("INTEGER") || self.kw("INT64") {
-            #[cfg(feature = "cms")]
             self.consume_type_len()?;
             Ok(ColumnType::Int64)
         } else if self.kw("FLOAT") || self.kw("FLOAT64") || self.kw("DOUBLE") {
@@ -356,11 +345,9 @@ impl SParser {
             // MySQL length/precision spec: `double(15,8)`, `float(10,2)`
             // (OpenCart's currency.value) — precision is advisory, the
             // engine stores IEEE doubles.
-            #[cfg(feature = "cms")]
             self.consume_type_len()?;
             Ok(ColumnType::Float64)
         } else if self.kw("TEXT") || self.kw("VARCHAR") || self.kw("STRING") {
-            #[cfg(feature = "cms")]
             self.consume_type_len()?; // VARCHAR(191), TEXT(65535)
             Ok(ColumnType::Text)
         } else if self.kw("DNA") || self.kw("DNA2BIT") {
@@ -368,8 +355,7 @@ impl SParser {
         } else if self.kw("TIMESTAMP") {
             Ok(ColumnType::Timestamp)
         } else {
-            // CMS edition: MySQL-dialect names map onto base engine types.
-            #[cfg(feature = "cms")]
+            // MySQL-dialect names map onto base engine types.
             {
                 if self.kw("BIGINT")
                     || self.kw("TINYINT")
@@ -429,8 +415,7 @@ impl SParser {
         }
     }
 
-    /// Consumes an optional `(n)` / `(n,m)` type length (cms only).
-    #[cfg(feature = "cms")]
+    /// Consumes an optional `(n)` / `(n,m)` type length.
     pub(super) fn consume_type_len(&mut self) -> Result<(), String> {
         if matches!(self.peek(), STok::LParen) {
             self.next();
@@ -451,8 +436,7 @@ impl SParser {
     }
 
     /// Consumes a DEFAULT/COMMENT value literal: string, number, or bare
-    /// identifier (NULL / CURRENT_TIMESTAMP) (cms only).
-    #[cfg(feature = "cms")]
+    /// identifier (NULL / CURRENT_TIMESTAMP).
     pub(super) fn consume_default_value(&mut self) -> Result<(), String> {
         match self.peek() {
             STok::Str(_) | STok::Int(_) | STok::Float(_) | STok::Ident(_) => {
@@ -473,7 +457,6 @@ impl SParser {
     /// after the optional name, a constraint reaches '(' where the name is
     /// NOT a type keyword (a column def's next token is a type keyword
     /// before its length paren).
-    #[cfg(feature = "cms")]
     pub(super) fn peek_is_cms_constraint(&self) -> bool {
         let type_word = |w: &str| matches!(
             w.to_ascii_uppercase().as_str(),
@@ -540,11 +523,10 @@ impl SParser {
         }
     }
 
-    /// Parses one MySQL constraint line into the table's secondary indexes
-    /// (cms only). Composite keys keep only the first column (non-unique) —
+    /// Parses one MySQL constraint line into the table's secondary indexes.
+    /// Composite keys keep only the first column (non-unique) —
     /// a unique composite would reject valid rows under the single-column
     /// index model.
-    #[cfg(feature = "cms")]
     pub(super) fn parse_cms_table_constraint(&mut self, t: &mut ChromosomeTable) -> Result<(), String> {
         let unique = self.kw("UNIQUE");
         let fulltext = self.kw("FULLTEXT") || self.kw("SPATIAL");

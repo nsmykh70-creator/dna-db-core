@@ -131,12 +131,47 @@ DnaQL-консоли» подставляет ровно эту команду `
 
 ---
 
+## Глава 3.1. Стадии SQL-конформности (v4.3)
+
+Пайплайн DnaQL принимает реляционные конструкции SQL, а транслятор
+SQL→DnaQL отображает на них весь словарь SQL-движка:
+
+```dnaql
+FROM chr_users |> SORT balance ASC |> SKIP 50 |> LIMIT 10 |> EMIT *;
+
+FROM chr_users
+|> LEFT JOIN chr_orders ON user_id = user_id AND status = 'paid'
+|> EMIT username, total_usd;
+
+FROM chr_orders
+|> GROUP user_id, COUNT(*) AS n, SUM(total_usd) AS total
+HAVING COUNT(*) > 1
+|> SORT n DESC |> EMIT user_id, n, total;
+
+FROM chr_users
+|> WHERE NOT username LIKE 'a%'
+|> EMIT username, balance * 2 AS double_balance;
+
+SHOW CHROMOSOMES LIKE 'chr_%';
+CREATE INDEX idx_orders_user ON chr_orders (user_id);
+```
+
+Хвостовые токены после завершённого запроса — ошибка (обрезка
+`EMIT a, b * 10` до `EMIT a, b` больше невозможна).
+
 ## Глава 4. Шпаргалка Rosetta Stone: SQL vs DnaQL
 
 | Операция | ANSI SQL | Standard DnaQL | Quick DnaQL |
 |:---|:---|:---|:---|
 | Поиск с мутацией | *нет нативно* | `FIND PATTERN 'ACGT' IN chr WHERE HAMMING_DISTANCE <= 1` | `chr ? 'ACGT' ~1` |
 | Реляционный JOIN | `SELECT ... JOIN b ON ...` | `FROM a LINK b VIA COMPLEMENT(a_id)` | `FROM a |> LINK b => emit *` |
+| Экви-соединение (общее) | `SELECT ... JOIN b ON a.x = b.y` | `FROM a |> JOIN b ON x = y` | — |
+| LEFT JOIN | `SELECT ... LEFT JOIN b ON ...` | `FROM a |> LEFT JOIN b ON x = y` | — |
+| GROUP BY + агрегаты | `SELECT g, COUNT(*) FROM t GROUP BY g HAVING ...` | `FROM t |> GROUP g COUNT(*) HAVING ...` | — |
+| OFFSET | `LIMIT 10 OFFSET 50` | `FROM t |> SKIP 50 |> LIMIT 10` | — |
+| Вычислимая проекция | `SELECT x*2 AS y FROM t` | `FROM t |> EMIT x * 2 AS y` | — |
+| Список таблиц | `SHOW TABLES` | `SHOW CHROMOSOMES` | — |
+| DDL индексов | `CREATE INDEX i ON t (c)` | `CREATE INDEX i ON t (c);` | — |
 | Транзакция | `BEGIN; UPDATE; INSERT; COMMIT;` | `SYNTHESIZE ... BEGIN ... LIGATE` | `TX { ... }` |
 | Обратный комплемент | *внешняя библиотека* | `ANALYZE SEQUENCE s |> REV_COMP()` | `ANALYZE SEQUENCE s |> REV_COMP()` |
 | Фильтр по полю | `WHERE x > 1` | `FROM a |> WHERE x > 1` | `FROM a |> WHERE x > 1` |

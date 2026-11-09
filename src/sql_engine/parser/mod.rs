@@ -214,10 +214,10 @@ impl SParser {
             self.kw("COLUMN");
             let column = self.ident()?;
             let col_type = self.parse_column_type()?;
-            // CMS edition: trailing column flags — the DEFAULT literal
+            // Trailing column flags — the DEFAULT literal
             // (or the NOT NULL zero-value) becomes the new column's
-            // effective default, exactly like CREATE TABLE.
-            #[cfg(feature = "cms")]
+            // effective default, exactly like CREATE TABLE. Shared grammar
+            // in every build (cms feature gates wire dialects, not SQL).
             {
                 let mut col_default: Option<String> = None;
                 let mut not_null = false;
@@ -273,12 +273,6 @@ impl SParser {
                 }
                 self.eat_semi();
                 return Ok(Stmt::AddColumn { table, column, col_type, col_default });
-            }
-            #[cfg(not(feature = "cms"))]
-            {
-                let _ = self.kw("NOT") && self.kw("NULL");
-                self.eat_semi();
-                return Ok(Stmt::AddColumn { table, column, col_type, col_default: None });
             }
         } else if self.kw("EXPLAIN") {
             // kw() already consumed the EXPLAIN token.

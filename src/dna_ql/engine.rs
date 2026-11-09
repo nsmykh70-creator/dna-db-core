@@ -4,6 +4,200 @@
 //! VERIFY/REPAIR CHROMOSOME and schema DDL forwarded to the SQL engine.
 
 use super::*;
+use crate::expr::like_match;
+
+// ---------------------------------------------------------------------------
+// EMIT projection (shared by pattern searches and the pipeline)
+// ---------------------------------------------------------------------------
+
+/// Apply an `EMIT` item list to one row (v4.3: expressions + aliases; missing
+/// columns project as NULL, matching SQL row shapes).
+fn apply_emit_items(
+    fields: &BTreeMap<String, Value>,
+    items: &[EmitItem],
+) -> BTreeMap<String, Value> {
+    let mut out = BTreeMap::new();
+    for item in items {
+        match item {
+            EmitItem::All => {
+                for (k, v) in fields {
+                    out.insert(k.clone(), v.clone());
+                }
+            }
+            EmitItem::Column { name, alias } => {
+                let key = alias.clone().unwrap_or_else(|| name.clone());
+                let v = fields.get(name).cloned().unwrap_or(Value::Null);
+                out.insert(key, v);
+            }
+            EmitItem::Computed { expr, alias } => {
+                let key = alias
+                    .clone()
+                    .unwrap_or_else(|| expr.describe());
+                let v = expr.eval(fields).unwrap_or(Value::Null);
+                out.insert(key, v);
+            }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// GROUP stage helpers
+// ---------------------------------------------------------------------------
+
+/// Canonical group key: type-tagged rendering of the BY-column values, so
+/// (1, 'x') and ('1', 'x') never collide and NULL forms its own group
+/// (SQL semantics).
+fn group_key(row: &BTreeMap<String, Value>, by: &[String]) -> String {
+    let mut key = String::new();
+    for c in by {
+        let v = row.get(c).cloned().unwrap_or(Value::Null);
+        key.push_str(&value_group_tag(&v));
+        key.push('\u{1}');
+    }
+    key
+}
+
+fn value_group_tag(v: &Value) -> String {
+    match v {
+        Value::Null => "n".to_string(),
+        Value::Int(i) => format!("i:{}", i),
+        Value::Float(f) => format!("f:{}", f),
+        Value::Text(s) => format!("s:{}", s),
+        Value::Dna(s) => format!("d:{}", s),
+    }
+}
+
+/// Evaluate one aggregate over the group's member rows (NULLs skipped, per
+/// SQL). SUM/AVG accept Int/Float (MySQL-style numeric text is coerced);
+/// MIN/MAX accept any comparable value.
+fn eval_aggregate(
+    spec: &AggSpec,
+    members: &[BTreeMap<String, Value>],
+) -> Result<Value, String> {
+    if let DnaAggFunc::Count = spec.func {
+        let n = match &spec.arg {
+            None => members.len() as i64, // COUNT(*)
+            Some(e) => members
+                .iter()
+                .filter(|m| matches!(e.eval(m), Some(Value::Null) | None) == false)
+                .count() as i64,
+        };
+        return Ok(Value::Int(n));
+    }
+    let arg = spec.arg.as_ref().ok_or_else(|| {
+        "DnaQL: only COUNT may aggregate '*'".to_string()
+    })?;
+    let mut values: Vec<Value> = Vec::new();
+    for m in members {
+        if let Some(v) = arg.eval(m) {
+            if !matches!(v, Value::Null) {
+                values.push(v);
+            }
+        }
+    }
+    let out = match spec.func {
+        DnaAggFunc::Count => unreachable!("COUNT handled above"),
+        DnaAggFunc::Min => values
+            .into_iter()
+            .reduce(|a, b| if a.compare(&b) != std::cmp::Ordering::Greater { a } else { b })
+            .unwrap_or(Value::Null),
+        DnaAggFunc::Max => values
+            .into_iter()
+            .reduce(|a, b| if a.compare(&b) != std::cmp::Ordering::Less { a } else { b })
+            .unwrap_or(Value::Null),
+        DnaAggFunc::Sum | DnaAggFunc::Avg => {
+            let mut sum_i: i64 = 0;
+            let mut sum_f: f64 = 0.0;
+            let mut any_float = false;
+            let mut n = 0usize;
+            for v in values {
+                let num = match &v {
+                    Value::Int(i) => Some((*i as f64, false)),
+                    Value::Float(f) => Some((*f, true)),
+                    // MySQL coerces numeric text in SUM/AVG ('250.00' + 0).
+                    Value::Text(s) | Value::Dna(s) => s
+                        .trim()
+                        .parse::<f64>()
+                        .ok()
+                        .map(|f| (f, true)),
+                    Value::Null => None,
+                };
+                if let Some((f, is_float)) = num {
+                    sum_f += f;
+                    if let Value::Int(i) = v {
+                        if !is_float {
+                            sum_i += i;
+                        }
+                    } else {
+                        any_float = true;
+                    }
+                    n += 1;
+                }
+            }
+            if n == 0 {
+                Value::Null
+            } else if spec.func == DnaAggFunc::Avg {
+                Value::Float(sum_f / n as f64)
+            } else if any_float {
+                Value::Float(sum_f)
+            } else {
+                Value::Int(sum_i)
+            }
+        }
+    };
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// SHOW CHROMOSOMES / DDL passthrough
+// ---------------------------------------------------------------------------
+
+impl DnaQlEngine {
+    /// `SHOW CHROMOSOMES [LIKE 'pattern']` — chromosome names from the
+    /// shared SQL-engine schema cache (the same list SQL `SHOW TABLES`
+    /// reports; the two consoles can never disagree).
+    fn exec_show_chromosomes(
+        &self,
+        pattern: Option<&str>,
+    ) -> Result<(Vec<DnaQlRow>, String), String> {
+        let mut rows = Vec::new();
+        for name in self.sql.list_tables() {
+            if let Some(p) = pattern {
+                if !like_match(p, &name) {
+                    continue;
+                }
+            }
+            let mut f = BTreeMap::new();
+            f.insert("chromosome".to_string(), Value::Text(name));
+            rows.push(DnaQlRow { fields: f });
+        }
+        let n = rows.len();
+        Ok((
+            rows,
+            format!(
+                "schema cache: {} chromosome{}{}",
+                n,
+                if n == 1 { "" } else { "s" },
+                pattern.map(|p| format!(" LIKE '{}'", p)).unwrap_or_default()
+            ),
+        ))
+    }
+
+    /// DDL passthrough: run the rendered SQL statement on the shared SQL
+    /// engine (CREATE/DROP INDEX, ALTER ... ADD/DROP COLUMN).
+    fn exec_ddl_passthrough(&self, sql: &str) -> Result<(Vec<DnaQlRow>, String), String> {
+        let res = self
+            .sql
+            .execute(sql)
+            .map_err(|e| format!("DnaQL DDL: {}", e))?;
+        Ok((
+            vec![],
+            res.message
+                .unwrap_or_else(|| format!("executed: {}", sql)),
+        ))
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Engine (parser + executor)
@@ -66,6 +260,8 @@ impl DnaQlEngine {
             DnaQlAst::DropChromosome { table, if_exists } => {
                 self.exec_drop_chromosome(table, *if_exists)?
             }
+            DnaQlAst::ShowChromosomes { pattern } => self.exec_show_chromosomes(pattern.as_deref())?,
+            DnaQlAst::DdlPassthrough { sql, .. } => self.exec_ddl_passthrough(sql)?,
         };
 
         Ok(DnaQlResult {
@@ -83,7 +279,7 @@ impl DnaQlEngine {
         mode: DistanceMode,
         max_distance: usize,
         link: Option<LinkSpec>,
-        projection: Vec<String>,
+        projection: Vec<EmitItem>,
     ) -> Result<(Vec<DnaQlRow>, String), String> {
         if pattern.is_empty() || pattern.len() > 64 {
             return Err(format!(
@@ -173,16 +369,14 @@ impl DnaQlEngine {
                     }
                 }
 
-                let row = if projection.is_empty() {
+                let row = if projection.is_empty()
+                    || matches!(projection.as_slice(), [EmitItem::All])
+                {
                     DnaQlRow { fields: result_row }
                 } else {
-                    let mut filtered = BTreeMap::new();
-                    for p in &projection {
-                        if let Some(v) = result_row.get(p) {
-                            filtered.insert(p.clone(), v.clone());
-                        }
+                    DnaQlRow {
+                        fields: apply_emit_items(&result_row, &projection),
                     }
-                    DnaQlRow { fields: filtered }
                 };
                 out.push(row);
             }
@@ -318,15 +512,9 @@ impl DnaQlEngine {
                     rows.retain(|r| e.eval_bool(&r.fields));
                 }
                 PipelineStage::Emit(projection) => {
-                    plan.push(format!("Project({:?})", projection));
+                    plan.push(format!("Project({} items)", projection.len()));
                     for row in rows.iter_mut() {
-                        let mut filtered = BTreeMap::new();
-                        for p in projection {
-                            if let Some(v) = row.fields.get(p.as_str()) {
-                                filtered.insert(p.clone(), v.clone());
-                            }
-                        }
-                        row.fields = filtered;
+                        row.fields = apply_emit_items(&row.fields, projection);
                     }
                 }
                 PipelineStage::Sort { column, asc } => {
@@ -346,9 +534,186 @@ impl DnaQlEngine {
                         }
                     });
                 }
+                PipelineStage::SortBy { expr, asc } => {
+                    // v4.3: computed sort key — the expression evaluates per
+                    // row (missing/NULL sorts first ASC, like SQL NULLs).
+                    plan.push(format!(
+                        "SortBy({} {})",
+                        expr.describe(),
+                        if *asc { "ASC" } else { "DESC" }
+                    ));
+                    rows.sort_by(|a, b| {
+                        let va = expr.eval(&a.fields).unwrap_or(Value::Null);
+                        let vb = expr.eval(&b.fields).unwrap_or(Value::Null);
+                        let ord = va.compare(&vb);
+                        if *asc {
+                            ord
+                        } else {
+                            ord.reverse()
+                        }
+                    });
+                }
                 PipelineStage::Limit(n) => {
                     plan.push(format!("Limit({})", n));
                     rows.truncate(*n);
+                }
+                PipelineStage::Skip(n) => {
+                    // v4.3: SQL OFFSET equivalent.
+                    plan.push(format!("Skip({})", n));
+                    let n = (*n).min(rows.len());
+                    rows.drain(..n);
+                }
+                PipelineStage::Join(join) => {
+                    // v4.3: equi-join against a whole chromosome. Nested-loop
+                    // with a cached right-side scan: right rows are read once,
+                    // matched by evaluating the ON pair against each side.
+                    // The right fields land under their qualified names
+                    // `chr2.field` (collision → `link_field`), exactly like
+                    // LINK's namespace rule — expressions address them as
+                    // `chr2.field`.
+                    plan.push(format!(
+                        "{}Join({}.{} = rhs){}",
+                        if join.left_outer { "Left" } else { "Inner" },
+                        join.chromosome,
+                        join.on_left.describe(),
+                        if join.on_extra.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" +{} extra", join.on_extra.len())
+                        }
+                    ));
+                    let right_prefix = format!("{}:", join.chromosome);
+                    let right_raw = self
+                        .engine
+                        .scan_prefix(right_prefix.as_bytes())
+                        .map_err(|e| format!("DnaQL storage error: {}", e))?;
+                    let mut right_rows: Vec<BTreeMap<String, Value>> = Vec::new();
+                    for (key, payload) in right_raw {
+                        let fields = RowCodec::decode(&payload).map_err(|e| {
+                            format!(
+                                "DnaQL: joined row {} unreadable: {}",
+                                String::from_utf8_lossy(&key),
+                                e
+                            )
+                        })?;
+                        right_rows.push(fields.into_iter().collect());
+                    }
+                    let mut joined: Vec<DnaQlRow> = Vec::new();
+                    for row in rows.drain(..) {
+                        let mut matched = false;
+                        for r in &right_rows {
+                            let lv = join.on_left.eval(&row.fields);
+                            let rv = join.on_right.eval(r);
+                            let eq = match (&lv, &rv) {
+                                (Some(l), Some(r)) => l.compare(r) == std::cmp::Ordering::Equal,
+                                _ => false, // NULL never matches (SQL semantics)
+                            };
+                            if !eq {
+                                continue;
+                            }
+                            let mut merged = row.fields.clone();
+                            for (k, v) in r {
+                                // Spec §4.2 naming: bare name first, then the
+                                // chromosome-qualified form, then link_. The
+                                // bare preference mirrors the SQL engine's
+                                // single-namespace row model, so transpiled
+                                // queries keep resolving joined columns.
+                                let mut name = k.clone();
+                                if merged.contains_key(&name) {
+                                    name = format!("{}.{}", join.chromosome, k);
+                                    if merged.contains_key(&name) {
+                                        name = format!("link_{}", k);
+                                    }
+                                }
+                                merged.insert(name, v.clone());
+                            }
+                            // Non-equi conjuncts apply during the ON match
+                            // (crucial for LEFT JOIN — folding them into a
+                            // later WHERE would resurrect dropped rows).
+                            if join
+                                .on_extra
+                                .iter()
+                                .all(|e| e.eval_bool(&merged))
+                            {
+                                matched = true;
+                                joined.push(DnaQlRow { fields: merged });
+                            }
+                        }
+                        if !matched && join.left_outer {
+                            // NULL-extension: the right side contributes no
+                            // fields; qualified references read as NULL.
+                            joined.push(DnaQlRow {
+                                fields: row.fields,
+                            });
+                        }
+                    }
+                    rows = joined;
+                }
+                PipelineStage::Group(group) => {
+                    // v4.3: grouping + aggregates. One output row per group;
+                    // group columns keep their value, aggregates land under
+                    // their aliases (canonical SQL rendering by default).
+                    let agg_names: Vec<String> = group
+                        .aggs
+                        .iter()
+                        .map(|a| {
+                            a.alias
+                                .clone()
+                                .unwrap_or_else(|| {
+                                    a.func.canonical(
+                                        a.arg.as_ref().map(|e| e.describe()).as_deref(),
+                                    )
+                                })
+                        })
+                        .collect();
+                    plan.push(format!(
+                        "Group(by={:?}, aggs={:?})",
+                        group.by, agg_names
+                    ));
+                    let mut order: Vec<String> = Vec::new();
+                    let mut buckets: BTreeMap<
+                        String,
+                        Vec<BTreeMap<String, Value>>,
+                    > = BTreeMap::new();
+                    for row in rows.drain(..) {
+                        let key = group_key(&row.fields, &group.by);
+                        if !buckets.contains_key(&key) {
+                            order.push(key.clone());
+                        }
+                        buckets.entry(key).or_default().push(row.fields);
+                    }
+                    let mut grouped: Vec<DnaQlRow> = Vec::new();
+                    for key in order {
+                        let members = buckets.remove(&key).unwrap_or_default();
+                        let mut out_row: BTreeMap<String, Value> = BTreeMap::new();
+                        // Group columns: value from the first member.
+                        let first = members.first().cloned().unwrap_or_default();
+                        for c in &group.by {
+                            let v = first.get(c).cloned().unwrap_or(Value::Null);
+                            out_row.insert(c.clone(), v);
+                        }
+                        for (a, name) in group.aggs.iter().zip(&agg_names) {
+                            let v = eval_aggregate(a, &members)?;
+                            // SQL parity: the aggregate lands under its
+                            // canonical rendering AND its output alias (both
+                            // keys present during HAVING / ORDER BY / EMIT;
+                            // the SQL executor does the same).
+                            let canonical = a.func.canonical(
+                                a.arg.as_ref().map(|e| e.describe()).as_deref(),
+                            );
+                            out_row.insert(canonical.clone(), v.clone());
+                            if *name != canonical {
+                                out_row.insert(name.clone(), v);
+                            }
+                        }
+                        if let Some(h) = &group.having {
+                            if !h.eval_bool(&out_row) {
+                                continue;
+                            }
+                        }
+                        grouped.push(DnaQlRow { fields: out_row });
+                    }
+                    rows = grouped;
                 }
             }
         }
@@ -741,6 +1106,18 @@ fn ast_summary(ast: &DnaQlAst) -> String {
                 "DropChromosome {{ table: '{}', if_exists: {} }}",
                 table, if_exists
             )
+        }
+        DnaQlAst::ShowChromosomes { pattern } => {
+            format!(
+                "ShowChromosomes {{ pattern: {} }}",
+                pattern
+                    .as_ref()
+                    .map(|p| format!("'{}'", p))
+                    .unwrap_or_else(|| "none".into())
+            )
+        }
+        DnaQlAst::DdlPassthrough { sql, .. } => {
+            format!("DdlPassthrough {{ sql: '{}' }}", sql)
         }
     }
 }

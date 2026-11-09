@@ -2,6 +2,63 @@
 
 ## Unreleased (CMS Edition — branch `cms-edition`)
 
+### SQL grammar parity + DnaQL↔SQL conformance — v4.3 track (2026-11-09)
+
+Two limitation classes closed end-to-end (tests: **210 without the `cms`
+feature / 352 with, 0 failures** — the previous "4 known cms-gated battery
+failures" are gone; E2E verdicts stay green: `MYSQLDUMP_E2E_VERDICT: OK`,
+`BACKUP_RESTORE_E2E_VERDICT: OK`, `SPIRALS_PANEL_E2E_VERDICT: OK`):
+
+- **Grammar parity: the SQL surface no longer depends on the feature mix.**
+  The CMS edition's MySQL-dialect parser extensions (column flags in any
+  order, inline/composite/prefix PRIMARY KEY, type lengths `VARCHAR(191)` /
+  `DECIMAL(10,2)`, MySQL type names bigint/datetime/enum/set/…, KEY/INDEX
+  constraint lines, table options, `LIMIT offset,count`, `FOR UPDATE
+  [NOWAIT | SKIP LOCKED]`, ALTER ADD COLUMN flags) moved out from behind
+  `#[cfg(feature = "cms")]` into the shared parser. The plain build parses
+  the same SQL text; the `cms` feature keeps gating only the wire dialects
+  and shims (as designed: DEFAULT-fill, numeric coercion and affected-count
+  semantics stay cms-executor behavior). This removes the 4 battery
+  failures of the non-cms build (CASE-expression, `#`-comment dump,
+  composite-PK, derived-table tests) instead of skipping them.
+- **DnaQL brought to SQL-command conformance** (the transpiler target is
+  now the full SQL surface minus documented exceptions):
+  - new pipeline stages: `|> SKIP n` (SQL OFFSET), `|> [LEFT] JOIN chr2 ON
+    lhs = rhs [AND extra]*` (nested-loop equi-join, bare-first field naming
+    per spec §4.2, non-equi conjuncts match during the join — LEFT JOIN
+    rows are never resurrected), `|> GROUP [BY] cols, AGG(expr) [AS a], ...
+    [HAVING e]` (COUNT/SUM/AVG/MIN/MAX; aggregates land under the canonical
+    SQL key and the output alias, exactly like the SQL executor);
+  - `EMIT` accepts expressions with aliases (`EMIT balance * 2 AS
+    double_balance`); missing columns project as NULL (SQL row shapes);
+  - expression grammar: `NOT`, `LIKE` / `NOT LIKE` (MySQL wildcards), `NOT
+    IN`, aggregate references in HAVING (`HAVING COUNT(*) > 1`) and
+    `CAST(expr AS SIGNED|UNSIGNED|CHAR)`; `SORT` accepts computed keys
+    (`SORT balance * -1 DESC`, SQL `ORDER BY meta_value+0`);
+  - `SHOW CHROMOSOMES [LIKE 'pat']` — chromosome introspection over the
+    shared schema cache (the transpiler used to advertise this statement;
+    now it exists and always agrees with SQL `SHOW TABLES`);
+  - DDL passthrough: `CREATE [UNIQUE] INDEX [IF NOT EXISTS]`,
+    `DROP INDEX [IF EXISTS]`, `ALTER CHROMOSOME ADD/DROP COLUMN` render to
+    the exact SQL statement and execute on the shared SQL engine;
+  - transpiler: OFFSET→`SKIP`, joins→`JOIN` stages (reversed ON spelling is
+    re-oriented by schema, not silently broken), GROUP BY/HAVING/aggregates
+    →`GROUP`, aliases/computed projections→`EMIT expr AS alias`,
+    qualified ORDER BY resolved against the FROM alias, CREATE/DROP INDEX
+    and ALTER→passthrough, `SHOW TABLES`→`SHOW CHROMOSOMES`. Honest
+    rejections remain for UPSERT tails (`ON CONFLICT`, `INSERT IGNORE` —
+    previously silently dropped!), subqueries, window functions,
+    RIGHT/FULL joins (rewriting hint: swap the sides), CTE/UNION.
+  - parser hardening: trailing tokens after a DnaQL query are now an error
+    (a malformed `EMIT a, b * 10` used to silently truncate to `EMIT a, b`).
+
+Tests: +15 transpiler tests (mapping + SQL↔DnaQL semantic parity for
+JOIN/GROUP/OFFSET) and +8 DnaQL engine tests (stages, ACL visibility,
+DDL passthrough index plans). `docs/DNAQL_SPEC.md` bumped to v2.2,
+`docs/DNAQL_MANUAL*.md` gained the SQL-parity chapter; release binary
+refreshed in `prebuilt/linux-x86_64/`.
+
+
 ### Per-database dual spirals + web panel + SUM scale fix (2026-11-07)
 
 Product request closed end-to-end (`scripts/e2e_spirals_panel.sh`,

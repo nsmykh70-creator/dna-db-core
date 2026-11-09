@@ -11,7 +11,7 @@ mod index_scan;
 mod lexer;
 mod parser;
 mod refs;
-mod stmt;
+pub(crate) mod stmt;
 #[cfg(test)]
 mod tests;
 

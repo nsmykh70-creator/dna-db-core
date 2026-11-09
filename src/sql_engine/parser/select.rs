@@ -407,9 +407,7 @@ impl SParser {
                 STok::Int(i) => {
                     // MySQL pagination form `LIMIT offset, count` — WordPress
                     // (WP_Query) sends it everywhere; == LIMIT count OFFSET
-                    // offset. Without the cms feature the comma stays a
-                    // parse error (original strict grammar).
-                    #[cfg(feature = "cms")]
+                    // offset. Shared grammar in every build.
                     if matches!(self.peek(), STok::Comma) {
                         self.next();
                         offset = i as usize;
@@ -418,10 +416,6 @@ impl SParser {
                             t => return Err(format!("SQL: LIMIT expects int, got {:?}", t)),
                         }
                     } else {
-                        limit = Some(i as usize);
-                    }
-                    #[cfg(not(feature = "cms"))]
-                    {
                         limit = Some(i as usize);
                     }
                 }
@@ -439,7 +433,8 @@ impl SParser {
         // deadlock detection is CMS_EDITION_RU.md §4 item 2); inside the
         // gate's transaction buffer the statement is still correct, just
         // not serialized — accept and ignore (WooCommerce stock paths).
-        #[cfg(feature = "cms")]
+        // Grammar is shared: parsed (and deliberately ignored) in every
+        // build, so SQL text does not depend on the feature mix.
         if self.kw("FOR") {
             if !(self.kw("UPDATE") || self.kw("SHARE")) {
                 return Err("SQL: expected UPDATE or SHARE after FOR".into());
