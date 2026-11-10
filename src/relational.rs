@@ -153,15 +153,16 @@ impl Value {
         t[..i].parse::<f64>().ok()
     }
 
-    /// CMS edition (branch `cms-edition`): coerce a value to the declared
-    /// column type the way MariaDB does on write — `$wpdb->insert()` without
-    /// a format array sends EVERY value as a string, so `order_id` reaches
-    /// a `bigint unsigned` column as '15'. MySQL converts on store; without
-    /// the same conversion the secondary-index key (built from the stored
-    /// Text) never matches lookups by an Int literal (`IndexScan → 0 rows`)
-    /// and JOINs on the column go blind. Non-numeric text becomes 0 (the
-    /// non-strict mode WordPress runs with, `sql_mode=''`).
-    #[cfg(feature = "cms")]
+    /// Coerce a value to the declared column type the way MariaDB does on
+    /// write — `$wpdb->insert()` without a format array sends EVERY value
+    /// as a string, so `order_id` reaches a `bigint unsigned` column as
+    /// '15'. MySQL converts on store; without the same conversion the
+    /// secondary-index key (built from the stored Text) never matches
+    /// lookups by an Int literal (`IndexScan → 0 rows`) and JOINs on the
+    /// column go blind. Non-numeric text becomes 0 (the non-strict mode
+    /// WordPress runs with, `sql_mode=''`). Since v4.3 the SQL grammar is
+    /// shared by both builds — ALTER TABLE MODIFY COLUMN (data rewrite)
+    /// uses this outside the cms feature too.
     pub fn coerce_for_column(ct: &ColumnType, v: Value) -> Value {
         match ct {
             ColumnType::Int64 => match v {

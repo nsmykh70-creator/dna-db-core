@@ -265,14 +265,26 @@ pub(super) fn collect_agg_items(
         }
     };
     for item in projection {
-        if let SelectItem::Agg {
-            func,
-            arg,
-            rendered,
-            canonical,
-        } = item
-        {
-            push(canonical.clone(), rendered.clone(), *func, arg.clone());
+        match item {
+            SelectItem::Agg {
+                func,
+                arg,
+                rendered,
+                canonical,
+            } => push(canonical.clone(), rendered.clone(), *func, arg.clone()),
+            // Expression aggregates (SUM(expr) / AVG(expr)): the argument is
+            // materialised per row under `arg_name` BEFORE aggregation, so
+            // the accumulator reads that column. Missing this arm left
+            // `SELECT SUM(a+b) FROM t` un-aggregated (one empty row per
+            // input row).
+            SelectItem::AggOverExpr {
+                func,
+                arg_name,
+                rendered,
+                canonical,
+                ..
+            } => push(canonical.clone(), rendered.clone(), *func, Some(arg_name.clone())),
+            _ => {}
         }
     }
     // Aggregates appearing only inside HAVING still need computing (they

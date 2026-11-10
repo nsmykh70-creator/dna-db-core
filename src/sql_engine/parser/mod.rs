@@ -210,6 +210,38 @@ impl SParser {
                 self.eat_semi();
                 return Ok(Stmt::DropColumn { table, column });
             }
+            // Online type change: ALTER TABLE t MODIFY [COLUMN] c T [flags]
+            // and rename+retype: ALTER TABLE t CHANGE [COLUMN] old new T [flags].
+            // Shared grammar in every build (cms gates wire dialects, not SQL).
+            if self.kw("MODIFY") {
+                self.kw("COLUMN");
+                let column = self.ident()?;
+                let col_type = self.parse_column_type()?;
+                let (col_default, _not_null) = self.parse_alter_column_tail(&col_type)?;
+                self.eat_semi();
+                return Ok(Stmt::ModifyColumn {
+                    table,
+                    column,
+                    new_name: None,
+                    col_type,
+                    col_default,
+                });
+            }
+            if self.kw("CHANGE") {
+                self.kw("COLUMN");
+                let column = self.ident()?;
+                let new_name = self.ident()?;
+                let col_type = self.parse_column_type()?;
+                let (col_default, _not_null) = self.parse_alter_column_tail(&col_type)?;
+                self.eat_semi();
+                return Ok(Stmt::ModifyColumn {
+                    table,
+                    column,
+                    new_name: Some(new_name),
+                    col_type,
+                    col_default,
+                });
+            }
             self.expect_kw("ADD")?;
             self.kw("COLUMN");
             let column = self.ident()?;
@@ -219,50 +251,8 @@ impl SParser {
             // effective default, exactly like CREATE TABLE. Shared grammar
             // in every build (cms feature gates wire dialects, not SQL).
             {
-                let mut col_default: Option<String> = None;
-                let mut not_null = false;
-                loop {
-                    if self.kw("UNSIGNED") || self.kw("ZEROFILL") {
-                        continue;
-                    }
-                    if self.kw("NOT") {
-                        if !self.kw("NULL") {
-                            return Err("SQL: expected NULL after NOT in column definition".into());
-                        }
-                        not_null = true;
-                        continue;
-                    }
-                    if self.kw("NULL") {
-                        continue;
-                    }
-                    if self.kw("DEFAULT") {
-                        col_default = Some(match self.peek().clone() {
-                            STok::Str(s) => {
-                                self.next();
-                                s
-                            }
-                            STok::Int(v) => {
-                                self.next();
-                                v.to_string()
-                            }
-                            STok::Float(v) => {
-                                self.next();
-                                v.to_string()
-                            }
-                            STok::Ident(s) => {
-                                self.next();
-                                s
-                            }
-                            t => return Err(format!("SQL: bad DEFAULT value {:?}", t)),
-                        });
-                        continue;
-                    }
-                    if self.kw("COMMENT") {
-                        self.consume_default_value()?;
-                        continue;
-                    }
-                    break;
-                }
+                let (col_default, not_null) = self.parse_alter_column_tail(&col_type)?;
+                let mut col_default = col_default;
                 if col_default.is_none() && not_null {
                     col_default = Some(match &col_type {
                         ColumnType::Timestamp => "0000-00-00 00:00:00".to_string(),

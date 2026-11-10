@@ -75,6 +75,7 @@ pub(super) fn collect_stmt_tables(stmt: &Stmt, out: &mut Vec<String>) -> Result<
         Stmt::ShowTables | Stmt::Tx { .. } => {}
         Stmt::ShowStorage { table, .. } => out.push(table.clone()),
         Stmt::AddColumn { table, .. } => out.push(table.clone()),
+        Stmt::ModifyColumn { table, .. } => out.push(table.clone()),
         Stmt::Insert { table, rows, on_conflict, ignore: _ } => {
             out.push(table.clone());
             // Column values are literals; no table refs beyond the target.

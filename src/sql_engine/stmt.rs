@@ -127,6 +127,17 @@ pub enum Stmt {
         table: String,
         column: String,
     },
+    /// Online type change: `ALTER TABLE t MODIFY [COLUMN] c T [flags]` and
+    /// `ALTER TABLE t CHANGE [COLUMN] old new T [flags]` (`new_name: Some`).
+    /// Metadata + one data-rewrite batch (every stored value is coerced to
+    /// the new type — reads never see stale payloads).
+    ModifyColumn {
+        table: String,
+        column: String,
+        new_name: Option<String>,
+        col_type: ColumnType,
+        col_default: Option<String>,
+    },
 }
 
 /// v3.6 UPSERT tail of an INSERT statement.

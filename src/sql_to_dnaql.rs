@@ -446,6 +446,36 @@ pub(crate) fn transpile(
         Stmt::DropColumn { table, column } => {
             Ok(format!("ALTER CHROMOSOME {} DROP COLUMN {};", table, column))
         }
+        // Online type change: MODIFY (retype) / CHANGE (rename+retype) —
+        // the passthrough form executes on the shared SQL engine.
+        Stmt::ModifyColumn {
+            table,
+            column,
+            new_name,
+            col_type,
+            col_default,
+        } => {
+            let mut q = match new_name {
+                Some(n) => format!(
+                    "ALTER CHROMOSOME {} CHANGE COLUMN {} {} {}",
+                    table,
+                    column,
+                    n,
+                    type_name(col_type)?
+                ),
+                None => format!(
+                    "ALTER CHROMOSOME {} MODIFY COLUMN {} {}",
+                    table,
+                    column,
+                    type_name(col_type)?
+                ),
+            };
+            if let Some(d) = col_default {
+                q.push_str(" DEFAULT ");
+                q.push_str(&render_default(d));
+            }
+            Ok(format!("{};", q))
+        }
         Stmt::Explain(_) => Err(
             "SQL→DnaQL: EXPLAIN is SQL-only — the equivalent DnaQL plan is reported in the \
              execution note of every DnaQL result"

@@ -319,7 +319,9 @@ fn show_variables_and_sql_calc_found_rows() {
     assert!(r.rows.len() >= 3);
     assert_eq!(v(&r.rows[0], "Variable_name"), "character_set_client");
 
-    // SQL_CALC_FOUND_ROWS is stripped transparently and still counts.
+    // SQL_CALC_FOUND_ROWS: the page stays limited, FOUND_ROWS() is the
+    // unlimited count (MySQL semantics — the page-count approximation is
+    // retired; both matching rows exist, LIMIT 1 returns one).
     g.execute(s, "INSERT INTO wp_posts (post_title, post_status, post_type, post_name) VALUES ('T1','publish','post','t1'),('T2','publish','post','t2')").unwrap();
     let r = g
         .execute(
@@ -329,7 +331,7 @@ fn show_variables_and_sql_calc_found_rows() {
         .unwrap();
     assert_eq!(r.rows.len(), 1, "LIMIT 1 still applies");
     let r = g.execute(s, "SELECT FOUND_ROWS()").unwrap();
-    assert_eq!(v(&r.rows[0], "FOUND_ROWS()"), "1");
+    assert_eq!(v(&r.rows[0], "FOUND_ROWS()"), "2");
 
     // Row exists with generated ID; post_date_gmt was never provided →
     // filled with the effective DEFAULT (NOT NULL zero-date), exactly
@@ -867,9 +869,13 @@ fn decimal_aggregate_scale_parity() {
     let r = g.execute(s, "SELECT SUM(items.price) FROM items").unwrap();
     assert_eq!(r.decimal_scales, vec![Some(2)]);
 
-    // Expressions without a plain-column binding stay DOUBLE.
+    // Expression arguments resolve to the MAX scale among the decimal
+    // columns referenced (MySQL: decimal * int keeps the decimal scale) —
+    // the former "SUM(expr) stays DOUBLE" divergence is retired.
     let r = g.execute(s, "SELECT SUM(price * 2) FROM items").unwrap();
-    assert_eq!(r.decimal_scales, vec![None]);
+    eprintln!("DBG columns={:?} rows={:?} scales={:?}", r.columns, r.rows, r.decimal_scales);
+    assert_eq!(r.decimal_scales, vec![Some(2)]);
+    assert_eq!(v(&r.rows[0], "SUM(price * 2)"), "500.20");
 
     // COUNT stays integer (no scale metadata).
     let r = g.execute(s, "SELECT COUNT(*) FROM items").unwrap();
@@ -967,4 +973,246 @@ fn decimal_scale_join_resolution() {
         .execute(s, "SELECT amount FROM wp_a WHERE id = 1")
         .unwrap();
     assert_eq!(v(&r.rows[0], "amount"), "10.50");
+}
+
+#[test]
+fn error_message_parity_1062_1091() {
+    // Differential clients compare message text, not only errno: the gate
+    // renders MariaDB's exact wording for duplicate-entry and can't-DROP
+    // failures (COMPARISON_MYSQL_REPORT.md «Расхождения и ошибки» #15/#55).
+    let g = gate("err_parity");
+    let s = g.open_session();
+    g.execute(
+        s,
+        "CREATE TABLE wp_opts (option_id bigint(20) unsigned NOT NULL AUTO_INCREMENT, option_name varchar(64) NOT NULL DEFAULT '', PRIMARY KEY (option_id), UNIQUE KEY option_name (option_name)) ENGINE=InnoDB",
+    )
+    .unwrap();
+
+    // Unique-index duplicate (report #15: same errno 1062 — now same text).
+    g.execute(s, "INSERT INTO wp_opts (option_name) VALUES ('foo')").unwrap();
+    let e = g
+        .execute(s, "INSERT INTO wp_opts (option_name) VALUES ('foo')")
+        .unwrap_err();
+    assert_eq!(e.errno, 1062);
+    assert_eq!(e.message, "Duplicate entry 'foo' for key 'option_name'");
+
+    // Primary-key duplicate → `for key 'PRIMARY'`.
+    g.execute(s, "INSERT INTO wp_opts (option_id, option_name) VALUES (10, 'x')").unwrap();
+    let e = g
+        .execute(s, "INSERT INTO wp_opts (option_id, option_name) VALUES (10, 'y')")
+        .unwrap_err();
+    assert_eq!(e.errno, 1062);
+    assert_eq!(e.message, "Duplicate entry '10' for key 'PRIMARY'");
+
+    // Missing column drop (report #55: errno 1091 — now same text).
+    let e = g
+        .execute(s, "ALTER TABLE wp_opts DROP COLUMN old_col")
+        .unwrap_err();
+    assert_eq!(e.errno, 1091);
+    assert_eq!(
+        e.message,
+        "Can't DROP COLUMN `old_col`; check that it exists"
+    );
+
+    // Missing index drop → MariaDB's key form.
+    let e = g
+        .execute(s, "DROP INDEX no_such_idx ON wp_opts")
+        .unwrap_err();
+    assert_eq!(e.errno, 1091);
+    assert_eq!(
+        e.message,
+        "Can't DROP `no_such_idx`; check that column/key exists"
+    );
+}
+
+#[test]
+fn table_status_reports_row_count() {
+    // SHOW TABLE STATUS carried Rows=0 — phpMyAdmin showed empty tables.
+    // Now Rows is an exact COUNT(*) (E2E_MYSQLDUMP_ROUNDTRIP_REPORT.md
+    // divergence #3).
+    let g = gate("table_status");
+    let s = g.open_session();
+    g.execute(
+        s,
+        "CREATE TABLE t_rows (id bigint(20) unsigned NOT NULL AUTO_INCREMENT, k varchar(10) DEFAULT '', PRIMARY KEY (id)) ENGINE=InnoDB",
+    )
+    .unwrap();
+    g.execute(s, "INSERT INTO t_rows (k) VALUES ('a')").unwrap();
+    g.execute(s, "INSERT INTO t_rows (k) VALUES ('b')").unwrap();
+    g.execute(s, "INSERT INTO t_rows (k) VALUES ('c')").unwrap();
+    g.execute(s, "DELETE FROM t_rows WHERE k = 'c'").unwrap();
+
+    let r = g.execute(s, "SHOW TABLE STATUS LIKE 't_rows'").unwrap();
+    assert_eq!(r.rows.len(), 1);
+    let rows = v(&r.rows[0], "Rows");
+    assert_eq!(rows, "2", "Rows must be the live count, not 0");
+}
+
+#[test]
+fn on_update_current_timestamp_semantics() {
+    // MySQL: an `ON UPDATE CURRENT_TIMESTAMP` column refreshes on every
+    // UPDATE that omits it, is reported in SHOW FULL COLUMNS Extra and
+    // reproduced by SHOW CREATE TABLE (E2E_MYSQLDUMP_ROUNDTRIP_REPORT.md
+    // divergence #1).
+    let g = gate("on_update_cts");
+    let s = g.open_session();
+    g.execute(
+        s,
+        "CREATE TABLE wp_audit (id bigint(20) unsigned NOT NULL AUTO_INCREMENT, note varchar(50) NOT NULL DEFAULT '', modified datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, PRIMARY KEY (id)) ENGINE=InnoDB",
+    )
+    .unwrap();
+
+    // SHOW CREATE TABLE reproduces the clause (roundtrip-stable).
+    let r = g.execute(s, "SHOW CREATE TABLE wp_audit").unwrap();
+    let ddl = v(&r.rows[0], "Create Table");
+    assert!(ddl.contains("ON UPDATE CURRENT_TIMESTAMP"), "ddl: {}", ddl);
+    // Idempotent: parse → emit → parse keeps the flag.
+    let r2 = g.execute(s, "SHOW CREATE TABLE wp_audit").unwrap();
+    assert_eq!(v(&r2.rows[0], "Create Table"), ddl);
+
+    // SHOW FULL COLUMNS Extra (MariaDB form).
+    let r = g.execute(s, "SHOW FULL COLUMNS FROM wp_audit").unwrap();
+    let modified_row = r
+        .rows
+        .iter()
+        .find(|row| v(row, "Field") == "modified")
+        .unwrap();
+    assert_eq!(v(modified_row, "Extra"), "on update current_timestamp()");
+
+    g.execute(s, "INSERT INTO wp_audit (note) VALUES ('first')").unwrap();
+
+    // Explicit assignment wins — no bump.
+    g.execute(
+        s,
+        "UPDATE wp_audit SET note = 'pinned', modified = '2020-01-01 00:00:00' WHERE id = 1",
+    )
+    .unwrap();
+    let r = g.execute(s, "SELECT modified FROM wp_audit WHERE id = 1").unwrap();
+    assert_eq!(v(&r.rows[0], "modified"), "2020-01-01 00:00:00");
+
+    // Assignment that omits the column → bumped away from the pinned value.
+    g.execute(s, "UPDATE wp_audit SET note = 'second' WHERE id = 1").unwrap();
+    let r = g.execute(s, "SELECT modified FROM wp_audit WHERE id = 1").unwrap();
+    let bumped = v(&r.rows[0], "modified");
+    assert_ne!(bumped, "2020-01-01 00:00:00", "modified must auto-bump");
+    assert!(bumped.len() >= 19, "bumped value must be a datetime: {}", bumped);
+}
+
+#[test]
+fn sql_calc_found_rows_unlimited_count() {
+    // FOUND_ROWS() with SQL_CALC_FOUND_ROWS is the count the query would
+    // return WITHOUT the LIMIT clause (MySQL semantics) — the page-count
+    // approximation is retired (CMS_EDITION_RU.md §4 item 4).
+    let g = gate("found_rows");
+    let s = g.open_session();
+    g.execute(
+        s,
+        "CREATE TABLE wp_t (id bigint(20) unsigned NOT NULL AUTO_INCREMENT, n int NOT NULL DEFAULT 0, PRIMARY KEY (id)) ENGINE=InnoDB",
+    )
+    .unwrap();
+    for i in 1..=6 {
+        g.execute(s, &format!("INSERT INTO wp_t (n) VALUES ({})", i)).unwrap();
+    }
+
+    let r = g
+        .execute(
+            s,
+            "SELECT SQL_CALC_FOUND_ROWS id FROM wp_t ORDER BY id LIMIT 0,2",
+        )
+        .unwrap();
+    assert_eq!(r.rows.len(), 2, "page is still limited");
+    let r = g.execute(s, "SELECT FOUND_ROWS()").unwrap();
+    assert_eq!(v(&r.rows[0], "FOUND_ROWS()"), "6", "unlimited total");
+
+    // OFFSET form and single-arg form both strip.
+    let r = g
+        .execute(
+            s,
+            "SELECT SQL_CALC_FOUND_ROWS id FROM wp_t ORDER BY id LIMIT 3 OFFSET 2",
+        )
+        .unwrap();
+    assert_eq!(r.rows.len(), 3);
+    let r = g.execute(s, "SELECT FOUND_ROWS()").unwrap();
+    assert_eq!(v(&r.rows[0], "FOUND_ROWS()"), "6");
+
+    // A WHERE clause survives the strip (the count reflects the filter).
+    let r = g
+        .execute(
+            s,
+            "SELECT SQL_CALC_FOUND_ROWS id FROM wp_t WHERE n > 4 ORDER BY id LIMIT 1",
+        )
+        .unwrap();
+    assert_eq!(r.rows.len(), 1);
+    let r = g.execute(s, "SELECT FOUND_ROWS()").unwrap();
+    assert_eq!(v(&r.rows[0], "FOUND_ROWS()"), "2");
+
+    // Without SQL_CALC_FOUND_ROWS, FOUND_ROWS() stays the page count.
+    let r = g
+        .execute(s, "SELECT id FROM wp_t ORDER BY id LIMIT 2")
+        .unwrap();
+    assert_eq!(r.rows.len(), 2);
+    let r = g.execute(s, "SELECT FOUND_ROWS()").unwrap();
+    assert_eq!(v(&r.rows[0], "FOUND_ROWS()"), "2");
+}
+
+#[test]
+fn alter_modify_change_column_parity() {
+    // Online type change (CMS_EDITION_RU.md §4 item 6 — the phase-3 tail):
+    // ALTER TABLE MODIFY retypes, CHANGE renames+retypes; stored values are
+    // coerced in one batch; SHOW FULL COLUMNS / SHOW CREATE TABLE follow.
+    let g = gate("alter_modify");
+    let s = g.open_session();
+    g.execute(
+        s,
+        "CREATE TABLE wp_inv (id bigint(20) unsigned NOT NULL AUTO_INCREMENT, sku varchar(20) NOT NULL DEFAULT '', qty int NOT NULL DEFAULT 0, price decimal(10,2) NOT NULL DEFAULT 0.00, PRIMARY KEY (id), UNIQUE KEY sku (sku)) ENGINE=InnoDB",
+    )
+    .unwrap();
+    g.execute(s, "INSERT INTO wp_inv (sku, qty, price) VALUES ('A1', 5, 3)").unwrap();
+
+    // MODIFY: int → decimal(10,2); stored 5 reads back with the scale.
+    g.execute(s, "ALTER TABLE wp_inv MODIFY COLUMN qty decimal(10,2) NOT NULL DEFAULT 0.00").unwrap();
+    let r = g.execute(s, "SELECT qty FROM wp_inv WHERE sku = 'A1'").unwrap();
+    assert_eq!(v(&r.rows[0], "qty"), "5.00", "stored value coerced to new type");
+    let r = g.execute(s, "SHOW FULL COLUMNS FROM wp_inv").unwrap();
+    let qty_row = r.rows.iter().find(|row| v(row, "Field") == "qty").unwrap();
+    assert_eq!(v(qty_row, "Type"), "decimal(10,2)", "overlay follows MODIFY");
+
+    // CHANGE: rename sku → item_sku (rename is visible to reads, the old
+    // name answers errno 1054, the unique index keeps enforcing).
+    g.execute(
+        s,
+        "ALTER TABLE wp_inv CHANGE COLUMN sku item_sku varchar(30) NOT NULL DEFAULT ''",
+    )
+    .unwrap();
+    let r = g.execute(s, "SELECT item_sku FROM wp_inv WHERE id = 1").unwrap();
+    assert_eq!(v(&r.rows[0], "item_sku"), "A1");
+    let e = g
+        .execute(s, "SELECT sku FROM wp_inv WHERE id = 1")
+        .unwrap_err();
+    assert_eq!(e.errno, 1054, "renamed column is gone");
+    // Unique key rides along with the rename (duplicate rejected).
+    g.execute(s, "INSERT INTO wp_inv (item_sku) VALUES ('B2')").unwrap();
+    let e = g
+        .execute(s, "INSERT INTO wp_inv (item_sku) VALUES ('B2')")
+        .unwrap_err();
+    assert_eq!(e.errno, 1062);
+    assert_eq!(e.message, "Duplicate entry 'B2' for key 'sku'");
+
+    // SHOW CREATE TABLE reflects both changes.
+    let r = g.execute(s, "SHOW CREATE TABLE wp_inv").unwrap();
+    let ddl = v(&r.rows[0], "Create Table");
+    assert!(ddl.contains("`qty` decimal(10,2)"), "ddl: {}", ddl);
+    assert!(ddl.contains("`item_sku` varchar(30)"), "ddl: {}", ddl);
+    assert!(ddl.contains("UNIQUE KEY `sku` (`item_sku`)"), "ddl: {}", ddl);
+
+    // Declaration order survives the rename.
+    let r = g.execute(s, "SELECT * FROM wp_inv WHERE id = 1").unwrap();
+    assert_eq!(r.columns, vec!["id", "item_sku", "qty", "price"]);
+
+    // MODIFY of a missing column answers MariaDB's 1054 text.
+    let e = g
+        .execute(s, "ALTER TABLE wp_inv MODIFY COLUMN ghost int NOT NULL DEFAULT 0")
+        .unwrap_err();
+    assert_eq!(e.errno, 1054);
+    assert_eq!(e.message, "Unknown column 'ghost' in 'wp_inv'");
 }

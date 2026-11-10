@@ -270,8 +270,10 @@ fn resolve_scale(
 /// MySQL scale rules for aggregates over a decimal column: SUM/MIN/MAX
 /// preserve the argument scale, AVG widens it by 4
 /// (`AVG(decimal(p,s)) → decimal(…, s+4)`). `SUM(DISTINCT col)` shares the
-/// column's scale. Only plain-column arguments are bound (documented
-/// scope); expressions (`SUM(a+b)`) stay DOUBLE.
+/// column's scale. Expression arguments (`SUM(a+b)`) resolve to the MAX
+/// scale among the decimal columns referenced in the expression (MySQL:
+/// result scale of an expression is the max of its decimal operands) —
+/// unresolved or non-decimal-only expressions stay DOUBLE.
 fn aggregate_inner_scale(
     gate: &super::CmsSqlGate,
     tables: &[(String, String)],
@@ -281,28 +283,182 @@ fn aggregate_inner_scale(
         let Some(pos) = super::text::find_ci(name, word) else {
             continue;
         };
+        // Balanced close of the aggregate's argument (nested calls allowed):
+        // the slice re-includes the opening `(` consumed by `word`.
+        let Some(close) = balanced_paren_close(&name[pos + word.len() - 1..]) else {
+            continue;
+        };
         let rest = &name[pos + word.len()..];
-        let close = rest.find(')')?;
-        let inner = rest[..close].trim();
+        let inner = rest[..close - 1].trim();
         let inner = inner
             .strip_prefix("DISTINCT")
             .map(|r| r.trim())
             .unwrap_or(inner);
-        let (qual, col) = match inner.rsplit_once('.') {
-            Some((q, c)) => (q.trim_matches('`'), c.trim_matches('`')),
-            None => ("", inner.trim_matches('`')),
-        };
-        let scale = if qual.is_empty() {
-            unqualified_scale(gate, tables, col)
-        } else if let Some((_, table)) = tables
-            .iter()
-            .find(|(al, _)| al.eq_ignore_ascii_case(qual))
-        {
-            column_scale(gate, table, col)
-        } else {
-            unqualified_scale(gate, tables, col)
-        };
-        return scale.map(|s| s.saturating_add(delta));
+        // Plain-column fast path: `SUM(price)` / `SUM(t.price)`.
+        if let Some(scale) = resolve_column_in_tables(gate, tables, inner) {
+            return Some(scale.saturating_add(delta));
+        }
+        // Expression path: every identifier that is NOT a function call or a
+        // keyword is a column reference. MySQL widens the result scale to
+        // the max scale among decimal operands; references that resolve to
+        // non-decimal columns don't contribute (int + decimal → decimal).
+        let mut max_scale: Option<u8> = None;
+        for (ident, is_function) in expression_identifiers(inner) {
+            if is_function {
+                continue;
+            }
+            if is_sql_keyword(&ident.to_ascii_uppercase()) {
+                continue;
+            }
+            let (ident, qualifier) = match ident.rsplit_once('.') {
+                Some((q, c)) => (c, Some(q)),
+                None => (ident.as_str(), None),
+            };
+            let scale = match qualifier {
+                Some(q) => {
+                    let q = q.trim_matches('`');
+                    match tables.iter().find(|(al, _)| al.eq_ignore_ascii_case(q)) {
+                        Some((_, table)) => column_scale(gate, table, ident),
+                        None => None,
+                    }
+                }
+                None => unqualified_scale(gate, tables, ident),
+            };
+            if let Some(s) = scale {
+                max_scale = Some(match max_scale {
+                    None => s,
+                    Some(prev) => prev.max(s),
+                });
+            }
+        }
+        return max_scale.map(|s| s.saturating_add(delta));
+    }
+    None
+}
+
+/// Split an expression into identifier tokens with a `is_function` flag
+/// (identifier immediately followed by `(`). String literals, numbers and
+/// operators are skipped; backticks are stripped.
+fn expression_identifiers(expr: &str) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    let bytes = expr.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if c == '\'' {
+            // Skip string literal (backslash escapes, '' doubling).
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == b'\'' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if c.is_ascii_alphabetic() || c == '_' || c == '`' {
+            let start = i;
+            while i < bytes.len() {
+                let ch = bytes[i] as char;
+                if ch.is_ascii_alphanumeric() || ch == '_' || ch == '.' || ch == '`' {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            let token = expr[start..i].trim_matches('`').to_string();
+            if !token.is_empty() {
+                // Function call? (identifier directly followed by '(')
+                let mut j = i;
+                while j < bytes.len() && (bytes[j] as char).is_whitespace() {
+                    j += 1;
+                }
+                let is_function = j < bytes.len() && bytes[j] == b'(';
+                out.push((token, is_function));
+            }
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Keywords that can appear inside aggregate arguments but are not columns.
+fn is_sql_keyword(word: &str) -> bool {
+    matches!(
+        word,
+        "NULL" | "TRUE" | "FALSE" | "AND" | "OR" | "NOT" | "CASE" | "WHEN" | "THEN" | "ELSE"
+            | "END" | "DIV" | "MOD" | "IS" | "LIKE" | "BETWEEN" | "IN" | "FROM" | "DUAL"
+    )
+}
+
+/// One column reference → scale: `t.col` resolved through the alias map,
+/// bare `col` through unique resolution across the FROM tables.
+fn resolve_column_in_tables(
+    gate: &super::CmsSqlGate,
+    tables: &[(String, String)],
+    col: &str,
+) -> Option<u8> {
+    let col = col.trim();
+    match col.rsplit_once('.') {
+        Some((q, c)) => {
+            let q = q.trim_matches('`');
+            let c = c.trim_matches('`');
+            match tables.iter().find(|(al, _)| al.eq_ignore_ascii_case(q)) {
+                Some((_, table)) => column_scale(gate, table, c),
+                None => None,
+            }
+        }
+        None => unqualified_scale(gate, tables, col.trim_matches('`')),
+    }
+}
+
+/// Byte index of the `)` closing the `(` at position 0 (string-literal aware).
+fn balanced_paren_close(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if bytes.first() != Some(&b'(') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == b'\'' {
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
     }
     None
 }

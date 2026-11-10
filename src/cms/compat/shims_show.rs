@@ -466,8 +466,8 @@ impl CmsSqlGate {
 
         // SHOW TABLE STATUS [FROM db] [LIKE 'pat'] — table inventory used by
         // admin clients (phpMyAdmin table list, diagnostics). DNA-DB answers
-        // InnoDB-shaped rows with zeroed statistics (documented divergence:
-        // row counts are not materialized here).
+        // InnoDB-shaped rows; Rows is an exact COUNT(*), Data_length stays
+        // the InnoDB page placeholder (the engine does not track bytes).
         if upper.starts_with("SHOW TABLE STATUS") {
             let like = find_like_pattern(sql).map(|p| decode_mysql_string(&p));
             let mut rows = Vec::new();
@@ -522,7 +522,10 @@ impl CmsSqlGate {
         r.insert("Engine".into(), Value::Text("InnoDB".into()));
         r.insert("Version".into(), Value::Int(10));
         r.insert("Row_format".into(), Value::Text("Dynamic".into()));
-        r.insert("Rows".into(), Value::Int(0));
+        // Live row count — MariaDB reports an estimate, the CMS engine can
+        // answer exactly (phpMyAdmin "Rows" and mysqldump probes read it).
+        let rows = count_table_rows(self, table).unwrap_or(0);
+        r.insert("Rows".into(), Value::Int(rows as i64));
         r.insert("Avg_row_length".into(), Value::Int(0));
         r.insert("Data_length".into(), Value::Int(16384));
         r.insert("Max_data_length".into(), Value::Int(0));
@@ -724,5 +727,24 @@ impl CmsSqlGate {
             );
         }
         rows
+    }
+}
+
+/// Exact row count of a table via an internal `SELECT COUNT(*)` — the
+/// same engine path a client query takes (gate-internal: no session, no
+/// row locks). `None` when the engine cannot answer (table dropped between
+/// listing and counting).
+fn count_table_rows(gate: &CmsSqlGate, table: &str) -> Option<u64> {
+    // Identifiers arrive gate-normalized (backticks stripped upstream); the
+    // internal query is built the same way as the AUTO_INCREMENT probe.
+    let q = format!("SELECT COUNT(*) AS __rows FROM {}", table);
+    let mut buf = None;
+    let res = gate.engine.execute_in_tx(&q, &mut buf).ok()?;
+    let v = res.rows.first()?.get("__rows")?;
+    match v {
+        Value::Int(i) => Some((*i).max(0) as u64),
+        Value::Text(t) => t.trim().parse::<u64>().ok(),
+        Value::Float(f) => Some((*f).max(0.0) as u64),
+        _ => None,
     }
 }

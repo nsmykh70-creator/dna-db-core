@@ -2,6 +2,62 @@
 
 ## Unreleased (CMS Edition — branch `cms-edition`)
 
+### Divergence & error report sections closed — Прогон №12 (2026-11-10)
+
+Every actionable entry of the reports' «Расхождения и ошибки» /
+«Документированные расхождения» sections is fixed (tests: **210 without
+the `cms` feature / 324 lib with — 0 failures both; 357 across all
+targets with**):
+
+- **Error-message parity (1062/1091/1054).** The gate now rewrites engine
+  error text into the exact MariaDB wording at the same errno:
+  `Duplicate entry '<v>' for key '<index|PRIMARY>'`,
+  ``Can't DROP COLUMN `c`; check that it exists`` /
+  ``Can't DROP `i`; check that column/key exists``,
+  `Unknown column 'c' in '<context>'`. A missing `DROP INDEX` target is
+  now errno 1091 (was a generic 0/HY000). Drivers branched on errno
+  already; differential clients see identical text too. Test:
+  `error_message_parity_1062_1091`.
+- **ON UPDATE CURRENT_TIMESTAMP** (E2E_MYSQLDUMP_ROUNDTRIP #1). Parsed
+  into the overlay (`CmsColumnMeta.on_update_current_timestamp`),
+  reproduced by SHOW CREATE TABLE, reported as
+  `on update current_timestamp()` in SHOW FULL COLUMNS Extra, and
+  enforced at DML: every UPDATE that does not assign the column gets
+  `SET col = NOW()` appended by the gate. Test:
+  `on_update_current_timestamp_semantics`.
+- **SHOW TABLE STATUS Rows** (E2E_MYSQLDUMP_ROUNDTRIP #3). Rows is an
+  exact `COUNT(*)` (phpMyAdmin sees live table sizes); Data_length stays
+  the InnoDB page placeholder. Test: `table_status_reports_row_count`.
+- **SUM(expression) scale + the missing expression aggregation.**
+  `SUM(a+b)` resolves to the MAX scale among the decimal columns the
+  expression references (MySQL: decimal×int keeps the decimal scale),
+  with balanced parsing of nested calls. Along the way a real engine bug
+  fell out: `collect_agg_items` ignored `SelectItem::AggOverExpr`, so
+  `SELECT SUM(a+b) FROM t` returned one empty row PER input row instead
+  of a single aggregated row. Test: `decimal_aggregate_scale_parity`.
+- **FOUND_ROWS() = the unlimited count.** With SQL_CALC_FOUND_ROWS the
+  gate re-runs the same query without the top-level LIMIT (and without
+  the locking tail); all wpdb LIMIT shapes (`LIMIT n`, `LIMIT n,m`,
+  `LIMIT n, m`, `LIMIT n OFFSET m`) are stripped. The page-count
+  approximation is retired. Test: `sql_calc_found_rows_unlimited_count`.
+- **Online type change: ALTER TABLE MODIFY / CHANGE COLUMN**
+  (§4 item 6 — phase-3 tail). Metadata rewrite + ONE data batch (every
+  stored value coerced via `Value::coerce_for_column`); a rename re-keys
+  the column in every row and moves the secondary index entries in the
+  same atomic batch; the overlay follows for ALL ALTER column operations
+  (previously SHOW FULL COLUMNS / SHOW CREATE TABLE kept the CREATE-time
+  column set — dbDelta saw stale columns). DnaQL ALTER passthrough and
+  the SQL→DnaQL transpiler gained MODIFY/CHANGE (SQL-command parity).
+  Test: `alter_modify_change_column_parity`.
+- `Value::coerce_for_column` un-gated from `cms` — the shared grammar
+  (v4.3 rule) needs it for MODIFY COLUMN in the plain build.
+
+Still open by design (documented, not divergences): utf8mb4_*_ci
+collation semantics (phase-4 engine work), unsigned write semantics,
+LOCK TABLES no-op, FK DDL stripping, inline `/* … */` comments,
+`--single-transaction`, and the deliberate `10.11.11-MariaDB` VERSION()
+emulation.
+
 ### SQL grammar parity + DnaQL↔SQL conformance — v4.3 track (2026-11-09)
 
 Two limitation classes closed end-to-end (tests: **210 without the `cms`

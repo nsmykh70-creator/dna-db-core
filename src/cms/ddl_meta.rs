@@ -38,6 +38,11 @@ pub struct CmsColumnMeta {
     /// DDL default as written (unquoted), `None` = no DEFAULT clause.
     pub default: Option<String>,
     pub auto_increment: bool,
+    /// `ON UPDATE CURRENT_TIMESTAMP` column flag: SHOW CREATE TABLE must
+    /// reproduce it, SHOW FULL COLUMNS reports it in Extra, and the gate
+    /// auto-bumps such columns on UPDATE when the SET list omits them
+    /// (MySQL semantics; wp_posts.post_modified_gmt, wp_comments…).
+    pub on_update_current_timestamp: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -343,113 +348,30 @@ impl CmsTableMeta {
                     // Skipped in the overlay (engine FKs declared separately).
                 }
                 _ => {
-                    // Column definition. Backtick-quoted field names are
-                    // supported so SHOW CREATE TABLE output (and mysqldump
-                    // DDL) re-parses byte-identically when called directly
-                    // (the gate strips backticks earlier, but the parser is
-                    // also a public entry point for dump roundtrips).
-                    let seg_trim = seg.trim_start();
-                    let field;
-                    let after_name;
-                    if let Some(open) = seg_trim.strip_prefix('`') {
-                        let Some(close) = open.find('`') else {
-                            return Err(format!(
-                                "DDL {}: unterminated backticked column name",
-                                meta.table
-                            ));
-                        };
-                        field = open[..close].to_string();
-                        after_name = open[close + 1..].trim_start();
-                    } else {
-                        field = strip_backticks(seg_trim.split_whitespace().next().unwrap_or(""));
-                        if field.is_empty() {
-                            return Err(format!("DDL {}: empty column name", meta.table));
-                        }
-                        after_name = seg_trim[field.len()..].trim_start();
+                    // Column definition — shared parser (also used by the
+                    // gate's ALTER TABLE overlay sync). Backtick-quoted
+                    // field names are supported so SHOW CREATE TABLE output
+                    // (and mysqldump DDL) re-parses byte-identically when
+                    // called directly (the gate strips backticks earlier,
+                    // but the parser is also a public entry point for dump
+                    // roundtrips).
+                    let (col, inline_pk, inline_unique) =
+                        Self::parse_column_definition(&seg, &meta.table)?;
+                    if inline_pk {
+                        meta.primary_key.push(col.field.clone());
                     }
-                    if field.is_empty() {
-                        return Err(format!("DDL {}: empty column name", meta.table));
-                    }
-                    // Type = identifier + optional (n[,m]).
-                    let mut type_text = String::new();
-                    let mut rest = after_name;
-                    let type_word: String = after_name
-                        .chars()
-                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                        .collect();
-                    if type_word.is_empty() {
-                        return Err(format!("DDL {}: column '{}' has no type", meta.table, field));
-                    }
-                    type_text.push_str(&type_word.to_ascii_lowercase());
-                    rest = rest[type_word.len()..].trim_start();
-                    if let Some(group) = take_paren_group(rest) {
-                        type_text.push_str(&format!("({})", group.replace(' ', "")));
-                        // Close of the FIRST paren group (skipping its own
-                        // ')'): rfind would jump to a ')' inside a later
-                        // quoted DEFAULT value.
-                        let open = rest.find('(').unwrap_or(0);
-                        let close = open + 1 + group.len() + 1;
-                        rest = rest[close..].trim_start();
-                    }
-                    let mut col = CmsColumnMeta {
-                        field,
-                        mysql_type: type_text,
-                        engine_type: ColumnType::Text, // refined below
-                        not_null: false,
-                        default: None,
-                        auto_increment: false,
-                    };
-                    // Flags loop.
-                    loop {
-                        let upper_rest = rest.to_ascii_uppercase();
-                        if upper_rest.starts_with("UNSIGNED") {
-                            col.mysql_type.push_str(" unsigned");
-                            rest = rest["UNSIGNED".len()..].trim_start();
-                        } else if upper_rest.starts_with("NOT NULL") {
-                            col.not_null = true;
-                            rest = rest["NOT NULL".len()..].trim_start();
-                        } else if upper_rest.starts_with("NULL") {
-                            rest = rest["NULL".len()..].trim_start();
-                        } else if upper_rest.starts_with("DEFAULT") {
-                            rest = rest["DEFAULT".len()..].trim_start();
-                            let (raw, consumed) = take_default_literal(rest)?;
-                            col.default = unquote_default(&raw);
-                            rest = rest[consumed..].trim_start();
-                        } else if upper_rest.starts_with("AUTO_INCREMENT") {
-                            col.auto_increment = true;
-                            rest = rest["AUTO_INCREMENT".len()..].trim_start();
-                        } else if upper_rest.starts_with("PRIMARY KEY") {
-                            // Inline PRIMARY KEY column constraint — the
-                            // MySQL-standard single-column form plugins use
-                            // (`sku varchar(20) NOT NULL PRIMARY KEY`). Row
-                            // locking / PointGet need the overlay PK.
-                            meta.primary_key.push(col.field.clone());
-                            rest = rest["PRIMARY KEY".len()..].trim_start();
-                        } else if upper_rest.starts_with("UNIQUE") {
-                            // Inline UNIQUE — model as a unique index.
-                            rest = rest["UNIQUE".len()..].trim_start();
-                            let iname = format!("{}_{}_uniq", meta.table, col.field);
-                            meta.indexes.push(CmsIndexMeta {
-                                name: iname,
-                                unique: true,
-                                columns: vec![(col.field.clone(), None)],
-                            });
-                        } else if upper_rest.starts_with("CHARACTER SET")
-                            || upper_rest.starts_with("COLLATE")
-                            || upper_rest.starts_with("COMMENT")
-                            || upper_rest.starts_with("REFERENCES")
-                        {
-                            // consume to end — none of these appear before
-                            // another flag in the supported subset.
-                            rest = "";
-                        } else {
-                            break;
-                        }
+                    if inline_unique {
+                        // Inline UNIQUE — model as a unique index.
+                        let iname = format!("{}_{}_uniq", meta.table, col.field);
+                        meta.indexes.push(CmsIndexMeta {
+                            name: iname,
+                            unique: true,
+                            columns: vec![(col.field.clone(), None)],
+                        });
                     }
                     if col.auto_increment {
                         meta.auto_increment_column = Some(col.field.clone());
                     }
-                    col.engine_type = engine_type_of(&col.mysql_type);
                     meta.columns.push(col);
                 }
             }
@@ -465,6 +387,130 @@ impl CmsTableMeta {
             }
         }
         Ok(meta)
+    }
+
+    /// Parse ONE column-definition segment: a CREATE TABLE column-list item
+    /// or the tail of `ALTER TABLE … ADD|MODIFY|CHANGE [COLUMN]`. Handles
+    /// backticked names, MySQL type text with `(n[,m])`, and the flag tail
+    /// (UNSIGNED, NOT NULL/NULL, DEFAULT, AUTO_INCREMENT, inline PRIMARY
+    /// KEY, inline UNIQUE, ON UPDATE CURRENT_TIMESTAMP[()],
+    /// CHARACTER SET/COLLATE/COMMENT/REFERENCES consume-to-end).
+    /// Returns `(column, inline_pk, inline_unique)`; the engine type is
+    /// derived from the MySQL type here.
+    pub(crate) fn parse_column_definition(
+        seg: &str,
+        table: &str,
+    ) -> Result<(CmsColumnMeta, bool, bool), String> {
+        let seg_trim = seg.trim_start();
+        let field;
+        let after_name;
+        if let Some(open) = seg_trim.strip_prefix('`') {
+            let Some(close) = open.find('`') else {
+                return Err(format!("DDL {}: unterminated backticked column name", table));
+            };
+            field = open[..close].to_string();
+            after_name = open[close + 1..].trim_start();
+        } else {
+            field = strip_backticks(seg_trim.split_whitespace().next().unwrap_or(""));
+            if field.is_empty() {
+                return Err(format!("DDL {}: empty column name", table));
+            }
+            after_name = seg_trim[field.len()..].trim_start();
+        }
+        if field.is_empty() {
+            return Err(format!("DDL {}: empty column name", table));
+        }
+        // Type = identifier + optional (n[,m]).
+        let mut type_text = String::new();
+        let mut rest = after_name;
+        let type_word: String = after_name
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if type_word.is_empty() {
+            return Err(format!("DDL {}: column '{}' has no type", table, field));
+        }
+        type_text.push_str(&type_word.to_ascii_lowercase());
+        rest = rest[type_word.len()..].trim_start();
+        if let Some(group) = take_paren_group(rest) {
+            type_text.push_str(&format!("({})", group.replace(' ', "")));
+            // Close of the FIRST paren group (skipping its own ')'):
+            // rfind would jump to a ')' inside a later quoted DEFAULT value.
+            let open = rest.find('(').unwrap_or(0);
+            let close = open + 1 + group.len() + 1;
+            rest = rest[close..].trim_start();
+        }
+        let mut col = CmsColumnMeta {
+            field,
+            mysql_type: type_text,
+            engine_type: ColumnType::Text, // refined below
+            not_null: false,
+            default: None,
+            auto_increment: false,
+            on_update_current_timestamp: false,
+        };
+        let mut inline_pk = false;
+        let mut inline_unique = false;
+        // Flags loop.
+        loop {
+            let upper_rest = rest.to_ascii_uppercase();
+            if upper_rest.starts_with("UNSIGNED") {
+                col.mysql_type.push_str(" unsigned");
+                rest = rest["UNSIGNED".len()..].trim_start();
+            } else if upper_rest.starts_with("NOT NULL") {
+                col.not_null = true;
+                rest = rest["NOT NULL".len()..].trim_start();
+            } else if upper_rest.starts_with("NULL") {
+                rest = rest["NULL".len()..].trim_start();
+            } else if upper_rest.starts_with("DEFAULT") {
+                rest = rest["DEFAULT".len()..].trim_start();
+                let (raw, consumed) = take_default_literal(rest)?;
+                col.default = unquote_default(&raw);
+                rest = rest[consumed..].trim_start();
+            } else if upper_rest.starts_with("AUTO_INCREMENT") {
+                col.auto_increment = true;
+                rest = rest["AUTO_INCREMENT".len()..].trim_start();
+            } else if upper_rest.starts_with("PRIMARY KEY") {
+                // Inline PRIMARY KEY column constraint — the MySQL-standard
+                // single-column form plugins use (`sku varchar(20) NOT NULL
+                // PRIMARY KEY`). Row locking / PointGet need the overlay PK.
+                inline_pk = true;
+                rest = rest["PRIMARY KEY".len()..].trim_start();
+            } else if upper_rest.starts_with("UNIQUE") {
+                inline_unique = true;
+                rest = rest["UNIQUE".len()..].trim_start();
+            } else if upper_rest.starts_with("ON UPDATE") {
+                // `ON UPDATE CURRENT_TIMESTAMP[()]` — the column refreshes
+                // to NOW() on every UPDATE that omits it (MySQL semantics,
+                // gate-level rewrite).
+                rest = rest["ON UPDATE".len()..].trim_start();
+                let upper_rest = rest.to_ascii_uppercase();
+                if upper_rest.starts_with("CURRENT_TIMESTAMP") {
+                    col.on_update_current_timestamp = true;
+                    rest = rest["CURRENT_TIMESTAMP".len()..].trim_start();
+                    if rest.starts_with("()") {
+                        rest = rest[2..].trim_start();
+                    }
+                } else {
+                    // Unsupported ON UPDATE expression — skip the token so
+                    // the flag loop can resynchronize.
+                    let next = rest.split_whitespace().next().unwrap_or("");
+                    rest = rest[next.len()..].trim_start();
+                }
+            } else if upper_rest.starts_with("CHARACTER SET")
+                || upper_rest.starts_with("COLLATE")
+                || upper_rest.starts_with("COMMENT")
+                || upper_rest.starts_with("REFERENCES")
+            {
+                // consume to end — none of these appear before another flag
+                // in the supported subset.
+                rest = "";
+            } else {
+                break;
+            }
+        }
+        col.engine_type = engine_type_of(&col.mysql_type);
+        Ok((col, inline_pk, inline_unique))
     }
 
     /// SHOW FULL COLUMNS rows, dbDelta-exact: Field, Type (raw DDL text),
@@ -516,7 +562,17 @@ impl CmsTableMeta {
             );
             r.insert(
                 "Extra".into(),
-                Value::Text(if col.auto_increment { "auto_increment" } else { "" }.into()),
+                Value::Text(
+                    if col.on_update_current_timestamp {
+                        // MariaDB 10.11 form (lowercase function call).
+                        "on update current_timestamp()".to_string()
+                    } else if col.auto_increment {
+                        "auto_increment".to_string()
+                    } else {
+                        String::new()
+                    }
+                    .into(),
+                ),
             );
             r.insert(
                 "Privileges".into(),
@@ -615,6 +671,9 @@ impl CmsTableMeta {
             }
             if col.auto_increment {
                 l.push_str(" AUTO_INCREMENT");
+            }
+            if col.on_update_current_timestamp {
+                l.push_str(" ON UPDATE CURRENT_TIMESTAMP");
             }
             lines.push(l);
         }

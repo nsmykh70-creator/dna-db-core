@@ -153,16 +153,26 @@ cargo-сборка); в Docker/WSL без systemd — режим `nohup`+pidfile
 3. **Коллации** `utf8mb4_unicode_ci`: сравнение без регистра, PAD SPACE,
    составные и префиксные индексы (meta_value 191) — префиксы сохраняются
    в оверлее, сравнение — фаза 3.
-4. **`FOUND_ROWS()` / `SQL_CALC_FOUND_ROWS`** — ✅ готово в гейте
-   (приближение: счёт по странице, не по запросу без LIMIT).
+4. **`FOUND_ROWS()` / `SQL_CALC_FOUND_ROWS`** — ✅ готово в гейте, с
+   2026-11-10 — полные семантики MySQL: FOUND_ROWS() возвращает счёт
+   запроса БЕЗ LIMIT (тот же SELECT перепроигрывается без лимитного
+   хвоста и блокировок); прежнее приближение «счёт по странице»
+   устранено (тест `sql_calc_found_rows_unlimited_count`).
 5. **Каталог**: `SHOW TABLES LIKE`, `SHOW FULL COLUMNS`, `SHOW INDEX`
    (14 колонок, в форме MariaDB), `DESCRIBE`, `SHOW VARIABLES` — ✅ готово
    через оверлей (`cms::ddl_meta`: MySQL-точный `Type`, чтобы dbDelta не
    видел расхождений; CREATE TABLE через гейт регистрирует оверлей
    автоматически) + fallback из схемы движка; `information_schema` — фаза 3.
 6. **ALTER TABLE**: ADD COLUMN (с NOT NULL/DEFAULT → эффективный дефолт),
-   DROP COLUMN, CREATE/DROP INDEX — ✅ готово; изменение типа (онлайн) —
-   фаза 3.
+   DROP COLUMN, CREATE/DROP INDEX — ✅ готово; **онлайн-смена типа — ✅
+   готово (2026-11-10)**: `ALTER TABLE … MODIFY [COLUMN] c T [флаги]` и
+   `ALTER TABLE … CHANGE [COLUMN] old new T [флаги]` — метаданные + одна
+   батч-переписка данных (`Value::coerce_for_column` для каждой строки;
+   переименование перекеивает колонку в каждой строке и переносит
+   вторичные индексы атомарно); оверлей (SHOW FULL COLUMNS / SHOW CREATE
+   TABLE) синхронизируется теперь для ВСЕХ ALTER-колоночных операций (до
+   этого ALTER оставлял оверлей в состоянии CREATE — dbDelta видел
+   устаревший набор колонок); тест `alter_modify_change_column_parity`.
 7. **Именованные блокировки** — ✅ готово: реестр `cms::locks` + SQL-шимы
    `GET_LOCK/RELEASE_LOCK/IS_FREE_LOCK/IS_USED_LOCK` в гейте.
 8. **Типы**: BIGINT UNSIGNED/DECIMAL/DATETIME/ENUM — частично: имена
@@ -173,7 +183,12 @@ cargo-сборка); в Docker/WSL без systemd — режим `nohup`+pidfile
    с decimals=s в text- И binary-протоколах, `SUM(col)` под алиасом
    decimal-колонки хранит scale (как MySQL); резолв — по FROM-таблицам
    (`cms::compat::decimal`, квалифицированные имена, уникальность
-   шкалы при join); семантика unsigned — фаза 3.
+   шкалы при join); **SUM(выражение) — ✅ готово (2026-11-10)**: шкала
+   аргумента-выражения = MAX среди десятичных колонок выражения (с
+   сбалансированным разбором вложенных вызовов); попутно устранён
+   двигательный баг «SUM(выражение) не агрегировалась вовсе»
+   (`collect_agg_items` не собирал `AggOverExpr` — пустые строки в выдаче);
+   семантика unsigned — фаза 3.
 9. **SET-функции сессии**: `SET NAMES`, `USE db`, `SET autocommit`,
    `SET sql_mode` — ✅ готово в гейте; `CmsSession` хранит состояние.
 10. **Unix domain socket** для хостингов, persistent connections PHP-FPM —
@@ -418,6 +433,56 @@ spirals.rs): табличные данные активного каталога
 движка; пары спиралей — per-БД слой хранения, к которому подключается
 per-БД движок Фазы 4.
 
+### Прогон №12: раздел «Расхождения и ошибки» устранён (2026-11-10)
+
+Закрыты все пункты разделов «Расхождения и ошибки» / «Документированные
+расхождения» отчётов ветки, кроме сознательно архитектурных:
+
+1. **Тексты ошибок = MariaDB** (COMPARISON_MYSQL_REPORT #15/#55,
+   прогоны №7/№8): `mysql_parity_message` в гейте переписывает тексты
+   движка в точные формулировки MariaDB при том же errno — 1062
+   `Duplicate entry '<v>' for key '<idx|PRIMARY>'`, 1091 ``Can't DROP
+   COLUMN `c`; check that it exists`` / ``Can't DROP `i`; check that
+   column/key exists`` (DROP INDEX несуществующего теперь тоже 1091, а
+   не общий 0/HY000), 1054 `Unknown column 'c' in '<контекст>'`. Тест
+   `error_message_parity_1062_1091`. VERSION() остаётся ожидаемым
+   отличием (эмуляция 10.11.11 против живой сборки эталона).
+2. **ON UPDATE CURRENT_TIMESTAMP** (E2E_MYSQLDUMP_ROUNDTRIP #1): флаг
+   в оверлее, SHOW CREATE TABLE воспроизводит, Extra = `on update
+   current_timestamp()`, UPDATE без явного назначения бампит колонку
+   до NOW() (rewrite SET-секции в гейте). Тест
+   `on_update_current_timestamp_semantics`.
+3. **SHOW TABLE STATUS Rows** (там же #3): точный COUNT(*) вместо 0
+   (phpMyAdmin видит живое число строк). Тест
+   `table_status_reports_row_count`. Data_length остаётся
+   InnoDB-плейсхолдером (байтовой статистики движок не ведёт).
+4. **SUM(выражение)** (E2E_BACKUP_RESTORE): шкала = MAX среди
+   десятичных колонок выражения; попутно устранён двигательный баг —
+   `collect_agg_items` не собирал `AggOverExpr`, из-за чего
+   `SELECT SUM(a+b) FROM t` возвращал пустые строки вместо одной
+   агрегированной. Тест `decimal_aggregate_scale_parity`.
+5. **FOUND_ROWS() = полный счёт** (§4 item 4): при SQL_CALC_FOUND_ROWS
+   запрос перепроигрывается без топ-левел LIMIT/блокировок; приближение
+   «счёт по странице» устранено. Тест
+   `sql_calc_found_rows_unlimited_count`.
+6. **Онлайн-смена типа** (§4 item 6): `ALTER TABLE … MODIFY [COLUMN]`
+   и `CHANGE [COLUMN] old new` — метаданные + один батч coerced-переписки
+   данных, переименование переносит вторичные индексы; DnaQL-пасcтру
+   и SQL→DnaQL-трансляция дополнены MODIFY/CHANGE (паритет команд);
+   оверлей синхронизируется на все ALTER-колоночные операции (раньше
+   ALTER оставлял SHOW-вывод в состоянии CREATE — dbDelta видел
+   устаревший набор колонок). Тест `alter_modify_change_column_parity`.
+
+Остаются (осознанно, не «расхождения»): коллации utf8mb4_*_ci —
+регистро-независимое сравнение WHERE/GROUP BY (движковая задача
+Фазы 4), unsigned-семантика при записи, `LOCK TABLES`-no-op,
+вырезание FK-сегментов DDL, inline `/* … */`, `--single-transaction`,
+VERSION()-эмуляция. Тестов (lib): **324 с `--features cms`** (+5 новых:
+паритет ошибок, TABLE STATUS, ON UPDATE, FOUND_ROWS, MODIFY/CHANGE),
+**210 без фичи** — обе сборки 0 отказов (грамматика SQL общая: парсер
+MODIFY/CHANGE и coerce_for_column живут вне cms-гейта; полный набор со
+всеми целями — 357 passed с фичей).
+
 ## 5. Фазы
 
 **Фаза 0 — корпус запросов (1–2 нед).** ✅ Выполнено:
@@ -483,8 +548,11 @@ KEYS + SQL_NO_CACHE как no-op/стриппинг, `SHOW CREATE TABLE` (рек
 триггеров/рутин, `information_schema.FILES/TRIGGERS/EVENTS/ROUTINES`,
 `@@collation_database` и пр. Остаются: docker-образ,
 гайд «миграция WP с MySQL за 3 шага», Prometheus-дашборд для CMS-метик,
-инженерные хвосты Фазы 2 (коллации, online-смена типа, unsigned).
-Дисплейная шкала SUM-агрегатов закрыта Прогоном №11.
+инженерные хвосты Фазы 2 (коллации, unsigned). Дисплейная шкала
+SUM-агрегатов закрыта Прогоном №11; раздел «Расхождения и ошибки»,
+SUM-выражения, FOUND_ROWS-семантика, SHOW TABLE STATUS Rows,
+ON UPDATE CURRENT_TIMESTAMP и онлайн-смена типа (MODIFY/CHANGE) —
+Прогоном №12.
 
 **Фаза 4 — MySQL wire protocol (8–16 нед).** Полный вход B: тогда и
 mysqli/PDO_mysql/phpMyAdmin работают сами. CMS-редакция становится
@@ -499,7 +567,7 @@ mysqli/PDO_mysql/phpMyAdmin работают сами. CMS-редакция ст
   table options, `LIMIT n,m`, `FOR UPDATE`) больше не за фича-гейтом; `cms`
   гейтит только wire-диалекты и шимы. Батарея без фичи: **210 тестов, 0
   отказов** (прежние «4 известных cms-гейтованных отказа» устранены, а не
-  скрыты), 352 с `--features cms`.
+  скрыты), 324 с `--features cms` (lib; полный набор со всеми целями — 357).
 - При зрелости фазы 2 — обсуждение слияния `cms` в main как опциональной
   фичи; ветка остаётся для фаз 3–4.
 - CI ветки: cargo test с `--features cms` + сборка без неё.

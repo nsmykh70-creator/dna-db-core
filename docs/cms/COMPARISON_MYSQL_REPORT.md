@@ -90,18 +90,37 @@
 
 ## Расхождения и ошибки
 
-### #15 P1 — BOTH-ERR (same errno 1062)
+> **Статус 2026-11-10: раздел устранён.** Оба пункта ниже были BOTH-ERR с
+> одинаковым errno; расхождение жило в ТЕКСТЕ сообщения. Гейт теперь
+> переписывает тексты движка в точную формулировку MariaDB
+> (`mysql_parity_message` в `src/cms/compat/mod.rs`):
+> errno 1062 → `Duplicate entry '<значение>' for key '<индекс|PRIMARY>'`,
+> errno 1091 → ``Can't DROP COLUMN `<кол>`; check that it exists`` /
+> ``Can't DROP `<индекс>`; check that column/key exists``, errno 1054 →
+> `Unknown column '<кол>' in '<контекст>'` (errno не менялись — драйверы
+> ветвились по ним и раньше). Регрессионный тест:
+> `error_message_parity_1062_1091`.
+>
+> Единственное ожидаемое отличие, которое остаётся в прогонах №7/№8 —
+> `SELECT VERSION()`: гейт сознательно эмулирует `10.11.11-MariaDB`
+> (уровень совместимости WP-хостингов), эталонная машина прогона отвечает
+> строкой своей сборки (`11.8.6-MariaDB`). Это выбор эмуляции, а не дефект
+> движка.
+
+### #15 P1 — BOTH-ERR (same errno 1062) — ✅ УСТРАНЕНО (текст)
 
 ```sql
 INSERT INTO wp_options (option_name, option_value, autoload) VALUES ('foo','bar','yes')
 ```
 - MySQL error: [1062] Duplicate entry 'foo' for key 'option_name'
-- DNA error: [1062/23000] [MySQL errno 1062] UNIQUE constraint failed: wp_options.option_name = foo (index 'option_name')
+- DNA error (до фикса): [1062/23000] [MySQL errno 1062] UNIQUE constraint failed: wp_options.option_name = foo (index 'option_name')
+- DNA error (после фикса): [1062/23000] `Duplicate entry 'foo' for key 'option_name'`
 
-### #55 DDL — BOTH-ERR (same errno 1091)
+### #55 DDL — BOTH-ERR (same errno 1091) — ✅ УСТРАНЕНО (текст)
 
 ```sql
 ALTER TABLE wp_options DROP COLUMN old_col
 ```
 - MySQL error: [1091] Can't DROP COLUMN `old_col`; check that it exists
-- DNA error: [1091/42000] [MySQL errno 1091] SQL: can't DROP COLUMN 'old_col'; check that it exists in table 'wp_options'
+- DNA error (до фикса): [1091/42000] [MySQL errno 1091] SQL: can't DROP COLUMN 'old_col'; check that it exists in table 'wp_options'
+- DNA error (после фикса): [1091/42000] ``Can't DROP COLUMN `old_col`; check that it exists``

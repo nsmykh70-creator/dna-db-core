@@ -87,12 +87,110 @@ pub fn classify_error(message: &str) -> u16 {
         errno::ER_BAD_FIELD_ERROR
     } else if m.contains("already has an index") {
         1061 // ER_DUP_KEYNAME
+    } else if m.starts_with("index '") && m.contains("' does not exist") {
+        // `DROP INDEX name ON t` of a missing index — MariaDB answers
+        // ER_CANT_DROP_FIELD_OR_KEY (1091), not a generic parse error.
+        errno::ER_CANT_DROP_FIELD_OR_KEY
     } else if m.starts_with("sql:") {
         errno::ER_PARSE_ERROR
     } else {
         // General class (MySQL HY000); message text still travels to the client.
         0
     }
+}
+
+/// Rewrites an engine error message into the exact MariaDB/MySQL server
+/// text for the same errno. CMS drivers branch on errno, but differential
+/// clients and copy-paste debugging compare message text — the gate keeps
+/// both surfaces identical.
+pub(crate) fn mysql_parity_message(errno: u16, message: &str) -> String {
+    match errno {
+        errno::ER_DUP_ENTRY => duplicate_entry_message(message),
+        errno::ER_CANT_DROP_FIELD_OR_KEY => cant_drop_message(message),
+        errno::ER_BAD_FIELD_ERROR => unknown_column_message(message),
+        _ => message.to_string(),
+    }
+}
+
+/// `SQL: unknown column 'x' in <ctx>` → MariaDB's
+/// `Unknown column 'x' in '<ctx>'` (errno 1054): the engine prefixes
+/// parse-flavoured errors with `SQL: ` and spells the UPDATE/GROUP BY
+/// contexts unquoted — MariaDB quotes them.
+fn unknown_column_message(message: &str) -> String {
+    const NEEDLE: &str = "unknown column ";
+    if let Some(pos) = find_ci(message, NEEDLE) {
+        let tail = message[pos + NEEDLE.len()..].trim_start();
+        let up = tail.to_ascii_uppercase();
+        let tail = if up.starts_with("IN UPDATE") {
+            tail.replacen("UPDATE", "'field list'", 1)
+        } else if up.starts_with("IN GROUP BY") {
+            tail.replacen("GROUP BY", "'group statement'", 1)
+        } else {
+            tail.to_string()
+        };
+        return format!("Unknown column {}", tail);
+    }
+    message.to_string()
+}
+
+/// `UNIQUE constraint failed: t.c = v (index 'n')` and
+/// `duplicate primary key in INSERT: k` →
+/// `Duplicate entry 'v' for key 'n'` / `Duplicate entry 'k' for key 'PRIMARY'`
+/// (MariaDB 10.11 wording).
+fn duplicate_entry_message(message: &str) -> String {
+    if let Some(pos) = find_ci(message, "UNIQUE constraint failed: ") {
+        let rest = &message[pos + "UNIQUE constraint failed: ".len()..];
+        // `table.col = value (index 'name')` — value may contain anything
+        // except the tail marker, so the split uses rfind.
+        if let Some(p) = rest.rfind(" (index '") {
+            let lhs_value = rest[..p].split_once(" = ").map(|(_, v)| v).unwrap_or(rest[..p].trim());
+            let name = rest[p + " (index '".len()..]
+                .trim_end()
+                .trim_end_matches(')')
+                .trim_end_matches('\'');
+            return format!("Duplicate entry '{}' for key '{}'", lhs_value, name);
+        }
+    }
+    for prefix in [
+        "duplicate primary key in INSERT: ",
+        "UPDATE would create duplicate primary key: ",
+    ] {
+        if let Some(pos) = find_ci(message, prefix) {
+            // The engine reports the storage row key `table:pkvalue` —
+            // MariaDB renders the PK value itself (table names cannot
+            // contain ':', so the first colon is the separator).
+            let key = &message[pos + prefix.len()..];
+            let key = key.split_once(':').map(|(_, v)| v).unwrap_or(key);
+            return format!("Duplicate entry '{}' for key 'PRIMARY'", key);
+        }
+    }
+    message.to_string()
+}
+
+/// Engine DROP failures → MariaDB wording:
+/// * ``Can't DROP COLUMN `c`; check that it exists``
+/// * ``Can't DROP `idx`; check that column/key exists``
+fn cant_drop_message(message: &str) -> String {
+    const COLUMN_NEEDLE: &str = "can't drop column '";
+    if let Some(pos) = find_ci(message, COLUMN_NEEDLE) {
+        let rest = &message[pos + COLUMN_NEEDLE.len()..];
+        if let Some(close) = rest.find('\'') {
+            let col = &rest[..close];
+            return format!("Can't DROP COLUMN `{}`; check that it exists", col);
+        }
+    }
+    // `index 'n' does not exist[ on table 't']` — DROP INDEX of a missing
+    // index (classify_error maps it to 1091).
+    if let Some(pos) = find_ci(message, "index '") {
+        let rest = &message[pos + "index '".len()..];
+        if let Some(close) = rest.find('\'') {
+            let name = &rest[..close];
+            if rest[close + 1..].starts_with(" does not exist") {
+                return format!("Can't DROP `{}`; check that column/key exists", name);
+            }
+        }
+    }
+    message.to_string()
 }
 
 pub struct CmsSqlGate {
@@ -276,6 +374,12 @@ impl CmsSqlGate {
         let want_distinct = strip_select_distinct(&mut pre);
         if pre.trim_start()[..3.min(pre.trim_start().len())].eq_ignore_ascii_case("sel") {
             pre = rewrite_comma_from(&pre);
+        }
+        // ON UPDATE CURRENT_TIMESTAMP: MySQL refreshes such columns to
+        // NOW() on every UPDATE that does not SET them explicitly
+        // (wp_posts.post_modified*, wp_comments…).
+        if pre.trim_start().to_ascii_uppercase().starts_with("UPDATE") {
+            pre = self.apply_on_update_bump(&pre);
         }
         let sql = pre.trim();
         let sql = sql.strip_suffix(';').unwrap_or(sql).trim();
@@ -524,10 +628,12 @@ impl CmsSqlGate {
         }
 
         // ---------- SQL_CALC_FOUND_ROWS / SQL_NO_CACHE ----------
+        let mut calc_found_rows = false;
         let mut forwarded = sql.to_string();
         if let Some(pos) = find_ci(&forwarded, "SQL_CALC_FOUND_ROWS") {
             forwarded.replace_range(pos..pos + "SQL_CALC_FOUND_ROWS".len(), "");
             forwarded = forwarded.split_whitespace().collect::<Vec<_>>().join(" ");
+            calc_found_rows = true;
         }
         // `SELECT /*!40001 SQL_NO_CACHE */ * FROM t` — mariadb-dump's per-table
         // copy query. Advisory for a cacheless engine: strip like the above.
@@ -636,12 +742,20 @@ impl CmsSqlGate {
                         .expect("tx map poisoned")
                         .insert(session, buf);
                 }
+                let errno = classify_error(&e);
                 return Err(CmsError {
-                    errno: classify_error(&e),
-                    message: e,
+                    errno,
+                    message: mysql_parity_message(errno, &e),
                 });
             }
         };
+
+        // ALTER TABLE column operations keep the MySQL-dialect overlay in
+        // sync (SHOW FULL COLUMNS / SHOW CREATE TABLE / dbDelta read it;
+        // previously only CREATE TABLE registered the overlay).
+        if upper.starts_with("ALTER TABLE") {
+            self.sync_overlay_after_alter(sql, &upper);
+        }
 
         // InnoDB two-phase locking: COMMIT / ROLLBACK end the transaction and
         // release every row lock it holds.
@@ -692,7 +806,13 @@ impl CmsSqlGate {
             out.found_rows = out.rows.len() as u64;
             // MySQL: FOUND_ROWS() reflects the rows of the most recent
             // SELECT; with SQL_CALC_FOUND_ROWS it is the *unlimited* count —
-            // we approximate it with the returned page (phase-1 note).
+            // the same query re-run without the top-level LIMIT (real
+            // semantics; the page-count approximation is retired).
+            if calc_found_rows {
+                if let Some(total) = self.unlimited_found_rows(&forwarded) {
+                    out.found_rows = total;
+                }
+            }
             self.with_session(session, |s| s.found_rows = out.found_rows);
         } else if let Some(msg) = &res.message {
             out.affected_rows = extract_row_count(msg);
@@ -755,6 +875,333 @@ impl CmsSqlGate {
                 .insert(session, buf);
         }
         res
+    }
+
+    /// Keeps the catalog overlay aligned with the engine schema after a
+    /// successful `ALTER TABLE` column operation (ADD/DROP/MODIFY/CHANGE
+    /// [COLUMN]). Without this, SHOW FULL COLUMNS / SHOW CREATE TABLE /
+    /// dbDelta kept reporting the CREATE-time column set. Index/KEY/
+    /// CONSTRAINT clauses are skipped (SHOW INDEX derives from the engine).
+    fn sync_overlay_after_alter(&self, sql: &str, upper: &str) {
+        const HEAD: &str = "ALTER TABLE ";
+        if !upper.starts_with(HEAD) {
+            return;
+        }
+        let rest = sql[HEAD.len()..].trim_start();
+        let Some(name_end) = rest.find(|c: char| c.is_whitespace()) else {
+            return;
+        };
+        let table = &rest[..name_end];
+        let after = rest[name_end..].trim_start();
+        let after_up = after.to_ascii_uppercase();
+        let mut keys = self.meta.write().expect("meta map poisoned");
+        let key = keys
+            .keys()
+            .find(|k| k.as_str() == table)
+            .cloned()
+            .or_else(|| {
+                keys.values()
+                    .find(|m| m.table.eq_ignore_ascii_case(table))
+                    .map(|m| m.table.clone())
+            });
+        let Some(key) = key else { return };
+        let Some(meta) = keys.get_mut(&key) else { return };
+        use crate::cms::ddl_meta::CmsTableMeta;
+        if after_up.starts_with("ADD ") {
+            let seg = after[4..].trim_start();
+            let seg = seg
+                .strip_prefix("COLUMN")
+                .map(|s| s.trim_start())
+                .unwrap_or(seg);
+            let seg_up = seg.to_ascii_uppercase();
+            if seg_up.starts_with("PRIMARY")
+                || seg_up.starts_with("UNIQUE")
+                || seg_up.starts_with("KEY")
+                || seg_up.starts_with("INDEX")
+                || seg_up.starts_with("CONSTRAINT")
+                || seg_up.starts_with("FOREIGN")
+                || seg_up.starts_with("FULLTEXT")
+                || seg_up.starts_with("SPATIAL")
+            {
+                return; // index/constraint clauses: SHOW INDEX reads the engine
+            }
+            if let Ok((col, inline_pk, inline_unique)) =
+                CmsTableMeta::parse_column_definition(seg, &meta.table)
+            {
+                if inline_pk && !meta.primary_key.contains(&col.field) {
+                    meta.primary_key.push(col.field.clone());
+                }
+                if inline_unique {
+                    let iname = format!("{}_{}_uniq", meta.table, col.field);
+                    meta.indexes.push(crate::cms::ddl_meta::CmsIndexMeta {
+                        name: iname,
+                        unique: true,
+                        columns: vec![(col.field.clone(), None)],
+                    });
+                }
+                if col.auto_increment {
+                    meta.auto_increment_column = Some(col.field.clone());
+                }
+                meta.columns.push(col);
+            }
+        } else if after_up.starts_with("DROP ") {
+            let seg = after[5..].trim_start();
+            let seg = seg
+                .strip_prefix("COLUMN")
+                .map(|s| s.trim_start())
+                .unwrap_or(seg);
+            let col = seg
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_matches('`');
+            meta.columns
+                .retain(|c| !c.field.eq_ignore_ascii_case(col));
+            meta.primary_key
+                .retain(|c| !c.eq_ignore_ascii_case(col));
+            meta.indexes.retain(|i| {
+                !i.columns
+                    .iter()
+                    .any(|(c, _)| c.eq_ignore_ascii_case(col))
+            });
+            if meta
+                .auto_increment_column
+                .as_deref()
+                .map(|a| a.eq_ignore_ascii_case(col))
+                .unwrap_or(false)
+            {
+                meta.auto_increment_column = None;
+            }
+        } else if after_up.starts_with("MODIFY ") || after_up.starts_with("CHANGE ") {
+            let is_change = after_up.starts_with("CHANGE ");
+            let mut seg = after[7..].trim_start();
+            seg = seg
+                .strip_prefix("COLUMN")
+                .map(|s| s.trim_start())
+                .unwrap_or(seg);
+            if is_change {
+                // CHANGE [COLUMN] old <new-definition>.
+                let Some(old_end) = seg.find(|c: char| c.is_whitespace()) else {
+                    return;
+                };
+                let old = seg[..old_end].trim_matches('`').to_string();
+                let def = seg[old_end..].trim_start();
+                let Ok((col, inline_pk, _)) =
+                    CmsTableMeta::parse_column_definition(def, &meta.table)
+                else {
+                    return;
+                };
+                let was_pk = meta
+                    .primary_key
+                    .iter()
+                    .any(|c| c.eq_ignore_ascii_case(&old));
+                if let Some(pos) = meta
+                    .columns
+                    .iter()
+                    .position(|c| c.field.eq_ignore_ascii_case(&old))
+                {
+                    meta.columns[pos] = col.clone();
+                } else {
+                    meta.columns.push(col.clone());
+                }
+                meta.primary_key
+                    .retain(|c| !c.eq_ignore_ascii_case(&old));
+                if was_pk || inline_pk {
+                    meta.primary_key.push(col.field.clone());
+                }
+                for idx in meta.indexes.iter_mut() {
+                    for (c, _) in idx.columns.iter_mut() {
+                        if c.eq_ignore_ascii_case(&old) {
+                            *c = col.field.clone();
+                        }
+                    }
+                }
+                if meta
+                    .auto_increment_column
+                    .as_deref()
+                    .map(|a| a.eq_ignore_ascii_case(&old))
+                    .unwrap_or(false)
+                {
+                    meta.auto_increment_column = Some(col.field.clone());
+                }
+            } else {
+                // MODIFY [COLUMN] <definition> — same name, new type/flags.
+                let Ok((col, inline_pk, _)) =
+                    CmsTableMeta::parse_column_definition(seg, &meta.table)
+                else {
+                    return;
+                };
+                if let Some(pos) = meta
+                    .columns
+                    .iter()
+                    .position(|c| c.field.eq_ignore_ascii_case(&col.field))
+                {
+                    meta.columns[pos] = col.clone();
+                } else {
+                    return; // unknown column — the engine already rejected
+                }
+                if inline_pk && !meta.primary_key.contains(&col.field) {
+                    meta.primary_key.push(col.field.clone());
+                }
+                // MySQL: MODIFY replaces the definition — a clause without
+                // AUTO_INCREMENT drops the flag.
+                if !col.auto_increment
+                    && meta
+                        .auto_increment_column
+                        .as_deref()
+                        .map(|a| a.eq_ignore_ascii_case(&col.field))
+                        .unwrap_or(false)
+                {
+                    meta.auto_increment_column = None;
+                }
+            }
+        }
+    }
+
+    /// `ON UPDATE CURRENT_TIMESTAMP` semantics (MySQL): every `UPDATE` of a
+    /// table carrying such columns refreshes them to NOW() unless the SET
+    /// list assigns them explicitly. Rewrites the SET section before the
+    /// statement reaches the engine (the same NOW()-literal substitution
+    /// `preprocess_mysql_dialect` applies to client-supplied NOW()).
+    fn apply_on_update_bump(&self, sql: &str) -> String {
+        let trimmed = sql.trim_start();
+        let upper = trimmed.to_ascii_uppercase();
+        if !upper.starts_with("UPDATE") {
+            return sql.to_string();
+        }
+        // Single-table updates only (`UPDATE t SET …`). Multi-table
+        // (`UPDATE a, b SET …`) and AS-aliased updates are not CMS shapes —
+        // leave them untouched.
+        let rest = trimmed[6..].trim_start();
+        let name_end = rest
+            .find(|c: char| c.is_whitespace() || c == '(')
+            .unwrap_or(rest.len());
+        let table = &rest[..name_end];
+        if table.is_empty() {
+            return sql.to_string();
+        }
+        let after_table = rest[name_end..].trim_start();
+        let after_up = after_table.to_ascii_uppercase();
+        if after_up.starts_with("AS ") || after_table.starts_with(',') || after_table.starts_with('`')
+        {
+            return sql.to_string();
+        }
+        let Some(meta) = self.table_meta(table).or_else(|| {
+            self.meta
+                .read()
+                .ok()
+                .and_then(|m| {
+                    m.values()
+                        .find(|m| m.table.eq_ignore_ascii_case(table))
+                        .cloned()
+                })
+        }) else {
+            return sql.to_string();
+        };
+        let bump_cols: Vec<&str> = meta
+            .columns
+            .iter()
+            .filter(|c| c.on_update_current_timestamp)
+            .map(|c| c.field.as_str())
+            .collect();
+        if bump_cols.is_empty() {
+            return sql.to_string();
+        }
+        // SET section: top-level SET keyword … top-level WHERE (or end).
+        // top_level_find_ci matches whole words (its needles are words, not
+        // " SET " — a leading space can never start a word match).
+        let Some(set_pos) = top_level_find_ci(sql, "SET") else {
+            return sql.to_string();
+        };
+        let after_set = &sql[set_pos + 3..];
+        let assignments_start = set_pos + 3 + (after_set.len() - after_set.trim_start().len());
+        let assignments_end = top_level_find_ci(&sql[assignments_start..], "WHERE")
+            .map(|p| assignments_start + p)
+            .unwrap_or(sql.len());
+        let set_section = &sql[assignments_start..assignments_end];
+        let assigned: Vec<String> = crate::cms::ddl_meta::split_top_level(set_section)
+            .iter()
+            .map(|a| {
+                a.split('=')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .trim_matches('`')
+                    .to_ascii_lowercase()
+            })
+            .collect();
+        let missing: Vec<&str> = bump_cols
+            .iter()
+            .copied()
+            .filter(|c| !assigned.contains(&c.to_ascii_lowercase()))
+            .collect();
+        if missing.is_empty() {
+            return sql.to_string();
+        }
+        let ts = now_mysql();
+        let extra = missing
+            .iter()
+            .map(|c| format!("{} = '{}'", c, ts))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut out = String::with_capacity(sql.len() + extra.len() + 2);
+        out.push_str(&sql[..assignments_end]);
+        out.push_str(", ");
+        out.push_str(&extra);
+        out.push_str(&sql[assignments_end..]);
+        out
+    }
+
+    /// SQL_CALC_FOUND_ROWS accounting (MySQL): FOUND_ROWS() returns the row
+    /// count the query would return WITHOUT the LIMIT clause. The page
+    /// result is already in hand; the total comes from re-running the same
+    /// query with the top-level LIMIT (and any locking tail) removed — no
+    /// row locks are taken by the probe. A shape mismatch keeps the page
+    /// count (wpdb reads FOUND_ROWS() only after a successful page).
+    fn unlimited_found_rows(&self, page_query: &str) -> Option<u64> {
+        let mut q = page_query.to_string();
+        // Drop the locking tail first: `FOR UPDATE` / `LOCK IN SHARE MODE`
+        // must not lock rows twice for one client statement.
+        if let Some((pos, _, _)) = find_locking_tail(&q) {
+            q.truncate(pos);
+        }
+        // The strip path whitespace-normalizes `forwarded`, so the LIMIT
+        // tail is a clean token run: LIMIT n [, m] [OFFSET k] — everything
+        // after the top-level LIMIT belongs to the tail (ORDER BY precedes
+        // LIMIT in MySQL grammar; parenthesized subquery LIMITs are skipped
+        // by top_level_find_ci).
+        let limit_pos = top_level_find_ci(&q, "LIMIT")?;
+        let tail = &q[limit_pos..];
+        let toks: Vec<&str> = tail.split_whitespace().collect();
+        let ok_shape = match toks.len() {
+            // LIMIT n | LIMIT n,m | LIMIT n, m | LIMIT n OFFSET m — the
+            // comma may ride on the first number (`0,2`), stand alone
+            // (`0 , 2`) or be followed by a space (`0, 2`).
+            2 => {
+                toks[1].parse::<u64>().is_ok()
+                    || toks[1]
+                        .split_once(',')
+                        .map(|(a, b)| {
+                            !a.is_empty()
+                                && a.parse::<u64>().is_ok()
+                                && b.parse::<u64>().is_ok()
+                        })
+                        .unwrap_or(false)
+            }
+            3 => toks[1].ends_with(',') && toks[1].trim_end_matches(',').parse::<u64>().is_ok(),
+            4 => {
+                (toks[2] == "," && toks[3].parse::<u64>().is_ok())
+                    || (toks[2].eq_ignore_ascii_case("OFFSET") && toks[3].parse::<u64>().is_ok())
+            }
+            _ => false,
+        };
+        if !ok_shape {
+            return None;
+        }
+        q.truncate(limit_pos);
+        let mut buf = None;
+        let res = self.engine.execute_in_tx(q.trim(), &mut buf).ok()?;
+        Some(res.rows.len() as u64)
     }
 
     fn exec_set(&self, session: u64, sql: &str, upper: &str) -> Result<CmsQueryResult, CmsError> {

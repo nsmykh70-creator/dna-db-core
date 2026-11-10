@@ -477,6 +477,19 @@ impl SqlEngine {
                 col_default,
             } => self.exec_add_column(&table, &column, col_type, col_default.as_deref()),
             Stmt::DropColumn { table, column } => self.exec_drop_column(&table, &column),
+            Stmt::ModifyColumn {
+                table,
+                column,
+                new_name,
+                col_type,
+                col_default,
+            } => self.exec_modify_column(
+                &table,
+                &column,
+                new_name.as_deref(),
+                col_type,
+                col_default.as_deref(),
+            ),
             Stmt::Explain(inner) => self.exec_explain(*inner),
         }
     }
@@ -662,6 +675,15 @@ impl SqlEngine {
             Stmt::AddColumn { table, column, .. } => {
                 format!("AlterTable({} ADD COLUMN {})", table, column)
             }
+            Stmt::ModifyColumn {
+                table,
+                column,
+                new_name,
+                ..
+            } => match new_name {
+                Some(n) => format!("AlterTable({} CHANGE COLUMN {} {})", table, column, n),
+                None => format!("AlterTable({} MODIFY COLUMN {})", table, column),
+            },
             Stmt::Tx { action } => format!("Tx({:?})", action),
             Stmt::Cte { ctes, body } => format!(
                 "CTE({}) {}",

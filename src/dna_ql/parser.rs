@@ -691,9 +691,9 @@ impl Parser {
         })
     }
 
-    /// ALTER CHROMOSOME (or the SQL spelling ALTER TABLE) — ADD/DROP COLUMN
-    /// passthrough. The ADD tail (type + flags) is captured verbatim, like
-    /// the CREATE CHROMOSOME clause list.
+    /// ALTER CHROMOSOME (or the SQL spelling ALTER TABLE) — ADD/DROP/
+    /// MODIFY/CHANGE COLUMN passthrough. The column tail (type + flags) is
+    /// captured verbatim, like the CREATE CHROMOSOME clause list.
     fn parse_alter_passthrough(&mut self) -> Result<DnaQlAst, String> {
         self.expect_kw("ALTER")?;
         let kw = self.ident()?;
@@ -715,11 +715,61 @@ impl Parser {
                 tables: vec![table],
             });
         }
+        // Online type change, SQL-spelling parity:
+        //   MODIFY [COLUMN] c <type+flags>
+        //   CHANGE [COLUMN] old new <type+flags>
+        if self.kw("MODIFY") {
+            self.kw("COLUMN");
+            let column = self.ident()?;
+            let tail = self.consume_alter_column_tail()?;
+            if matches!(self.peek(), Tok::Semicolon) {
+                self.next();
+            }
+            return Ok(DnaQlAst::DdlPassthrough {
+                sql: format!(
+                    "ALTER TABLE {} MODIFY COLUMN {} {};",
+                    table, column, tail
+                ),
+                tables: vec![table],
+            });
+        }
+        if self.kw("CHANGE") {
+            self.kw("COLUMN");
+            let old = self.ident()?;
+            let new = self.ident()?;
+            let tail = self.consume_alter_column_tail()?;
+            if matches!(self.peek(), Tok::Semicolon) {
+                self.next();
+            }
+            return Ok(DnaQlAst::DdlPassthrough {
+                sql: format!(
+                    "ALTER TABLE {} CHANGE COLUMN {} {} {};",
+                    table, old, new, tail
+                ),
+                tables: vec![table],
+            });
+        }
         self.expect_kw("ADD")?;
         self.kw("COLUMN");
         let column = self.ident()?;
         // Type + flags: raw token text until ';' / end (INT NOT NULL
         // DEFAULT 'x', VARCHAR(191) UNSIGNED, ...).
+        let tail = self.consume_alter_column_tail()?;
+        if matches!(self.peek(), Tok::Semicolon) {
+            self.next();
+        }
+        Ok(DnaQlAst::DdlPassthrough {
+            sql: format!(
+                "ALTER TABLE {} ADD COLUMN {} {};",
+                table, column, tail
+            ),
+            tables: vec![table],
+        })
+    }
+
+    /// Raw column-definition tail of an ALTER clause: type + flags until
+    /// ';' / end (INT NOT NULL DEFAULT 'x', VARCHAR(191) UNSIGNED, ...).
+    fn consume_alter_column_tail(&mut self) -> Result<String, String> {
         let mut tail = String::new();
         loop {
             match self.peek().clone() {
@@ -734,22 +784,13 @@ impl Parser {
                 }
                 t => {
                     return Err(format!(
-                        "DnaQL: unexpected token {:?} in ALTER ... ADD COLUMN tail",
+                        "DnaQL: unexpected token {:?} in ALTER ... COLUMN tail",
                         t
                     ))
                 }
             }
         }
-        if matches!(self.peek(), Tok::Semicolon) {
-            self.next();
-        }
-        Ok(DnaQlAst::DdlPassthrough {
-            sql: format!(
-                "ALTER TABLE {} ADD COLUMN {} {};",
-                table, column, tail
-            ),
-            tables: vec![table],
-        })
+        Ok(tail)
     }
 
     // TX { stmt; stmt; ... }

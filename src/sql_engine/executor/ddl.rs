@@ -385,6 +385,161 @@ impl SqlEngine {
         ))
     }
 
+    /// Online type change: `ALTER TABLE t MODIFY [COLUMN] c T [flags]` /
+    /// `ALTER TABLE t CHANGE [COLUMN] old new T [flags]`. One statement =
+    /// metadata rewrite + ONE data batch: every stored value of the column
+    /// is coerced to the new type (`Value::coerce_for_column`, the same
+    /// conversion INSERT/UPDATE apply), so reads never see stale payloads.
+    /// A rename re-keys the column in every row map and rebuilds the
+    /// secondary-index entries of that column (old-name prefix deleted,
+    /// new-name written in the same atomic batch).
+    pub(crate) fn exec_modify_column(
+        &self,
+        table: &str,
+        column: &str,
+        new_name: Option<&str>,
+        col_type: ColumnType,
+        col_default: Option<&str>,
+    ) -> Result<
+        (
+            Vec<String>,
+            Vec<BTreeMap<String, Value>>,
+            String,
+            Option<String>,
+        ),
+        String,
+    > {
+        let mut schema = self
+            .get_schema(table)
+            .ok_or_else(|| format!("SQL: relation '{}' does not exist", table))?;
+        if !schema.columns.contains_key(column) {
+            return Err(format!("SQL: unknown column '{}' in '{}'", column, table));
+        }
+        let renamed = new_name.unwrap_or(column);
+        let rename = renamed != column;
+        if rename && schema.columns.contains_key(renamed) {
+            return Err(format!(
+                "SQL: column '{}' already exists in table '{}'",
+                renamed, table
+            ));
+        }
+        // RENAME pass over the metadata: column entry, default, declaration
+        // order, secondary indexes, auto-increment and PK references. The
+        // row key derives from PK VALUES (unchanged by a rename).
+        if rename {
+            let ty = schema.columns.remove(column).unwrap();
+            schema.columns.insert(renamed.to_string(), ty);
+            if let Some(d) = schema.column_defaults.remove(column) {
+                schema.column_defaults.insert(renamed.to_string(), d);
+            }
+            for c in schema.column_order.iter_mut() {
+                if c == column {
+                    *c = renamed.to_string();
+                }
+            }
+            for idx in schema.secondary_indexes.iter_mut() {
+                if idx.column == column {
+                    idx.column = renamed.to_string();
+                }
+            }
+            if schema.auto_increment_column.as_deref() == Some(column) {
+                schema.auto_increment_column = Some(renamed.to_string());
+            }
+            for pk in schema.primary_key_cols.iter_mut() {
+                if pk == column {
+                    *pk = renamed.to_string();
+                }
+            }
+            if schema.primary_locus_column == column {
+                schema.primary_locus_column = renamed.to_string();
+            }
+        }
+        // Type/default metadata.
+        schema.columns.insert(renamed.to_string(), col_type.clone());
+        match col_default {
+            Some(d) => {
+                schema
+                    .column_defaults
+                    .insert(renamed.to_string(), d.to_string());
+            }
+            None => {
+                // MySQL: MODIFY/CHANGE replaces the whole definition — a
+                // clause without DEFAULT drops the old default.
+                schema.column_defaults.remove(renamed);
+            }
+        }
+        self.persist_schema(&schema)?;
+
+        // Data rewrite: coerce the column value of every row; on rename
+        // also re-key the row map and drop the stale old-name index entries.
+        let rows = self.read_table_rows(table)?;
+        let rewritten = rows.len();
+        let mut batch: Vec<(crate::wal::WalOp, Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+        if rename {
+            // Old-name index entries are gone from the schema — delete them
+            // by the historical prefix before the delta writes new ones.
+            let stale = self
+                .engine
+                .scan_prefix(&index_prefix(table, column))
+                .map_err(|e| e.to_string())?;
+            for (key, _) in stale {
+                batch.push((crate::wal::WalOp::Delete, key, None));
+            }
+        }
+        for row in rows {
+            let old_row = row.clone();
+            let mut new_row = row;
+            let v = new_row.remove(column).unwrap_or(Value::Null);
+            let coerced = match v {
+                Value::Null => Value::Null,
+                other => Value::coerce_for_column(&col_type, other),
+            };
+            new_row.insert(renamed.to_string(), coerced);
+            let key = Self::row_key_from_row(table, &schema, &new_row)?;
+            batch.extend(Self::index_delta_batch(
+                &schema,
+                Some((table, &old_row)),
+                Some((table, &new_row)),
+            ));
+            let payload = RowCodec::encode(
+                &new_row
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect::<Vec<_>>(),
+            );
+            batch.push((crate::wal::WalOp::Put, key.into_bytes(), Some(payload)));
+        }
+        if !batch.is_empty() {
+            self.engine
+                .write_batch(&batch)
+                .map_err(|e| format!("ALTER TABLE MODIFY data rewrite failed: {}", e))?;
+        }
+        let action = if rename {
+            format!(
+                "AlterTable({} CHANGE COLUMN {} {})",
+                table, column, renamed
+            )
+        } else {
+            format!("AlterTable({} MODIFY COLUMN {})", table, column)
+        };
+        Ok((
+            vec!["status".into()],
+            vec![mk_row(&[("status", Value::Text("OK".into()))])],
+            action,
+            Some(if rename {
+                format!(
+                    "column '{}' renamed to '{}' and retyped in '{}' ({} row(s) rewritten)",
+                    column, renamed, table, rewritten
+                )
+            } else {
+                format!(
+                    "column '{}' retyped in '{}' ({} row(s) rewritten)",
+                    column, table, rewritten
+                )
+            }),
+        ))
+    }
+
     /// Enforce every UNIQUE secondary index of `table` for the row `new`
     /// (full row map + its row key). `old_key`, when present, is the key of
     /// the row being replaced: its own current index entries don't count as

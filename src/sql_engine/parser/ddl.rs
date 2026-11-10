@@ -447,6 +447,78 @@ impl SParser {
         }
     }
 
+    /// Trailing flags of an ALTER TABLE column clause (ADD / MODIFY /
+    /// CHANGE): UNSIGNED/ZEROFILL, NOT NULL/NULL, DEFAULT <lit>, COMMENT,
+    /// AUTO_INCREMENT, ON UPDATE CURRENT_TIMESTAMP. Returns the DEFAULT
+    /// literal (if any) and the NOT-NULL flag — the caller synthesizes the
+    /// zero default for NOT NULL columns without one (ADD COLUMN).
+    pub(super) fn parse_alter_column_tail(
+        &mut self,
+        _col_type: &ColumnType,
+    ) -> Result<(Option<String>, bool), String> {
+        let mut col_default: Option<String> = None;
+        let mut not_null = false;
+        loop {
+            if self.kw("UNSIGNED") || self.kw("ZEROFILL") {
+                continue;
+            }
+            if self.kw("ON") {
+                // ON UPDATE CURRENT_TIMESTAMP[()] — advisory on the engine
+                // side (the CMS gate rewrites UPDATEs for such columns;
+                // normalized_engine_ddl drops the flag).
+                if self.kw("UPDATE") {
+                    if self.kw("CURRENT_TIMESTAMP") {
+                        // Optional () tail: current_timestamp().
+                        if matches!(self.peek(), STok::LParen) {
+                            self.next();
+                            self.expect(STok::RParen)?;
+                        }
+                    }
+                    continue;
+                }
+                return Err("SQL: expected UPDATE after ON in column definition".into());
+            }
+            if self.kw("NOT") {
+                if !self.kw("NULL") {
+                    return Err("SQL: expected NULL after NOT in column definition".into());
+                }
+                not_null = true;
+                continue;
+            }
+            if self.kw("NULL") {
+                continue;
+            }
+            if self.kw("DEFAULT") {
+                col_default = Some(match self.peek().clone() {
+                    STok::Str(s) => {
+                        self.next();
+                        s
+                    }
+                    STok::Int(v) => {
+                        self.next();
+                        v.to_string()
+                    }
+                    STok::Float(v) => {
+                        self.next();
+                        v.to_string()
+                    }
+                    STok::Ident(s) => {
+                        self.next();
+                        s
+                    }
+                    t => return Err(format!("SQL: bad DEFAULT value {:?}", t)),
+                });
+                continue;
+            }
+            if self.kw("COMMENT") {
+                self.consume_default_value()?;
+                continue;
+            }
+            break;
+        }
+        Ok((col_default, not_null))
+    }
+
     /// True when the next token starts a MySQL constraint line inside
     /// CREATE TABLE (cms only): KEY / INDEX / UNIQUE / FULLTEXT / SPATIAL.
     ///

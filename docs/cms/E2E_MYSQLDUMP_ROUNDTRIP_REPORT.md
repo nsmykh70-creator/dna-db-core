@@ -82,12 +82,22 @@ MYSQLDUMP_E2E_VERDICT: OK
 
 ## Документированные расхождения
 
-1. `ON UPDATE CURRENT_TIMESTAMP` не входит в оверлей и не воспроизводится в
-   SHOW CREATE TABLE (в гейте семантика NOW() подменяется на уровне DML).
+> **Статус 2026-11-10:** пункты 1 и 3 устранены (см. пометки), 2/4/5 —
+> осознанные архитектурные решения, остаются задокументированными.
+
+1. ~~`ON UPDATE CURRENT_TIMESTAMP` не входит в оверлей~~ — **✅ УСТРАНЕНО**:
+   флаг парсится в `CmsColumnMeta.on_update_current_timestamp`, SHOW CREATE
+   TABLE воспроизводит флаг, SHOW FULL COLUMNS показывает MariaDB-форму
+   `on update current_timestamp()` в Extra, а гейт на каждом UPDATE,
+   который не назначает колонку явно, дописывает `SET col = NOW()`
+   (семантика MySQL; тест `on_update_current_timestamp_semantics`).
 2. `LOCK TABLES` — no-op: single-writer-движок уже исключает параллельные
    записи; гранулярные гарантии дают строчные блокировки (§4 item 2).
-3. SHOW TABLE STATUS статистика (Rows/Data_length) нулевая — движок не
-   материализует счётчики; автоинкремент честный.
+3. ~~SHOW TABLE STATUS статистика (Rows/Data_length) нулевая~~ —
+   **✅ Rows УСТРАНЕН**: Rows теперь точный `COUNT(*)` (phpMyAdmin видит
+   живое число строк; тест `table_status_reports_row_count`); Data_length
+   остаётся InnoDB-плейсхолдером страницы — движок не ведёт байтовую
+   статистику. Автоинкремент честный (как было).
 4. FOREIGN KEY-сегменты DDL вырезаются перед форвардом (референциальная
    целостность остаётся на декларативном FK-слое движка).
 5. Внутристрочные блоки `/* … */` без `!` отбрасываются (паритет с
