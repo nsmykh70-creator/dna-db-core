@@ -86,6 +86,23 @@ cargo build --release --features cms      # 1–2 минуты
 sudo install -m 0755 target/release/dna-db-core /usr/local/bin/
 ```
 
+### Вариант В — Docker + мониторинг одним стеком
+
+```bash
+git clone --branch cms-edition https://github.com/nsmykh70-creator/dna-db-core.git
+cd dna-db-core
+docker compose up -d --build
+```
+
+Стек поднимает три сервиса: `dna-db` (MySQL :3306 + веб-панель и метрики
+:9310, данные в volume `dna_data`), Prometheus (:9090, скрейп
+`dna-db:9310/metrics`) и Grafana (:3000, дашборд «DNA-DB CMS Edition»
+провижинится автоматически — сессии/запросы/ошибки wire-протокола и
+карта спиралей dnadb). База данных создаётся в панели: «Создать базу
+(2 спирали)» — Strand A и Strand B на выбранных хранилищах. Перенос
+существующего сайта — пошагово в
+[WP_MIGRATION_3STEPS_RU.md](WP_MIGRATION_3STEPS_RU.md).
+
 ---
 
 ## Шаг 2. Первый запуск

@@ -20,32 +20,40 @@
 //! * `GET  /api/storage` — registered roots + writable local-disk/network
 //!   candidates detected from `/proc/mounts`.
 //! * `POST /api/storage` / `DELETE /api/storage/{label}` — manage roots.
+//! * `GET  /metrics` — Prometheus text format 0.0.4: wire counters
+//!   (sessions, queries, errors, uptime) + spiral-catalog gauges
+//!   (databases, spirals, storage roots, per-root placement). Read-only
+//!   and unauthenticated like every scrape target; the panel binds
+//!   loopback by default, so expose it to the scraper deliberately.
 //!
 //! Bind is loopback by default (`--admin-bind`); put TLS in front for
-//! remote access. Everything except `GET /` and `POST /api/login` requires
-//! the bearer token.
+//! remote access. Everything except `GET /`, `POST /api/login` and
+//! `GET /metrics` requires the bearer token.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value as J};
 
 use crate::cms::spirals::{StorageKind, StorageRoot};
-use crate::cms::CmsSqlGate;
+use crate::cms::{CmsSqlGate, MySqlWireStats};
 
 const PANEL_HTML: &str = include_str!("panel.html");
 const MAX_BODY: usize = 256 * 1024;
 const TOKEN_TTL: Duration = Duration::from_secs(12 * 3600);
 const MAX_FAILURES: u32 = 5;
 const FAILURE_WINDOW: Duration = Duration::from_secs(60);
+const METRICS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
 type Users = Arc<HashMap<String, String>>;
 
 pub struct CmsPanel {
     gate: Arc<CmsSqlGate>,
+    stats: Arc<MySqlWireStats>,
     users: Users,
     sessions: Mutex<HashMap<String, (String, Instant)>>,
     failures: Mutex<HashMap<IpAddr, (u32, Instant)>>,
@@ -53,9 +61,15 @@ pub struct CmsPanel {
 
 impl CmsPanel {
     /// Accept loop. Runs forever; the caller spawns it on a thread.
-    pub fn run(listener: TcpListener, gate: Arc<CmsSqlGate>, users: Users) {
+    pub fn run(
+        listener: TcpListener,
+        gate: Arc<CmsSqlGate>,
+        stats: Arc<MySqlWireStats>,
+        users: Users,
+    ) {
         let panel = Arc::new(CmsPanel {
             gate,
+            stats,
             users,
             sessions: Mutex::new(HashMap::new()),
             failures: Mutex::new(HashMap::new()),
@@ -97,6 +111,16 @@ impl CmsPanel {
         if method == "POST" && area == "login" {
             let out = self.api_login(&req.body, peer);
             return respond_json(&mut stream, out.0, &out.1);
+        }
+        // Scrape target: read-only, no bearer token (Prometheus cannot do
+        // the login dance); content-type is the 0.0.4 text format.
+        if method == "GET" && path == "/metrics" {
+            return respond(
+                &mut stream,
+                200,
+                METRICS_CONTENT_TYPE,
+                &self.render_metrics(),
+            );
         }
 
         // Everything below needs a valid bearer token.
@@ -191,6 +215,131 @@ impl CmsPanel {
             }
             None => false,
         }
+    }
+
+    // ----------------------------- metrics -----------------------------
+
+    /// Prometheus text format 0.0.4 body: wire counters plus the
+    /// spiral-catalog gauges (databases / spirals / storage roots /
+    /// per-root placement). Pure function of the stats + catalog, so the
+    /// unit tests assert it without sockets.
+    fn render_metrics(&self) -> String {
+        let s = &self.stats;
+        let (databases, spirals, roots, per_root) = self
+            .gate
+            .with_spirals(|c| {
+                let pairs: Vec<&crate::cms::spirals::SpiralPair> = c.pairs().collect();
+                let mut per_root: std::collections::BTreeMap<String, u64> =
+                    std::collections::BTreeMap::new();
+                for p in &pairs {
+                    for strand in [&p.strand_a, &p.strand_b] {
+                        let label = strand
+                            .root_label
+                            .clone()
+                            .unwrap_or_else(|| "ad-hoc".to_string());
+                        *per_root.entry(label).or_insert(0) += 1;
+                    }
+                }
+                (pairs.len() as u64, pairs.len() as u64 * 2, c.roots().len() as u64, per_root)
+            })
+            .unwrap_or((0, 0, 0, std::collections::BTreeMap::new()));
+
+        let mut out = String::with_capacity(2048);
+        metric(
+            &mut out,
+            "dnadb_build_info",
+            "Build metadata (value is always 1).",
+            "gauge",
+            &format!(
+                "dnadb_build_info{{version=\"{}\",edition=\"cms\"}} 1",
+                env!("CARGO_PKG_VERSION")
+            ),
+        );
+        metric(
+            &mut out,
+            "dnadb_cms_wire_sessions_active",
+            "Currently open MySQL-wire sessions.",
+            "gauge",
+            &format!(
+                "dnadb_cms_wire_sessions_active {}",
+                s.active.load(Ordering::Relaxed)
+            ),
+        );
+        metric(
+            &mut out,
+            "dnadb_cms_wire_sessions_total",
+            "MySQL-wire sessions opened since server start.",
+            "counter",
+            &format!(
+                "dnadb_cms_wire_sessions_total {}",
+                s.total_sessions.load(Ordering::Relaxed)
+            ),
+        );
+        metric(
+            &mut out,
+            "dnadb_cms_wire_queries_total",
+            "COM_QUERY / COM_STMT_EXECUTE statements executed.",
+            "counter",
+            &format!(
+                "dnadb_cms_wire_queries_total {}",
+                s.total_queries.load(Ordering::Relaxed)
+            ),
+        );
+        metric(
+            &mut out,
+            "dnadb_cms_wire_errors_total",
+            "Statements answered with an ERR packet.",
+            "counter",
+            &format!(
+                "dnadb_cms_wire_errors_total {}",
+                s.total_errors.load(Ordering::Relaxed)
+            ),
+        );
+        metric(
+            &mut out,
+            "dnadb_cms_wire_uptime_seconds",
+            "Seconds since the wire listener came up.",
+            "gauge",
+            &format!("dnadb_cms_wire_uptime_seconds {}", s.uptime_seconds()),
+        );
+        metric(
+            &mut out,
+            "dnadb_cms_databases_total",
+            "Databases registered in the spiral catalog (each = Strand A + Strand B).",
+            "gauge",
+            &format!("dnadb_cms_databases_total {databases}"),
+        );
+        metric(
+            &mut out,
+            "dnadb_cms_spirals_total",
+            "Spiral strands under management (2 per database).",
+            "gauge",
+            &format!("dnadb_cms_spirals_total {spirals}"),
+        );
+        metric(
+            &mut out,
+            "dnadb_cms_storage_roots_total",
+            "Registered spiral storage roots (local disks / network mounts).",
+            "gauge",
+            &format!("dnadb_cms_storage_roots_total {roots}"),
+        );
+        metric(
+            &mut out,
+            "dnadb_cms_spirals_per_root",
+            "Spiral strands placed on each storage root (label may be 'ad-hoc').",
+            "gauge",
+            &per_root
+                .iter()
+                .map(|(label, n)| {
+                    format!(
+                        "dnadb_cms_spirals_per_root{{root=\"{}\"}} {n}",
+                        escape_label(label)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        out
     }
 
     // ----------------------------- data -----------------------------
@@ -519,6 +668,32 @@ fn respond_json(stream: &mut TcpStream, status: u16, v: &J) {
     )
 }
 
+/// Appends one `# HELP` / `# TYPE` header pair plus the pre-rendered sample
+/// line(s) of a Prometheus metric family. `sample` is empty for families
+/// with no series yet (a bare TYPE block is valid exposition).
+fn metric(out: &mut String, name: &str, help: &str, typ: &str, sample: &str) {
+    out.push_str("# HELP ");
+    out.push_str(name);
+    out.push(' ');
+    out.push_str(help);
+    out.push_str("\n# TYPE ");
+    out.push_str(name);
+    out.push(' ');
+    out.push_str(typ);
+    out.push('\n');
+    if !sample.is_empty() {
+        out.push_str(sample);
+        out.push('\n');
+    }
+}
+
+/// Escapes a Prometheus label value: backslash, double quote and newline.
+fn escape_label(v: &str) -> String {
+    v.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
 // ---------------------------------------------------------------------------
 // tests
 // ---------------------------------------------------------------------------
@@ -566,5 +741,133 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    // --------------------------- /metrics ---------------------------
+
+    /// Real engine + attached spiral catalog on a private temp dir.
+    fn test_gate(name: &str) -> Arc<CmsSqlGate> {
+        let dir = std::env::temp_dir().join(format!(
+            "dnadb_panel_{}_{}_{}",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let engine = crate::engine::Engine::open(crate::engine::EngineConfig {
+            dir_path: dir.clone(),
+            sync_mode: crate::wal::SyncMode::Batched,
+            ..crate::engine::EngineConfig::default()
+        })
+        .unwrap();
+        let gate = Arc::new(CmsSqlGate::new(Arc::new(
+            crate::sql_engine::SqlEngine::new(engine),
+        )));
+        gate.attach_spiral_catalog(&dir).unwrap();
+        gate
+    }
+
+    fn stats_with(totals: (u64, u64, u64), active: u32) -> Arc<MySqlWireStats> {
+        let s = Arc::new(MySqlWireStats::default());
+        s.total_queries.store(totals.0, Ordering::Relaxed);
+        s.total_sessions.store(totals.1, Ordering::Relaxed);
+        s.total_errors.store(totals.2, Ordering::Relaxed);
+        s.active.store(active, Ordering::Relaxed);
+        s
+    }
+
+    fn empty_panel(gate: Arc<CmsSqlGate>, stats: Arc<MySqlWireStats>) -> CmsPanel {
+        CmsPanel {
+            gate,
+            stats,
+            users: Arc::new(HashMap::new()),
+            sessions: Mutex::new(HashMap::new()),
+            failures: Mutex::new(HashMap::new()),
+        }
+    }
+
+    #[test]
+    fn metrics_body_reports_cms_families() {
+        let panel = empty_panel(test_gate("families"), stats_with((42, 7, 1), 2));
+        let body = panel.render_metrics();
+        for needle in [
+            "# TYPE dnadb_cms_wire_queries_total counter",
+            "dnadb_cms_wire_queries_total 42",
+            "dnadb_cms_wire_sessions_total 7",
+            "dnadb_cms_wire_errors_total 1",
+            "dnadb_cms_wire_sessions_active 2",
+            "dnadb_cms_wire_uptime_seconds ",
+            "# TYPE dnadb_cms_databases_total gauge",
+            "dnadb_cms_databases_total 0",
+            "dnadb_cms_spirals_total 0",
+            "dnadb_cms_storage_roots_total 2", // local-a / local-b seeded by open()
+            "# TYPE dnadb_cms_spirals_per_root gauge",
+        ] {
+            assert!(body.contains(needle), "missing {needle:?} in:\n{body}");
+        }
+        assert!(body.contains(&format!(
+            "dnadb_build_info{{version=\"{}\",edition=\"cms\"}} 1",
+            env!("CARGO_PKG_VERSION")
+        )));
+        // No pairs yet: the per-root family is declared, has no samples.
+        assert!(!body.contains("dnadb_cms_spirals_per_root{"));
+        assert!(body.ends_with('\n'));
+    }
+
+    #[test]
+    fn metrics_track_spiral_pair_lifecycle() {
+        let gate = test_gate("lifecycle");
+        let panel = empty_panel(gate.clone(), Arc::new(MySqlWireStats::default()));
+        let pair = gate
+            .panel_create_database("shop", (None, None, None), (None, None, None))
+            .expect("create pair on default roots");
+        assert_eq!(pair.strand_a.root_label.as_deref(), Some("local-a"));
+        assert_eq!(pair.strand_b.root_label.as_deref(), Some("local-b"));
+        let body = panel.render_metrics();
+        assert!(body.contains("dnadb_cms_databases_total 1"));
+        assert!(body.contains("dnadb_cms_spirals_total 2"));
+        assert!(body.contains("dnadb_cms_spirals_per_root{root=\"local-a\"} 1"));
+        assert!(body.contains("dnadb_cms_spirals_per_root{root=\"local-b\"} 1"));
+        gate.panel_drop_database("shop").unwrap();
+        let body = panel.render_metrics();
+        assert!(body.contains("dnadb_cms_databases_total 0"));
+        assert!(body.contains("dnadb_cms_spirals_total 0"));
+        assert!(!body.contains("dnadb_cms_spirals_per_root{"));
+    }
+
+    #[test]
+    fn metrics_endpoint_roundtrip_without_auth() {
+        let gate = test_gate("roundtrip");
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let users: Users = Arc::new(HashMap::new());
+        std::thread::spawn(move || {
+            CmsPanel::run(listener, gate, Arc::new(MySqlWireStats::default()), users)
+        });
+        // Scrape: 200 + text format, no bearer token.
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "got: {}", &resp[..40]);
+        assert!(resp.contains(METRICS_CONTENT_TYPE));
+        assert!(resp.contains("dnadb_cms_wire_sessions_total 0"));
+        // API routes stay token-protected.
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.write_all(b"GET /api/databases HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 401"));
+    }
+
+    #[test]
+    fn escape_label_escapes_prometheus_specials() {
+        assert_eq!(escape_label("a\"b\\c"), "a\\\"b\\\\c");
+        assert_eq!(escape_label("x\ny"), "x\\ny");
+        assert_eq!(escape_label("plain"), "plain");
     }
 }

@@ -54,12 +54,36 @@ use std::time::{Duration, Instant};
 // Server + stats
 // ---------------------------------------------------------------------------
 
-#[derive(Default)]
+/// Wire-server counters shared with the panel's `/metrics` endpoint.
+/// `started` is `Instant::now()` at construction so the uptime gauge is
+/// honest even for hand-built stats (tests, embedders).
 pub struct MySqlWireStats {
     pub active: AtomicU32,
     pub total_queries: AtomicU64,
     pub total_sessions: AtomicU64,
     pub total_errors: AtomicU64,
+    /// Process start wall-clock instant; exported as
+    /// `dnadb_cms_wire_uptime_seconds` by the panel's `/metrics`.
+    pub started: Instant,
+}
+
+impl Default for MySqlWireStats {
+    fn default() -> Self {
+        Self {
+            active: AtomicU32::new(0),
+            total_queries: AtomicU64::new(0),
+            total_sessions: AtomicU64::new(0),
+            total_errors: AtomicU64::new(0),
+            started: Instant::now(),
+        }
+    }
+}
+
+impl MySqlWireStats {
+    /// Seconds since the listener came up (for the uptime gauge).
+    pub fn uptime_seconds(&self) -> u64 {
+        self.started.elapsed().as_secs()
+    }
 }
 
 pub struct MySqlWireServer {

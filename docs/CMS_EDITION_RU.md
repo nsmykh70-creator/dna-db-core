@@ -483,6 +483,46 @@ VERSION()-эмуляция. Тестов (lib): **324 с `--features cms`** (+5 
 MODIFY/CHANGE и coerce_for_column живут вне cms-гейта; полный набор со
 всеми целями — 357 passed с фичей).
 
+### Прогон №13: docker-образ, гайд миграции WP, Prometheus-дашборд — Фаза 3 закрыта (2026-11-14)
+
+Финальные пункты Фазы 3 «эксплуатация»:
+
+- **`GET /metrics` в панели mysqld** (`cms::panel`): Prometheus text
+  format 0.0.4, без bearer-токена (скрейп-цель; панель по умолчанию на
+  loopback, API-роуты остаются защищёнными). Семейства:
+  `dnadb_cms_wire_sessions_active/_total`, `dnadb_cms_wire_queries_total`,
+  `dnadb_cms_wire_errors_total`, `dnadb_cms_wire_uptime_seconds`,
+  `dnadb_cms_databases_total`, `dnadb_cms_spirals_total`,
+  `dnadb_cms_storage_roots_total`, `dnadb_cms_spirals_per_root{root=…}`
+  (размещение спиралей по корням хранения, вне корня — label «ad-hoc»),
+  `dnadb_build_info`. Счётчики wire (`MySqlWireStats`) создаются до
+  запуска панели и пробрасываются в неё, так что первый скрейп видит
+  живые числа; uptime — честный `Instant` с момента старта слушателя.
+  Тесты: тело метрик (семейства/значения), жизненный цикл пары спиралей
+  (создание/удаление базы двигает гейджи), HTTP-раундтрип без токена
+  (200 + `text/plain; version=0.0.4`; `/api/*` остаются 401), экранирование
+  label-значений.
+- **Docker-образ**: `Dockerfile` (многоступенчатый rust:1-slim-bookworm →
+  debian:bookworm-slim, некорневой пользователь `dnadb`, VOLUME
+  `/var/lib/dna-db`, HEALTHCHECK по TCP :3306, vendored
+  reed-solomon-erasure через `[patch.crates-io]`), `.dockerignore`;
+  `docker-compose.yml` поднимает dna-db (:3306, панель/метрики :9310) +
+  Prometheus (:9090) + Grafana (:3000) с провижинингом.
+- **Prometheus-дашборд**: каталог `monitoring/` — `prometheus.yml`
+  (цель `dna-db:9310`), Grafana-провижининг datasource и дашборд
+  `monitoring/grafana/dashboards/dna_db_cms_dashboard.json` (11 панелей:
+  активные сессии, сессий всего, ошибок, uptime, запросы/с и ошибки/с,
+  базы, спирали, корни хранения, размещение спиралей по корням).
+- **Гайд миграции**: `docs/WP_MIGRATION_3STEPS_RU.md` — WordPress с MySQL
+  на DNA-DB за 3 шага (установка + создание базы парой спиралей с выбором
+  хранилищ → перенос данных штатным mysqldump → переключение
+  `wp-config.php` и проверки wp-cli/панели/Grafana), плюс откат
+  (дамп из DNA-DB встаёт на ванильный MySQL) и чеклист перед
+  переключением.
+
+Тестов (lib): **328 с `--features cms`** (+4 панельных), **210 без
+фичи** — обе сборки 0 отказов.
+
 ## 5. Фазы
 
 **Фаза 0 — корпус запросов (1–2 нед).** ✅ Выполнено:
@@ -525,7 +565,7 @@ deadlock-retry и DECIMAL-шкала закрыты — Фаза 2 выполн�
 unsigned-семантика) переносятся в Фазу 3 как инженерные задачи без
 приёмочных блокеров.
 
-**Фаза 3 — эксплуатация (2–4 нед).** 🔶 В прогрессе: **mysqldump-совместимый
+**Фаза 3 — эксплуатация (2–4 нед).** ✅ Выполнена: **mysqldump-совместимый
 импорт/экспорт ✅ (6.11: реальный `mariadb-dump` 10.11.11 в обе стороны —
 дамп с эталона MariaDB проигрывается в DNA-DB штатным клиентом `mariadb`,
 дамп С DNA-DB проигрывается в чистую MariaDB; содержимое ref→imp→back
@@ -546,13 +586,13 @@ KEYS + SQL_NO_CACHE как no-op/стриппинг, `SHOW CREATE TABLE` (рек
 из оверлея с табличными опциями; идемпотентен parse→emit→parse),
 `SHOW CREATE DATABASE`, `SHOW TABLE STATUS`, пустые каталоги
 триггеров/рутин, `information_schema.FILES/TRIGGERS/EVENTS/ROUTINES`,
-`@@collation_database` и пр. Остаются: docker-образ,
-гайд «миграция WP с MySQL за 3 шага», Prometheus-дашборд для CMS-метик,
-инженерные хвосты Фазы 2 (коллации, unsigned). Дисплейная шкала
+`@@collation_database` и пр. Инженерные хвосты Фазы 2
+(коллации, unsigned) переносятся в Фазу 4. Дисплейная шкала
 SUM-агрегатов закрыта Прогоном №11; раздел «Расхождения и ошибки»,
 SUM-выражения, FOUND_ROWS-семантика, SHOW TABLE STATUS Rows,
 ON UPDATE CURRENT_TIMESTAMP и онлайн-смена типа (MODIFY/CHANGE) —
-Прогоном №12.
+Прогоном №12; docker-образ, гайд «миграция WP с MySQL за 3 шага»,
+Prometheus-дашборд и `GET /metrics` — Прогоном №13 (Фаза 3 закрыта).
 
 **Фаза 4 — MySQL wire protocol (8–16 нед).** Полный вход B: тогда и
 mysqli/PDO_mysql/phpMyAdmin работают сами. CMS-редакция становится

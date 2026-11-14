@@ -2,6 +2,48 @@
 
 ## Unreleased (CMS Edition — branch `cms-edition`)
 
+### Phase 3 closed: docker image, WP migration guide, Prometheus dashboard — Прогон №13 (2026-11-14)
+
+The last three operational items of Phase 3 (see
+docs/CMS_EDITION_RU.md, «Прогон №13»):
+
+- **`GET /metrics` on the mysqld web panel** (`cms::panel`): Prometheus
+  text format 0.0.4, unauthenticated like every scrape target (the panel
+  binds loopback by default; `/api/*` routes stay bearer-protected).
+  Families: `dnadb_cms_wire_sessions_active/_total`,
+  `dnadb_cms_wire_queries_total`, `dnadb_cms_wire_errors_total`,
+  `dnadb_cms_wire_uptime_seconds`, `dnadb_cms_databases_total`,
+  `dnadb_cms_spirals_total`, `dnadb_cms_storage_roots_total`,
+  `dnadb_cms_spirals_per_root{root=…}` (spiral placement per storage
+  root; strands outside a registered root report label `ad-hoc`) and
+  `dnadb_build_info`. The wire counters (`MySqlWireStats`) are created
+  before the panel starts and handed to it, so the first scrape already
+  sees live numbers. Tests: metrics body (families/values), spiral-pair
+  lifecycle (create/drop database moves the gauges), HTTP round-trip
+  without a token (200 + correct content-type; `/api/*` stays 401),
+  label-value escaping.
+- **Docker image**: multi-stage `Dockerfile`
+  (rust:1-slim-bookworm → debian:bookworm-slim, non-root user, VOLUME
+  `/var/lib/dna-db`, TCP healthcheck on :3306, vendored
+  reed-solomon-erasure honoured via `[patch.crates-io]`) +
+  `.dockerignore`; `docker-compose.yml` brings up dna-db (MySQL :3306,
+  panel/metrics :9310) + Prometheus (:9090) + Grafana (:3000) with
+  provisioning.
+- **Prometheus dashboard**: `monitoring/` — scrape config and Grafana
+  provisioning with `monitoring/grafana/dashboards/dna_db_cms_dashboard.json`
+  (11 panels: active sessions, sessions total, errors, uptime,
+  queries/s + errors/s rates, databases, spirals, storage roots,
+  spirals per root).
+- **Migration guide**: `docs/WP_MIGRATION_3STEPS_RU.md` — WordPress from
+  MySQL to DNA-DB in 3 steps (install + create the database with a
+  dual-spiral pair on chosen storages → move data with plain mysqldump →
+  switch `wp-config.php` and verify with wp-cli / the panel / Grafana),
+  plus the rollback path (a dump taken from DNA-DB restores into
+  vanilla MySQL) and a pre-cutover checklist.
+
+Tests (lib): **328 with `--features cms`** (+4 panel metrics tests),
+**210 without** — both 0 failures.
+
 ### Divergence & error report sections closed — Прогон №12 (2026-11-10)
 
 Every actionable entry of the reports' «Расхождения и ошибки» /

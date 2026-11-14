@@ -1,0 +1,11 @@
+# Grafana provisioning: Prometheus datasource (docker compose stack).
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: dna-db-prom
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false

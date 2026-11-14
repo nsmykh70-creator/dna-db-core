@@ -1,0 +1,70 @@
+# DNA-DB CMS edition — one command to get a MySQL-compatible server with
+# monitoring:
+#
+#   docker compose up -d --build
+#
+#   WordPress etc.  → localhost:3306   (user root, password dna-db)
+#   Web panel       → http://localhost:9310   (root / dna-db)
+#   Prometheus      → http://localhost:9090
+#   Grafana         → http://localhost:3000   (admin / admin, dashboard
+#                                              "DNA-DB CMS Edition")
+#
+# Point the CMS at it:  DB_HOST=127.0.0.1:3306, DB_USER=root,
+# DB_PASSWORD=dna-db, DB_NAME=wordpress (create the database from the web
+# panel — it deploys a dual-spiral pair automatically).
+#
+# For a production install use the bare-metal path instead:
+# scripts/install.sh (systemd, sha256-verified prebuilt).
+
+services:
+  dna-db:
+    build: .
+    image: dna-db-core:cms
+    container_name: dna-db
+    restart: unless-stopped
+    ports:
+      - "3306:3306"
+      - "9310:9310"
+    volumes:
+      - dna_data:/var/lib/dna-db
+    # CHANGE the credentials before exposing anything beyond localhost.
+    command:
+      ["mysqld", "--data-dir", "/var/lib/dna-db",
+       "--bind", "0.0.0.0", "--port", "3306",
+       "--user", "root:dna-db",
+       "--admin-port", "9310", "--admin-bind", "0.0.0.0",
+       "--sync", "strict"]
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: dna-db-prometheus
+    restart: unless-stopped
+    depends_on:
+      - dna-db
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom_data:/prometheus
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: dna-db-grafana
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/dna_db_cms_dashboard.json
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+
+volumes:
+  dna_data:
+  prom_data:
+  grafana_data:

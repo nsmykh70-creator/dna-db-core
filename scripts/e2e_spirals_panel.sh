@@ -12,6 +12,8 @@
 #      спирали и каталог;
 #   5. ХРАНИЛИЩА: GET /api/storage (корни + обнаруженные диски), POST /api/storage
 #      (регистрация сетевого корня), перенос спирали B (relocate) между хранилищами;
+#   5b. МЕТРИКИ: GET /metrics — Prometheus text format, гейджи баз/спиралей/корней
+#      отслеживают жизненный цикл пары, /api остаётся под токеном;
 #   6. ФИКС SUM: SELECT SUM(price) через mariadb-клиент печатает "250.10"
 #      (регрессия из E2E_BACKUP_RESTORE_REPORT — дисплейная шкала агрегатов).
 #
@@ -113,6 +115,28 @@ echo "== storage: relocate ok, panel drop removed both spirals"
 $DNACLI -e "DROP DATABASE webdb" || fail "SQL DROP DATABASE"
 [ ! -d "$W_A" ] && [ ! -d "$W_B" ] || fail "SQL DROP left spirals behind"
 echo "== sql: webdb dropped — spirals removed"
+
+# ---------- 5b) /metrics: Prometheus text format + живые CMS-гейджи ----------
+MET=$(curl -s "$PANEL/metrics")
+echo "$MET" | grep -q "^# TYPE dnadb_cms_wire_sessions_total counter" || fail "metrics: wire sessions_total family missing"
+echo "$MET" | grep -q "^# TYPE dnadb_cms_wire_queries_total counter" || fail "metrics: wire queries_total family missing"
+echo "$MET" | grep -q "^# TYPE dnadb_cms_databases_total gauge" || fail "metrics: databases family missing"
+echo "$MET" | grep -q "^dnadb_build_info{version=" || fail "metrics: build_info missing"
+echo "$MET" | grep -q "^dnadb_cms_wire_uptime_seconds [0-9]" || fail "metrics: uptime gauge missing"
+DBS0=$(echo "$MET" | awk '/^dnadb_cms_databases_total /{print $2}')
+[ "$DBS0" = "0" ] || fail "metrics: databases_total=$DBS0 after all drops, want 0"
+curl -s -o /dev/null -w '%{http_code}\n' "$PANEL/api/databases" | grep -q 401 || fail "/api lost its 401 (auth leak)"
+$DNACLI -e "CREATE DATABASE metrictest" || fail "metrictest create"
+MET=$(curl -s "$PANEL/metrics")
+DBS=$(echo "$MET" | awk '/^dnadb_cms_databases_total /{print $2}')
+SPL=$(echo "$MET" | awk '/^dnadb_cms_spirals_total /{print $2}')
+[ "$DBS" = "1" ] && [ "$SPL" = "2" ] || fail "metrics: after CREATE databases=$DBS spirals=$SPL, want 1/2"
+SER=$(echo "$MET" | grep -c '^dnadb_cms_spirals_per_root{root=' || true)
+[ "$SER" -ge 2 ] || fail "metrics: per-root series=$SER, want >= 2 (local-a + local-b)"
+$DNACLI -e "DROP DATABASE metrictest" || fail "metrictest drop"
+MET=$(curl -s "$PANEL/metrics")
+echo "$MET" | grep -q '^dnadb_cms_spirals_per_root{root=' && fail "metrics: per-root series left after DROP"
+echo "== metrics: /metrics 200 text-format, gauges track pair lifecycle (1/2 while alive, 0 after DROP), /api stays 401"
 
 # ---------- 6) фикс SUM: дисплейная шкала агрегатов ----------
 $DNACLI -e "CREATE DATABASE fin" || fail "fin create"

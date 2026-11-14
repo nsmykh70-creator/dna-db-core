@@ -1,0 +1,13 @@
+# Scrape the CMS edition mysqld panel: MySQL-wire counters + spiral-catalog
+# gauges (see docs/CMS_EDITION_RU.md, «Прогон №13»).
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: dna-db-cms
+    static_configs:
+      - targets: ['dna-db:9310']
+        labels:
+          service: dna-db
+          edition: cms

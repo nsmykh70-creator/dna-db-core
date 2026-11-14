@@ -42,7 +42,7 @@ pub mod wordpress;
 pub use compat::{CmsError, CmsQueryResult, CmsSqlGate};
 pub use ddl_meta::{CmsColumnMeta, CmsIndexMeta, CmsTableMeta};
 pub use locks::LockRegistry;
-pub use mysqlwire::{MySqlAuth, MySqlWireServer};
+pub use mysqlwire::{MySqlAuth, MySqlWireServer, MySqlWireStats};
 pub use panel::CmsPanel;
 pub use row_locks::RowLockRegistry;
 pub use sequence::AutoIncrementRegistry;

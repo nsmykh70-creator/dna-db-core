@@ -110,7 +110,12 @@ pub(crate) fn run_mysqld(
         MySqlAuth::Users(map)
     };
 
-    // Web panel: databases + spiral storage management (admin_port > 0).
+    // The wire server (and its stats) exist before the panel so /metrics
+    // can report the live wire counters from the very first scrape.
+    let server = Arc::new(MySqlWireServer::new(auth));
+
+    // Web panel: databases + spiral storage management + /metrics
+    // (admin_port > 0).
     if admin_port > 0 {
         let mut map = std::collections::HashMap::new();
         for spec in users {
@@ -126,15 +131,12 @@ pub(crate) fn run_mysqld(
         match std::net::TcpListener::bind((admin_bind, admin_port)) {
             Ok(listener) => {
                 eprintln!(
-                    "[MYSQLD] web panel: http://{admin_bind}:{admin_port} (databases, spirals, storage)"
+                    "[MYSQLD] web panel: http://{admin_bind}:{admin_port} (databases, spirals, storage, /metrics)"
                 );
                 let gate = gate.clone();
+                let stats = server.stats();
                 std::thread::spawn(move || {
-                    dna_db_core::cms::CmsPanel::run(
-                        listener,
-                        gate,
-                        Arc::new(map),
-                    );
+                    dna_db_core::cms::CmsPanel::run(listener, gate, stats, Arc::new(map));
                 });
             }
             Err(e) => {
@@ -173,7 +175,6 @@ pub(crate) fn run_mysqld(
     );
     eprintln!("[MYSQLD] -----------------------");
 
-    let server = Arc::new(MySqlWireServer::new(auth));
     if let Err(e) = server.serve(listener, gate) {
         eprintln!("[FATAL] MySQL listener stopped: {e}");
         return 2;

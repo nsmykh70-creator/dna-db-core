@@ -1,0 +1,17 @@
+target/
+.git/
+.github/
+docs/
+landing/
+scripts/
+tests/
+examples/
+prebuilt/
+*.md
+!README.md
+monitoring/
+docker-compose.yml
+Cargo.lock.bak
+**/*.png
+**/*.log
+**/*.json

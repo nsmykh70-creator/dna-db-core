@@ -1,0 +1,15 @@
+# Grafana provisioning: load the DNA-DB CMS dashboard from disk.
+apiVersion: 1
+
+providers:
+  - name: DNA-DB
+    orgId: 1
+    folder: DNA-DB
+    folderUid: dna-db
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false
